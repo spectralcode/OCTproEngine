@@ -1,32 +1,48 @@
-# Prerequisites
-*.d
+# Build system
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+install_manifest.txt
 
-# Compiled Object files
-*.slo
-*.lo
+# IDE
+.vscode/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+python/build/
+python/dist/
+python/*.egg-info
+
+# Compiled binaries
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
+*.a
+*.lib
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
 *.exe
 *.out
 *.app
+*.pdb
+*.idb
+*.ilk
+
+# Keep third-party libraries
+!src/thirdparty/
+!src/thirdparty/**/
+!src/thirdparty/**/*.dll
+!src/thirdparty/**/*.lib
+!src/thirdparty/**/*.so
+!src/thirdparty/**/*.a
+!src/thirdparty/**/*.dylib
+
+# OS junk
+Thumbs.db
+ehthumbs.db
+desktop.ini
