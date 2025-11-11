@@ -7,6 +7,7 @@ set(CORE_SOURCES
 	core/iobuffer.cpp
 	core/processor.cpp
 	core/processorconfiguration.cpp
+	core/callback_manager.cpp
 )
 
 set(CPU_SOURCES

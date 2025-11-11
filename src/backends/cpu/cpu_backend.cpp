@@ -7,7 +7,10 @@
 
 namespace ope {
 
+// ============================================
 // Internal implementation
+// ============================================
+
 struct CpuBackend::Impl {
 	ProcessorConfiguration config;
 	std::function<void(const IOBuffer&)> callback;
@@ -18,11 +21,21 @@ struct CpuBackend::Impl {
 	int currentOutputBuffer;
 	
 	// Input buffer management
+	std::vector<uint8_t> processingBuffer; 
 	std::vector<IOBuffer> hostInputBuffers;
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
 	std::condition_variable freeQueueCV;
 	int numInputBuffers;
+	
+	// Work queue for async processing
+	std::queue<IOBuffer*> workQueue;
+	std::mutex workQueueMutex;
+	std::condition_variable workQueueCV;
+	
+	// Processing thread
+	std::thread processingThread;
+	std::atomic<bool> stopProcessing;
 	
 	// FFTW plans and buffers
 	fftwf_complex* fftIn;
@@ -34,20 +47,22 @@ struct CpuBackend::Impl {
 	std::vector<std::complex<float>> dispersionPhaseComplex;
 	std::vector<float> windowCurve;
 	
-	// Processing thread
-	std::thread processingThread;
-	bool stopProcessing;
-	
 	Impl() 
 		: currentOutputBuffer(0)
 		, fftIn(nullptr)
 		, fftOut(nullptr)
 		, fftPlan(nullptr)
 		, stopProcessing(false)
-		, numInputBuffers(2)  // Default: 2 buffers (ping-pong)
+		, numInputBuffers(2)  // default: 2 buffers (ping-pong)
 	{}
 	
 	~Impl() {
+		this->stopProcessing = true;
+		if (this->processingThread.joinable()) {
+			this->workQueueCV.notify_one();
+			this->processingThread.join();
+		}
+		
 		if (this->fftPlan) {
 			fftwf_destroy_plan(this->fftPlan);
 		}
@@ -58,7 +73,159 @@ struct CpuBackend::Impl {
 			fftwf_free(this->fftOut);
 		}
 	}
+	
+	void processingThreadFunc() {
+		while (!this->stopProcessing) {
+			// Get work from queue
+			IOBuffer* inputBuffer = nullptr;
+			{
+				std::unique_lock<std::mutex> lock(this->workQueueMutex);
+				this->workQueueCV.wait(lock, [this]() {
+					return !this->workQueue.empty() || this->stopProcessing;
+				});
+				
+				if (this->stopProcessing) {
+					break;
+				}
+				
+				inputBuffer = this->workQueue.front();
+				this->workQueue.pop();
+			}
+			
+			// Resize buffer if needed (only happens on first frame or config change)
+			size_t inputDataSize = this->config.dataParams.samplesPerBuffer * 
+								(this->config.dataParams.getBitDepth() / 8);
+			if (this->processingBuffer.size() != inputDataSize) {
+				this->processingBuffer.resize(inputDataSize);
+			}
+			
+			// Copy input data (reusing pre-allocated buffer)
+			std::memcpy(this->processingBuffer.data(), inputBuffer->getDataPointer(), inputDataSize);
+			
+			// Return input buffer right after copying to processingBuffer so user can reuse it
+			{
+				std::lock_guard<std::mutex> lock(this->freeQueueMutex);
+				this->freeBuffersQueue.push(inputBuffer);
+			}
+			this->freeQueueCV.notify_one();
+			
+			this->currentOutputBuffer = (this->currentOutputBuffer + 1) % 2;
+			IOBuffer& output = (this->currentOutputBuffer == 0) 
+				? this->outputBuffer1 
+				: this->outputBuffer2;
+			
+			this->processData(this->processingBuffer.data(), output);
+			
+			// Invoke callback
+			if (this->callback) {
+				this->callback(output);
+			}
+		}
+	}
+	
+	void processData(const void* inputData, IOBuffer& output) {
+		const ProcessorConfiguration& config = this->config;
+		const int signalLength = config.dataParams.signalLength;
+		const int ascansPerBscan = config.dataParams.ascansPerBscan;
+		const int bscansPerBuffer = config.dataParams.bscansPerBuffer;
+		const int totalAscans = ascansPerBscan * bscansPerBuffer;
+		const int outputSamplesPerAscan = signalLength / 2;
+		
+		float* outputPtr = static_cast<float*>(output.getDataPointer());
+		
+		// Process each A-scan
+		for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
+			const void* ascanStart = static_cast<const uint8_t*>(inputData) + 
+			                         (ascanIdx * signalLength * (config.dataParams.getBitDepth() / 8));
+			
+			// 1. Convert input data
+			std::vector<std::complex<float>> spectrum(signalLength);
+			cpu_kernels::convertInputData<float>(
+				ascanStart,
+				signalLength,
+				config.dataParams.getBitDepth(),
+				spectrum
+			);
+			
+			// 2. Background removal (if enabled)
+			if (config.backgroundRemovalParams.enabled) {
+				cpu_kernels::rollingAverageDCRemoval<float>(
+					spectrum,
+					config.backgroundRemovalParams.rollingAverageWindowSize
+				);
+			}
+			
+			// 3. K-linearization (if enabled)
+			std::vector<std::complex<float>> linearizedSpectrum = spectrum;
+			if (config.resamplingParams.enabled) {
+				switch (config.resamplingParams.interpolationMethod) {
+					case InterpolationMethod::LINEAR:
+						cpu_kernels::kLinearizationLinear<float>(spectrum, this->resampleCurve, linearizedSpectrum);
+						break;
+					case InterpolationMethod::CUBIC:
+						cpu_kernels::kLinearizationCubic<float>(spectrum, this->resampleCurve, linearizedSpectrum);
+						break;
+					case InterpolationMethod::LANCZOS:
+						cpu_kernels::kLinearizationLanczos<float>(spectrum, this->resampleCurve, linearizedSpectrum);
+						break;
+				}
+			}
+			
+			// 4. Windowing (if enabled)
+			if (config.windowingParams.enabled) {
+				cpu_kernels::applyWindow<float>(linearizedSpectrum, this->windowCurve);
+			}
+			
+			// 5. Dispersion compensation (if enabled)
+			if (config.dispersionParams.enabled) {
+				cpu_kernels::dispersionCompensation<float>(linearizedSpectrum, this->dispersionPhaseComplex);
+			}
+			
+			// 6. IFFT
+			std::vector<std::complex<float>> ifftOutput(signalLength);
+			cpu_kernels::computeIFFT<float>(
+				linearizedSpectrum,
+				ifftOutput,
+				this->fftPlan,
+				this->fftIn,
+				this->fftOut
+			);
+			
+			// 7. Magnitude calculation, grayscale conversion, truncation
+			std::vector<float> processedAscan;
+			if (config.postProcessingParams.logScaling) {
+				cpu_kernels::logScaleAndTruncate<float>(
+					ifftOutput,
+					processedAscan,
+					config.postProcessingParams.multiplicator,
+					config.postProcessingParams.grayscaleMin,
+					config.postProcessingParams.grayscaleMax,
+					config.postProcessingParams.addend,
+					(config.postProcessingParams.grayscaleMin == config.postProcessingParams.grayscaleMax)
+				);
+			} else {
+				cpu_kernels::linearScaleAndTruncate<float>(
+					ifftOutput,
+					processedAscan,
+					config.postProcessingParams.multiplicator,
+					config.postProcessingParams.grayscaleMin,
+					config.postProcessingParams.grayscaleMax,
+					config.postProcessingParams.addend
+				);
+			}
+			
+			// 8. Copy to output
+			int outputStartIdx = ascanIdx * outputSamplesPerAscan;
+			std::copy(processedAscan.begin(),
+			          processedAscan.end(),
+			          outputPtr + outputStartIdx);
+		}
+	}
 };
+
+// ============================================
+// CpuBackend Implementation
+// ============================================
 
 CpuBackend::CpuBackend() : impl(std::make_unique<Impl>()) {
 }
@@ -105,29 +272,44 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->outputBuffer2.setDataType(IOBuffer::DataType::FLOAT32);
 	
 	// Allocate input buffers
-	size_t inputSize = config.dataParams.samplesPerBuffer * sizeof(float);
+	size_t inputSize = config.dataParams.samplesPerBuffer * (config.dataParams.getBytesPerSample());
+	//size_t inputSize = config.dataParams.samplesPerBuffer * sizeof(float);
 	this->impl->hostInputBuffers.resize(this->impl->numInputBuffers);
 	
 	for (int i = 0; i < this->impl->numInputBuffers; ++i) {
 		if (!this->impl->hostInputBuffers[i].allocateMemory(inputSize)) {
 			throw std::runtime_error("Failed to allocate input buffer " + std::to_string(i));
 		}
-		this->impl->hostInputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
+		this->impl->hostInputBuffers[i].setDataType(config.dataParams.inputDataType);
+		//this->impl->hostInputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
 	}
-
+	
 	// Initialize curves
 	this->impl->resampleCurve.resize(signalLength);
 	this->impl->dispersionPhaseComplex.resize(signalLength);
 	this->impl->windowCurve.resize(signalLength);
+	
+	// Start processing thread
+	this->impl->stopProcessing = false;
+	this->impl->processingThread = std::thread([this]() {
+		this->impl->processingThreadFunc();
+	});
 }
 
 void CpuBackend::cleanup() {
+	// Stop processing thread
 	this->impl->stopProcessing = true;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->workQueueMutex);
+	}
+	this->impl->workQueueCV.notify_one();
+	
 	if (this->impl->processingThread.joinable()) {
 		this->impl->processingThread.join();
 	}
 	
+	// Release output buffers
 	this->impl->outputBuffer1.releaseMemory();
 	this->impl->outputBuffer2.releaseMemory();
 	
@@ -137,9 +319,12 @@ void CpuBackend::cleanup() {
 	}
 	this->impl->hostInputBuffers.clear();
 	
-	// Clear the queue
+	// Clear queues
 	while (!this->impl->freeBuffersQueue.empty()) {
 		this->impl->freeBuffersQueue.pop();
+	}
+	while (!this->impl->workQueue.empty()) {
+		this->impl->workQueue.pop();
 	}
 }
 
@@ -147,155 +332,25 @@ void CpuBackend::setOutputCallback(std::function<void(const IOBuffer&)> callback
 	this->impl->callback = callback;
 }
 
+// ============================================
+// UPDATED: process() - NOW ASYNC!
+// ============================================
+
 void CpuBackend::process(IOBuffer& input) {
-	// Switch output buffer (ping-pong)
-	this->impl->currentOutputBuffer = (this->impl->currentOutputBuffer + 1) % 2;
-	IOBuffer& output = (this->impl->currentOutputBuffer == 0) 
-		? this->impl->outputBuffer1 
-		: this->impl->outputBuffer2;
-	
-	// Get configuration
-	const ProcessorConfiguration& config = this->impl->config;
-	const int signalLength = config.dataParams.signalLength;
-	const int samplesPerBuffer = config.dataParams.samplesPerBuffer;
-	const int numAscans = samplesPerBuffer / signalLength;
-	const int outputSamplesPerAscan = signalLength / 2;
-	
-	// Convert input to complex array
-	std::vector<std::complex<float>> complexData;
-	cpu_kernels::convertInputData<float>(
-		input.getDataPointer(),
-		samplesPerBuffer,
-		config.dataParams.getBitDepth(),
-		complexData
-	);
-	
-	// Get output pointer
-	float* outputPtr = static_cast<float*>(output.getDataPointer());
-	
-	// Process each A-scan
-	for (int ascanIdx = 0; ascanIdx < numAscans; ++ascanIdx) {
-		// Extract A-scan
-		std::vector<std::complex<float>> ascan(signalLength);
-		int startIdx = ascanIdx * signalLength;
-		std::copy(complexData.begin() + startIdx, 
-		          complexData.begin() + startIdx + signalLength,
-		          ascan.begin());
-		
-		// Apply processing pipeline using kernels
-		if (config.backgroundRemovalParams.enabled) {
-			cpu_kernels::rollingAverageDCRemoval<float>(
-				ascan,
-				config.backgroundRemovalParams.rollingAverageWindowSize
-			);
-		}
-		
-		//k-linearization
-		if (config.resamplingParams.enabled) {
-			std::vector<std::complex<float>> resampled;
-			
-			InterpolationMethod method = config.resamplingParams.interpolationMethod;
-			if (method == InterpolationMethod::CUBIC) {
-				cpu_kernels::kLinearizationCubic<float>(
-					ascan,
-					this->impl->resampleCurve,
-					resampled
-				);
-			} else if (method == InterpolationMethod::LINEAR) {
-				cpu_kernels::kLinearizationLinear<float>(
-					ascan,
-					this->impl->resampleCurve,
-					resampled
-				);
-			} else if (method == InterpolationMethod::LANCZOS) {
-				cpu_kernels::kLinearizationLanczos<float>(
-					ascan,
-					this->impl->resampleCurve,
-					resampled
-				);
-			}
-			
-			ascan = std::move(resampled);
-		}
-		
-		//dispersion compensation
-		if (config.dispersionParams.enabled) {
-			cpu_kernels::dispersionCompensation<float>(
-				ascan,
-				this->impl->dispersionPhaseComplex
-			);
-		}
-		
-		//windowing
-		if (config.windowingParams.enabled) {
-			cpu_kernels::applyWindow<float>(
-				ascan,
-				this->impl->windowCurve
-			);
-		}
-		
-		//IFFT
-		std::vector<std::complex<float>> ifftOutput;
-		cpu_kernels::computeIFFT<float>(
-			ascan,
-			ifftOutput,
-			this->impl->fftPlan,
-			this->impl->fftIn,
-			this->impl->fftOut
-		);
-		
-		//magnitude calculation, grayscale conversion, truncation 
-		std::vector<float> processedAscan;
-		if (config.postProcessingParams.logScaling) {
-			cpu_kernels::logScaleAndTruncate<float>(
-				ifftOutput,
-				processedAscan,
-				config.postProcessingParams.multiplicator,
-				config.postProcessingParams.grayscaleMin,
-				config.postProcessingParams.grayscaleMax,
-				config.postProcessingParams.addend,
-				(config.postProcessingParams.grayscaleMin == config.postProcessingParams.grayscaleMax)
-			);
-		} else {
-			cpu_kernels::linearScaleAndTrucate<float>(
-				ifftOutput,
-				processedAscan,
-				config.postProcessingParams.multiplicator,
-				config.postProcessingParams.grayscaleMin,
-				config.postProcessingParams.grayscaleMax,
-				config.postProcessingParams.addend
-			);
-		}
-		
-		// Copy to output
-		int outputStartIdx = ascanIdx * outputSamplesPerAscan;
-		std::copy(processedAscan.begin(),
-				processedAscan.end(),
-				outputPtr + outputStartIdx);
-	}
-	
-	// Call callback when done
-	if (this->impl->callback) {
-		this->impl->callback(output);
-	}
-	
-	// Return the input buffer to the free queue
-	// For CPU backend, processing is synchronous so we can return immediately
 	{
-		std::lock_guard<std::mutex> lock(this->impl->freeQueueMutex);
-		this->impl->freeBuffersQueue.push(&input);
-		this->impl->freeQueueCV.notify_one();
+		std::lock_guard<std::mutex> lock(this->impl->workQueueMutex);
+		this->impl->workQueue.push(&input);
 	}
+	this->impl->workQueueCV.notify_one();
 }
 
 void CpuBackend::updateConfig(const ProcessorConfiguration& config) {
 	this->impl->config = config;
-
 }
 
 void CpuBackend::updateResamplingCurve(const float* curve, size_t length) {
 	if (!curve && length > 0) {
-		throw std::runtime_error("Invalid window curve pointer");
+		throw std::runtime_error("Invalid resampling curve pointer");
 	}
 	this->impl->resampleCurve.assign(curve, curve + length);
 }
@@ -319,7 +374,7 @@ void CpuBackend::updateWindowCurve(const float* curve, size_t length) {
 }
 
 // ============================================
-// Individual operations (adapted from your code)
+// Individual operations (for testing/debugging)
 // ============================================
 
 std::vector<float> CpuBackend::convertInput(
@@ -327,15 +382,15 @@ std::vector<float> CpuBackend::convertInput(
 	IOBuffer::DataType inputType,
 	int bitDepth,
 	int samples,
-	bool applyBitshift)
-{
-	// Use kernel to convert to complex, then extract real part
-	std::vector<std::complex<float>> complexOutput;
-	cpu_kernels::convertInputData<float>(input, samples, bitDepth, complexOutput);
+	bool applyBitshift
+) {
+	std::vector<std::complex<float>> complexData(samples);
+	cpu_kernels::convertInputData<float>(input, samples, bitDepth, complexData);
 	
+	// Extract real part
 	std::vector<float> output(samples);
 	for (int i = 0; i < samples; ++i) {
-		output[i] = complexOutput[i].real();
+		output[i] = complexData[i].real();
 	}
 	
 	return output;
@@ -346,24 +401,34 @@ std::vector<float> CpuBackend::kLinearization(
 	const float* resampleCurve,
 	InterpolationMethod method,
 	int lineWidth,
-	int samples)
-{
-	// Convert input to complex for kernel processing
+	int samples
+) {
+	// Convert to complex
 	std::vector<std::complex<float>> complexInput(lineWidth);
 	for (int i = 0; i < lineWidth; ++i) {
 		complexInput[i] = std::complex<float>(input[i], 0.0f);
 	}
 	
-	// Convert resample curve to vector
-	std::vector<float> resampleVec(resampleCurve, resampleCurve + lineWidth);
+	// Convert curve to vector
+	std::vector<float> curveVec(resampleCurve, resampleCurve + lineWidth);
 	
-	// Use kernel for k-linearization
-	std::vector<std::complex<float>> complexOutput;
-	cpu_kernels::kLinearizationCubic<float>(complexInput, resampleVec, complexOutput);
+	// Apply linearization
+	std::vector<std::complex<float>> complexOutput(lineWidth);
+	switch (method) {
+		case InterpolationMethod::LINEAR:
+			cpu_kernels::kLinearizationLinear<float>(complexInput, curveVec, complexOutput);
+			break;
+		case InterpolationMethod::CUBIC:
+			cpu_kernels::kLinearizationCubic<float>(complexInput, curveVec, complexOutput);
+			break;
+		case InterpolationMethod::LANCZOS:
+			cpu_kernels::kLinearizationLanczos<float>(complexInput, curveVec, complexOutput);
+			break;
+	}
 	
 	// Extract real part
-	std::vector<float> output(complexOutput.size());
-	for (size_t i = 0; i < complexOutput.size(); ++i) {
+	std::vector<float> output(samples);
+	for (int i = 0; i < samples; ++i) {
 		output[i] = complexOutput[i].real();
 	}
 	
@@ -374,19 +439,19 @@ std::vector<float> CpuBackend::windowing(
 	const float* input,
 	const float* windowCurve,
 	int lineWidth,
-	int samples)
-{
-	// Convert input to complex
-	std::vector<std::complex<float>> complexData(samples);
-	for (int i = 0; i < samples; ++i) {
+	int samples
+) {
+	// Convert to complex
+	std::vector<std::complex<float>> complexData(lineWidth);
+	for (int i = 0; i < lineWidth; ++i) {
 		complexData[i] = std::complex<float>(input[i], 0.0f);
 	}
 	
-	// Convert window curve to vector
-	std::vector<float> windowVec(windowCurve, windowCurve + lineWidth);
+	// Convert curve to vector
+	std::vector<float> curveVec(windowCurve, windowCurve + lineWidth);
 	
-	// Apply window using kernel
-	cpu_kernels::applyWindow<float>(complexData, windowVec);
+	// Apply window
+	cpu_kernels::applyWindow<float>(complexData, curveVec);
 	
 	// Extract real part
 	std::vector<float> output(samples);
@@ -401,15 +466,15 @@ std::vector<float> CpuBackend::dispersionCompensation(
 	const float* input,
 	const float* phaseComplex,
 	int lineWidth,
-	int samples)
-{
-	// Convert input to complex
-	std::vector<std::complex<float>> complexData(samples);
-	for (int i = 0; i < samples; ++i) {
+	int samples
+) {
+	// Convert to complex
+	std::vector<std::complex<float>> complexData(lineWidth);
+	for (int i = 0; i < lineWidth; ++i) {
 		complexData[i] = std::complex<float>(input[i], 0.0f);
 	}
 	
-	// Convert phaseComplex (interleaved real/imag) to vector
+	// Convert phase (interleaved real/imag) to vector
 	std::vector<std::complex<float>> phaseVec(lineWidth);
 	for (int i = 0; i < lineWidth; ++i) {
 		phaseVec[i] = std::complex<float>(phaseComplex[i * 2], phaseComplex[i * 2 + 1]);
@@ -505,7 +570,7 @@ std::vector<float> CpuBackend::postProcessBackgroundRemoval(const float* input, 
 }
 
 // ============================================
-// BUFFER MANAGEMENT
+// Buffer management
 // ============================================
 
 IOBuffer& CpuBackend::getInputBuffer(int index) {

@@ -64,6 +64,7 @@ add_ope_test(test_backend_output_comparison test_backend_output_comparison.cpp)
 add_ope_test(test_performance_benchmark test_performance_benchmark.cpp)
 add_ope_test(test_curve_functionality test_curve_functionality.cpp)
 add_ope_test(test_setconfig test_setconfig.cpp)
+add_ope_test(test_multi_consumer test_multi_consumer.cpp)
 
 # ========================================
 # Copy test data to build directory

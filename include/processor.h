@@ -14,40 +14,30 @@ namespace ope {
 class OPE_API Processor {
 public:
 	using OutputCallback = std::function<void(const IOBuffer&)>;
-	
+	using CallbackId = int;
+
 	// Construction
 	Processor(Backend backend);
 	~Processor();
-	
+
 	Processor(const Processor&) = delete;
 	Processor& operator=(const Processor&) = delete;
-	
-	// ============================================
-	// LIFECYCLE
-	// ============================================
-	
+
 	// Initialize processor and allocate buffers.
 	// OPTIONAL - automatically called on first use if not called explicitly.
 	// Call this to control when memory allocation occurs.
 	void initialize();
-	
+
 	// Free all allocated resources.
 	// OPTIONAL - automatically called when needed (e.g., setBackend, destructor).
 	void cleanup();
-	
+
 	// Query initialization state
 	bool isInitialized() const;
-	
-	// ============================================
-	// CONFIGURATION - FILE-BASED
-	// ============================================
-	
+
+	// todo: implement load/save ini files (load should be backwards compatible with OCTproZ settings.ini)
 	void loadConfigurationFromFile(const std::string& filepath);
 	void saveConfigurationToFile(const std::string& filepath) const;
-	
-	// ============================================
-	// CONFIGURATION - READ ACCESS
-	// ============================================
 	
 	// Get read-only reference to current configuration
 	// Useful for inspection, debugging, and GUI state synchronization
@@ -56,10 +46,6 @@ public:
 	// Set entire configuration at once
 	void setConfig(const ProcessorConfiguration& config);
 
-	// ============================================
-	// CONFIGURATION - CONTROLLED WRITE ACCESS
-	// ============================================
-	
 	// Set input buffer parameters (requires reinitialization)
 	void setInputParameters(
 		int samplesPerRawAscan,
@@ -67,32 +53,46 @@ public:
 		int bscansPerBuffer,
 		DataType type
 	);
-	
-	// ============================================
-	// BACKEND MANAGEMENT
-	// ============================================
-	
+
 	// Switch backend (CUDA <-> CPU)
 	// Preserves all configuration, automatically cleanup old backend
 	void setBackend(Backend backend);
-	
+
 	// Get current backend
 	Backend getBackend() const;
-	
-	// ============================================
-	// PROCESSING
-	// ============================================
-	
+
+	// Process input buffer that was previously acquired via getNextAvailableInputBuffer()
+	// processing is asynchronous; output is delivered via registered callbacks
 	void process(IOBuffer& input);
+
+	// todo: remove this method and update python bindings, tests etc
+	// Set single output callback (legacy method)
 	void setOutputCallback(OutputCallback callback);
+
+	// Add an output callback for processed data
+	// Each callback runs on its own dedicated thread. Callbacks execute
+	// in parallel when processing completes.
+	CallbackId addOutputCallback(OutputCallback callback);
+
+	// Remove previously added output callback by its ID
+	// Stops and destroys the associated worker thread.
+	// Blocks until the thread finishes its current callback (if any)
+	bool removeOutputCallback(CallbackId id);
+
+	// Remove all output callbacks and stop and destroy their threads
+	void clearOutputCallbacks();
+
+	// Get number of registered callback
+	size_t getCallbackCount() const;
 	
-	// ============================================
-	// BUFFER MANAGEMENT
-	// ============================================
-	
-	IOBuffer& getInputBuffer(int index); //dont use this, only for testing. will be removed
-	IOBuffer& getNextAvailableInputBuffer();
+	//dont use this, only for testing. will be removed
+	IOBuffer& getInputBuffer(int index); 
 	int getNumInputBuffers() const;
+
+	// Get next available input buffer for processing
+	// Blocks if no buffer is available
+	IOBuffer& getNextAvailableInputBuffer();
+
 	
 	// ============================================
 	// HOT-SWAP METHODS (real-time parameter updates)

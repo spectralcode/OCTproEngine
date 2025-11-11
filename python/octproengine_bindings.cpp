@@ -118,6 +118,9 @@ public:
 	ope::Processor processor;
 	py::function callback;
 	py::function error_callback;
+
+	std::map<ope::Processor::CallbackId, py::function> pyCallbacks;
+	std::mutex callbacksMutex;
 	
 	ProcessorWrapper(ope::Backend backend) : processor(backend) {}
 	
@@ -154,6 +157,76 @@ public:
 		});
 	}
 	
+ope::Processor::CallbackId add_output_callback(py::function cb) {
+		// Create C++ wrapper callback that handles GIL
+		auto wrappedCallback = [this, cb](const ope::IOBuffer& buffer) {
+			// CRITICAL: Re-acquire GIL before calling Python code
+			// We're in a C++ callback thread, need GIL to call Python
+			py::gil_scoped_acquire acquire;
+			
+			try {
+				// Create NumPy view of buffer (zero-copy)
+				ope::IOBuffer& buffer_ref = const_cast<ope::IOBuffer&>(buffer);
+				py::array output_array = buffer_to_numpy(buffer_ref);
+				
+				// Call Python callback
+				cb(output_array);
+				
+			} catch (const py::error_already_set& e) {
+				// Python exception
+				py::print("Python error in callback:", e.what());
+			} catch (const std::exception& e) {
+				// C++ exception
+				py::print("C++ error in callback:", e.what());
+			}
+		};
+		
+		// Register with C++ processor
+		ope::Processor::CallbackId id;
+		{
+			// Release GIL for C++ operation
+			py::gil_scoped_release release;
+			id = processor.addOutputCallback(wrappedCallback);
+		}
+		
+		// Store Python function to prevent garbage collection
+		{
+			std::lock_guard<std::mutex> lock(callbacksMutex);
+			pyCallbacks[id] = cb;
+		}
+		
+		return id;
+	}
+	
+	bool remove_output_callback(ope::Processor::CallbackId id) {
+		bool removed;
+		{
+			py::gil_scoped_release release;
+			removed = processor.removeOutputCallback(id);
+		}
+		
+		if (removed) {
+			std::lock_guard<std::mutex> lock(callbacksMutex);
+			pyCallbacks.erase(id);
+		}
+		
+		return removed;
+	}
+	
+	void clear_output_callbacks() {
+		{
+			py::gil_scoped_release release;
+			processor.clearOutputCallbacks();
+		}
+		
+		std::lock_guard<std::mutex> lock(callbacksMutex);
+		pyCallbacks.clear();
+	}
+	
+	size_t get_callback_count() const {
+		return processor.getCallbackCount();
+	}
+
 	void process(py::array buffer_array) {
 		// Validate that callback is set
 		if (callback.is_none()) {
@@ -490,6 +563,39 @@ PYBIND11_MODULE(octproengine, m) {
 			"Args:\n"
 			"    callback: Function that takes a NumPy array as argument\n"
 			"    error_callback: Optional function to handle callback errors")
+
+		.def("add_output_callback", &ProcessorWrapper::add_output_callback,
+			py::arg("callback"),
+			"Add output callback for multi-consumer support\n\n"
+			"Allows multiple callbacks to receive processed data in parallel.\n"
+			"Each callback runs in its own thread.\n\n"
+			"Args:\n"
+			"    callback: Function that takes a NumPy array as argument\n\n"
+			"Returns:\n"
+			"    int: Callback ID for later removal\n\n"
+			"Example:\n"
+			"    >>> def display(data):\n"
+			"    ...     cv2.imshow('OCT', data.copy())\n"
+			"    >>> callback_id = processor.add_output_callback(display)\n"
+			"    >>> processor.remove_output_callback(callback_id)")
+		
+		.def("remove_output_callback", &ProcessorWrapper::remove_output_callback,
+			py::arg("callback_id"),
+			"Remove a specific callback by ID\n\n"
+			"Args:\n"
+			"    callback_id: ID returned from add_output_callback()\n\n"
+			"Returns:\n"
+			"    bool: True if callback was found and removed")
+		
+		.def("clear_output_callbacks", &ProcessorWrapper::clear_output_callbacks,
+			"Remove all output callbacks\n\n"
+			"Stops all consumer threads and clears all registered callbacks.")
+		
+		.def("get_callback_count", &ProcessorWrapper::get_callback_count,
+			"Get number of registered callbacks\n\n"
+			"Returns:\n"
+			"    int: Number of active callbacks")
+
 		.def("process", &ProcessorWrapper::process, py::arg("buffer"),
 			"Process the input buffer asynchronously\n\n"
 			"Args:\n"

@@ -2,6 +2,7 @@
 #include "../backends/backend_interface.h"
 #include "../backends/cuda/cuda_backend.h"
 #include "../backends/cpu/cpu_backend.h"
+#include "callback_manager.h" 
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
@@ -21,6 +22,8 @@ public:
 	
 	bool initialized = false;
 	ProcessorConfiguration::DataParameters lastInitializedDataParams = {};
+	
+	CallbackManager callbackManager;
 
 	Impl(Backend type) : backendType(type) {
 		this->createBackend(type);
@@ -133,14 +136,22 @@ public:
 		if (!this->config.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
-		
-		// Initialize backend (allocates buffers)
+
+		// (re-)initialize backend
+		if (this->initialized) {
+			this->backend->cleanup();
+		}
 		this->backend->initialize(this->config);
+
+		// Setup internal callback that distributes to all consumers
+		this->backend->setOutputCallback([this](const IOBuffer& output) {
+			this->internalCallback(output);
+		});
+
 		this->initialized = true;
-		
-		// Send curves to backend
+
 		this->updateAllBackendCurves();
-		
+
 		this->lastInitializedDataParams = this->config.dataParams;
 	}
 	
@@ -173,6 +184,10 @@ public:
 		       current.samplesPerBuffer != last.samplesPerBuffer ||
 		       current.ascansPerBscan != last.ascansPerBscan ||
 		       current.bscansPerBuffer != last.bscansPerBuffer;
+	}
+
+	void internalCallback(const IOBuffer& output) {
+		this->callbackManager.invokeAll(output);
 	}
 };
 
@@ -306,14 +321,33 @@ Backend Processor::getBackend() const {
 // ============================================
 // PROCESSING
 // ============================================
+Processor::CallbackId Processor::addOutputCallback(OutputCallback callback) {
+	return this->impl->callbackManager.addCallback(callback);
+}
+
+bool Processor::removeOutputCallback(CallbackId id) {
+	return this->impl->callbackManager.removeCallback(id);
+}
+
+void Processor::clearOutputCallbacks() {
+	this->impl->callbackManager.clear();
+}
+
+size_t Processor::getCallbackCount() const {
+	return this->impl->callbackManager.getCallbackCount();
+}
+
+void Processor::setOutputCallback(OutputCallback callback) {
+	// Legacy method: clear all and add one
+	// Provided for backwards compatibility
+	// todo: remove this method und update processor.h and all examples, tests, etc
+	this->impl->callbackManager.clear();
+	this->impl->callbackManager.addCallback(callback);
+}
 
 void Processor::process(IOBuffer& input) {
 	this->impl->ensureInitialized();
 	this->impl->backend->process(input);
-}
-
-void Processor::setOutputCallback(OutputCallback callback) {
-	this->impl->backend->setOutputCallback(callback);
 }
 
 // ============================================
