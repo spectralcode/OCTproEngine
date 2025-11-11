@@ -37,14 +37,8 @@ python/*.egg-info
 python/tests/*.raw
 python/tests/*.csv
 
-# Keep third-party libraries
-!src/thirdparty/
-!src/thirdparty/**/
-!src/thirdparty/**/*.dll
-!src/thirdparty/**/*.lib
-!src/thirdparty/**/*.so
-!src/thirdparty/**/*.a
-!src/thirdparty/**/*.dylib
+# Third-party components
+thirdparty/
 
 # OS junk
 Thumbs.db
