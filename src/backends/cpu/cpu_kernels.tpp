@@ -341,7 +341,7 @@ void logScaleAndTruncate(
 }
 
 template <typename T>
-void linearScaleAndTrucate(
+void linearScaleAndTruncate(
 	const std::vector<std::complex<T>>& input,
 	std::vector<T>& output,
 	T coeff,
