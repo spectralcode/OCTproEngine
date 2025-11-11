@@ -16,7 +16,7 @@
 #include <numeric>
 #include <cstring>
 #include <limits>
-#include "../../thirdparty/fftw/fftw3.h"
+#include "fftw3.h"
 
 namespace ope {
 namespace cpu_kernels {

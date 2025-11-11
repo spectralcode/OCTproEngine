@@ -38,22 +38,21 @@ if(WIN32)
 		COMMENT "Copying octproengine.dll"
 	)
 	
-	# Copy FFTW3 DLL from thirdparty folder
-	set(FFTW_DLL_PATH "${CMAKE_SOURCE_DIR}/src/thirdparty/fftw/libfftw3f-3.dll")
-	
-	if(EXISTS "${FFTW_DLL_PATH}")
+	# Copy FFTW3 DLL (FindFFTW3.cmake sets FFTW3_DLL variable)
+	if(FFTW3_DLL)
 		add_custom_command(TARGET copy_test_dlls POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${FFTW_DLL_PATH}"
+				"${FFTW3_DLL}"
 				${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>
-			COMMENT "Copying libfftw3f-3.dll from thirdparty"
+			COMMENT "Copying FFTW DLL"
 		)
 	else()
-		message(WARNING "FFTW DLL not found at: ${FFTW_DLL_PATH}")
+		message(WARNING "FFTW3_DLL not found; tests may fail to run")
 	endif()
 	
 	# Make copy_test_dlls depend on octproengine being built
 	add_dependencies(copy_test_dlls octproengine)
+	
 endif()
 
 # ========================================

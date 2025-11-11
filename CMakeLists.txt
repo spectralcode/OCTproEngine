@@ -17,6 +17,7 @@ option(BUILD_CUDA "Build with CUDA support" ON)
 option(BUILD_PYTHON "Build Python bindings" OFF)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_EXAMPLES "Build examples" OFF)
+option(FFTW3_AUTO_DOWNLOAD "Automatically download FFTW3 to thirdparty/fftw if not found (Windows only)" OFF)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 14)
@@ -25,7 +26,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Workaround for Visual Studio 2022 + pybind11 mutex bug
 # see: https://github.com/microsoft/STL/issues/4875
 if(MSVC)
-    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+	add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 endif()
 
 # Add cmake module path for custom Find modules

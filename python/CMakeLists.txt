@@ -3,17 +3,14 @@ cmake_minimum_required(VERSION 3.15)
 
 # Set CMake policies for compatibility with newer pybind11
 if(POLICY CMP0054)
-    cmake_policy(SET CMP0054 NEW)  # Only interpret if() arguments as variables or keywords when unquoted
+	cmake_policy(SET CMP0054 NEW)  # Only interpret if() arguments as variables or keywords when unquoted
 endif()
 if(POLICY CMP0057)
-    cmake_policy(SET CMP0057 NEW)  # Support new IN_LIST if() operator
+	cmake_policy(SET CMP0057 NEW)  # Support new IN_LIST if() operator
 endif()
 
 # Project declaration
 project(octproengine_python)
-
-# Find Python and pybind11
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 # Find Python and pybind11
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
@@ -72,23 +69,16 @@ if(WIN32)
 		COMMENT "Copying octproengine.dll to Python module directory"
 	)
 	
-	# Copy FFTW DLL (single precision)
-	set(_fftw_dll "")
-	if(DEFINED FFTW3_ROOT AND EXISTS "${FFTW3_ROOT}/libfftw3f-3.dll")
-		set(_fftw_dll "${FFTW3_ROOT}/libfftw3f-3.dll")
-	elseif(EXISTS "${CMAKE_SOURCE_DIR}/src/thirdparty/fftw/libfftw3f-3.dll")
-		set(_fftw_dll "${CMAKE_SOURCE_DIR}/src/thirdparty/fftw/libfftw3f-3.dll")
-	endif()
-	
-	if(_fftw_dll)
+	# Copy FFTW DLL (FindFFTW3.cmake sets FFTW3_DLL variable)
+	if(FFTW3_DLL)
 		add_custom_command(TARGET octproengine_python POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${_fftw_dll}"
+				"${FFTW3_DLL}"
 				"$<TARGET_FILE_DIR:octproengine_python>"
 			COMMENT "Copying FFTW DLL to Python module directory"
 		)
 	else()
-		message(WARNING "FFTW DLL (libfftw3f-3.dll) not found; Python module may fail to import at runtime.")
+		message(WARNING "FFTW3_DLL not found; Python module may fail to import")
 	endif()
 	
 	# Copy CUDA DLLs if CUDA is enabled
