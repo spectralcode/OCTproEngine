@@ -34,13 +34,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # Find dependencies
 if(BUILD_CUDA)
-	enable_language(CUDA)
-	find_package(CUDAToolkit REQUIRED)
-	set(CMAKE_CUDA_STANDARD 14)
-	add_compile_definitions(BUILD_WITH_CUDA)
-	message(STATUS "Building with CUDA support")
+	include(cmake/CudaConfig.cmake)
 else()
-	message(STATUS "Building CPU-only (CUDA disabled)")
+	message(STATUS "Building without CUDA")
 endif()
 
 # Find FFTW3

@@ -24,9 +24,6 @@ set(CUDA_SOURCES
 # ========================================
 
 if(BUILD_CUDA)
-	# Include CUDA architecture configuration
-	include(${CMAKE_SOURCE_DIR}/cmake/CudaConfig.cmake)
-	
 	# Build library with CUDA support
 	add_library(octproengine SHARED
 		${CORE_SOURCES}
@@ -42,10 +39,12 @@ if(BUILD_CUDA)
 	
 	# CUDA-specific properties
 	set_target_properties(octproengine PROPERTIES
-		CUDA_SEPARABLE_COMPILATION ON
-		CUDA_RESOLVE_DEVICE_SYMBOLS ON
+		CUDA_SEPARABLE_COMPILATION ${CUDA_SEPARABLE_COMPILATION}
+		CUDA_RESOLVE_DEVICE_SYMBOLS ${CUDA_RDC}
 	)
-	
+	if(UNIX)
+		set_target_properties(octproengine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+	endif()	
 else()
 	# CPU-only build
 	add_library(octproengine SHARED
