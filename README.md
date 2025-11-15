@@ -5,15 +5,15 @@ High-performance Optical Coherence Tomography (OCT) processing library with GPU 
 
 ## Requirements
 
-- **CUDA Toolkit** 11.0 or higher
-- **CMake** 3.18 or higher
-- **FFTW3** (single precision)
-  - Windows: Included in `src/thirdparty/fftw/`
-  - Linux: `sudo apt-get install libfftw3-dev` (Debian/Ubuntu)
-- **Python** 3.8+ (optional, for Python bindings)
-- **C++ Compiler**
-  - Windows: Visual Studio 2019+ with C++14 support
-  - Linux: GCC or Clang with C++14 support
+- **CUDA Toolkit** ≥ 11.0  
+	https://developer.nvidia.com/cuda-downloads
+- **CMake** ≥ 3.18  
+- **FFTW3**
+	- Win: https://fftw.org/download.html or use `build_windows.bat`  
+	- Linux: `sudo apt-get install libfftw3-dev`
+- **Python** ≥ 3.8 (optional)
+- **C++ Compiler**  
+	- Win: VS 2019+ (C++14, must be compatible with your cuda version)  
 
 ## Build
 
