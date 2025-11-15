@@ -41,6 +41,11 @@ public:
 	virtual void setPostProcessBackgroundProfile(const float* background, size_t length) = 0; // todo consitent naming. either "set" or "update"
 	virtual const std::vector<float>& getPostProcessBackgroundProfile() const = 0;
 
+	// Fixed-pattern noise management (profile is interleaved floats: real0, imag0, real1, imag1...)
+	virtual void requestFixedPatternNoiseDetermination() = 0;
+	virtual void setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) = 0;
+	virtual const std::vector<float>& getFixedPatternNoiseProfile() const = 0;
+
 	// Individual operations for testing
 	virtual std::vector<float> convertInput(
 		const void* input,

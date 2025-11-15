@@ -151,7 +151,7 @@ public:
 		bool sinusoidalScanCorrection;
 		
 		bool fixedPatternNoiseRemoval;
-		int bscansForNoiseDetermination;
+		int fixedPatternNoiseBscanCount;
 		bool continuousFixedPatternNoiseDetermination;
 		
 		PostProcessingParameters()
@@ -166,7 +166,7 @@ public:
 			, bscanFlip(false)
 			, sinusoidalScanCorrection(false)
 			, fixedPatternNoiseRemoval(false)
-			, bscansForNoiseDetermination(1)
+			, fixedPatternNoiseBscanCount(1)
 			, continuousFixedPatternNoiseDetermination(false)
 		{}
 	};
@@ -191,21 +191,25 @@ public:
 	void setCustomWindowCurve(const float* data, size_t size);
 	void setCustomDispersionCurve(const float* data, size_t size);
 	void setCustomPostProcessBackgroundProfile(const float* data, size_t size); //todo: think about removing "custom" from background subtraction methods.  
+	void setCustomFixedPatternNoiseProfile(const float* data, size_t complexPairs);
 
 	const float* getCustomResamplingCurve() const;
 	const float* getCustomWindowCurve() const;
 	const float* getCustomDispersionCurve() const;
 	const float* getCustomPostProcessBackgroundProfile() const;
+	const float* getCustomFixedPatternNoiseProfile() const;
 	
 	size_t getCustomResamplingCurveSize() const;
 	size_t getCustomWindowCurveSize() const;
 	size_t getCustomDispersionCurveSize() const;
 	size_t getCustomPostProcessBackgroundProfileSize() const;
+	size_t getCustomFixedPatternNoiseProfileSize() const;
 
 	bool hasCustomResamplingCurve() const;
 	bool hasCustomWindowCurve() const;
 	bool hasCustomDispersionCurve() const;
 	bool hasCustomPostProcessBackgroundProfile() const;
+	bool hasCustomFixedPatternNoiseProfile() const;
 
 	const float* getGeneratedResamplingCurve() const;
 	const float* getGeneratedWindowCurve() const;
@@ -234,6 +238,7 @@ private:
 	void adjustCustomWindowCurve();
 	void adjustCustomDispersionCurve();
 	void adjustCustomPostProcessBackgroundProfile();
+	void adjustCustomFixedPatternNoiseProfile();
 	
 	template<typename T>
 	T clamp(T value, T min, T max) const {

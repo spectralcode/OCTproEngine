@@ -142,7 +142,24 @@ public:
 	// Other toggles
 	void enableBscanFlip(bool enable);
 	void enableSinusoidalScanCorrection(bool enable);
+
+	// Fixed-pattern noise
 	void enableFixedPatternNoiseRemoval(bool enable);
+	void requestFixedPatternNoiseDetermination();
+	
+	/// Set the number of B-scans to accumulate for fixed-pattern noise determination
+	// Note: the CPU backend can accumulate A-scans across multiple process() calls;
+	// the CUDA backend currently operates only on the A-scans contained in the
+	// current GPU input buffer.
+	void setFixedPatternNoiseBscanCount(int numberOfBscans);
+
+	void enableContinuousFixedPatternNoiseDetermination(bool enable);
+	void setFixedPatternNoiseProfile(const float* data, size_t complexPairs);
+	const float* getFixedPatternNoiseProfile() const;
+	size_t getFixedPatternNoiseProfileSize() const;
+	bool hasFixedPatternNoiseProfile() const;
+	void saveFixedPatternNoiseProfileToFile(const std::string& filepath) const;
+	void loadFixedPatternNoiseProfileFromFile(const std::string& filepath);
 	
 	// ============================================
 	// LOW-LEVEL API - Individual Operations (for testing)

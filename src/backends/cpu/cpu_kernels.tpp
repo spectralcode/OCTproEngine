@@ -399,6 +399,85 @@ void applyPostProcessBackgroundSubtraction(
 	}
 }
 
+template <typename T>
+std::vector<T> getMinimumVarianceMean(
+	const std::vector<std::vector<std::complex<T>>>& allIfftOutputs,
+	int width,
+	int segments
+)
+{
+	int height = static_cast<int>(allIfftOutputs.size());
+	if (height == 0 || width <= 0 || segments <= 0) {
+		return std::vector<T>();
+	}
+
+	int segWidth = height / segments;
+	T factor = static_cast<T>(1.0) / static_cast<T>(segWidth);
+
+	std::vector<T> out;
+	out.resize(static_cast<size_t>(width) * 2);
+
+	for (int col = 0; col < width; ++col) {
+		T minVariance = static_cast<T>(std::numeric_limits<T>::infinity());
+		T meanAtMinX = static_cast<T>(0);
+		T meanAtMinY = static_cast<T>(0);
+
+		for (int seg = 0; seg < segments; ++seg) {
+			int offsetRow = seg * segWidth;
+
+			double sumX = 0.0;
+			double sumY = 0.0;
+			double sumXX = 0.0;
+
+			for (int r = 0; r < segWidth; ++r) {
+				int row = offsetRow + r;
+				const std::complex<T>& c = allIfftOutputs[row][col];
+				double dx = static_cast<double>(c.real());
+				double dy = static_cast<double>(c.imag());
+				sumX += dx;
+				sumY += dy;
+				sumXX += dx * dx + dy * dy;
+			}
+
+			T meanX = static_cast<T>(sumX * static_cast<double>(factor));
+			T meanY = static_cast<T>(sumY * static_cast<double>(factor));
+			T variance = static_cast<T>((sumXX * static_cast<double>(factor)) - (static_cast<double>(meanX) * static_cast<double>(meanX) + static_cast<double>(meanY) * static_cast<double>(meanY)));
+
+			if (variance < minVariance) {
+				minVariance = variance;
+				meanAtMinX = meanX;
+				meanAtMinY = meanY;
+			}
+		}
+
+		out[col * 2] = meanAtMinX;
+		out[col * 2 + 1] = meanAtMinY;
+	}
+
+	return out;
+}
+
+template <typename T>
+void meanALineSubtraction(
+	std::vector<std::complex<T>>& spectrum,
+	const std::vector<T>& meanInterleaved
+)
+{
+	if (meanInterleaved.empty()) return;
+
+	int half = static_cast<int>(spectrum.size()) / 2;
+	int pairs = static_cast<int>(meanInterleaved.size()) / 2;
+	int use = std::min(half, pairs);
+
+	for (int i = 0; i < use; ++i) {
+		int mi = i * 2;
+		T mx = meanInterleaved[mi];
+		T my = meanInterleaved[mi + 1];
+		spectrum[i].real(spectrum[i].real() - mx);
+		spectrum[i].imag(spectrum[i].imag() - my);
+	}
+}
+
 
 // ============================================
 // Helper functions

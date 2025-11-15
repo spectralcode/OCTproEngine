@@ -573,6 +573,126 @@ void Processor::requestPostProcessBackgroundRecording() {
 	this->impl->backend->requestPostProcessBackgroundRecording();
 }
 
+void Processor::requestFixedPatternNoiseDetermination() {
+	this->impl->backend->requestFixedPatternNoiseDetermination();
+}
+
+void Processor::setFixedPatternNoiseBscanCount(int numberOfBscans) {
+	if (numberOfBscans < 1) throw std::invalid_argument("numberOfBscans must be >= 1");
+	this->impl->config.postProcessingParams.fixedPatternNoiseBscanCount = numberOfBscans;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::enableContinuousFixedPatternNoiseDetermination(bool enable) {
+	this->impl->config.postProcessingParams.continuousFixedPatternNoiseDetermination = enable;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::setFixedPatternNoiseProfile(const float* data, size_t complexPairs) {
+	if (!data || complexPairs == 0) throw std::invalid_argument("Invalid fixed pattern noise profile");
+	
+	// Store in configuration (for metadata persistence)
+	this->impl->config.setCustomFixedPatternNoiseProfile(data, complexPairs);
+	
+	// Update backend if initialized
+	if (this->impl->initialized) {
+		this->impl->backend->setFixedPatternNoiseProfile(data, complexPairs);
+	}
+}
+
+const float* Processor::getFixedPatternNoiseProfile() const {
+	if (!this->impl->initialized) {
+		return nullptr;
+	}
+	const std::vector<float>& v = this->impl->backend->getFixedPatternNoiseProfile();
+	if (v.empty()) return nullptr;
+	return v.data();
+}
+
+size_t Processor::getFixedPatternNoiseProfileSize() const {
+	if (!this->impl->initialized) return 0;
+	const std::vector<float>& v = this->impl->backend->getFixedPatternNoiseProfile();
+	return v.size()/2; // complex pairs
+}
+
+bool Processor::hasFixedPatternNoiseProfile() const {
+	if (!this->impl->initialized) return false;
+	const std::vector<float>& v = this->impl->backend->getFixedPatternNoiseProfile();
+	return !v.empty();
+}
+
+void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) const {
+	const float* profile = nullptr;
+	size_t size = 0;
+	
+	if (this->impl->initialized) {
+		const std::vector<float>& fpnProfile = this->impl->backend->getFixedPatternNoiseProfile();
+		if (!fpnProfile.empty()) {
+			profile = fpnProfile.data();
+			size = fpnProfile.size();
+		}
+	} else {
+		profile = this->impl->config.getCustomFixedPatternNoiseProfile();
+		size = this->impl->config.getCustomFixedPatternNoiseProfileSize() * 2; // convert pairs to float count
+	}
+	
+	if (!profile || size == 0) {
+		throw std::runtime_error("No fixed pattern noise profile to save");
+	}
+	
+	size_t complexPairs = size / 2;
+	std::ofstream file(filepath);
+	if (!file.is_open()) throw std::runtime_error("Failed to open file for writing: " + filepath);
+	file << "Sample Number;Real;Imag\n";
+	for (size_t i = 0; i < complexPairs; ++i) {
+		file << i << ";" << profile[i*2] << ";" << profile[i*2+1] << "\n";
+	}
+	file.close();
+	
+	if (!file.good()) {
+		throw std::runtime_error("Error writing to file: " + filepath);
+	}
+}
+
+void Processor::loadFixedPatternNoiseProfileFromFile(const std::string& filepath) {
+	std::ifstream file(filepath);
+	if (!file.is_open()) throw std::runtime_error("Failed to open file for reading: " + filepath);
+	std::string line;
+	if (!std::getline(file, line)) throw std::runtime_error("Empty file: " + filepath);
+	std::vector<float> profile;
+	int lineNumber = 1;
+	while (std::getline(file, line)) {
+		++lineNumber;
+		if (line.empty()) continue;
+		size_t p1 = line.find(';');
+		if (p1 == std::string::npos) throw std::runtime_error("Invalid format at line " + std::to_string(lineNumber));
+		size_t p2 = line.find(';', p1 + 1);
+		if (p2 == std::string::npos) throw std::runtime_error("Invalid format at line " + std::to_string(lineNumber));
+		std::string realStr = line.substr(p1 + 1, p2 - p1 - 1);
+		std::string imagStr = line.substr(p2 + 1);
+		try {
+			float real = std::stof(realStr);
+			float imag = std::stof(imagStr);
+			profile.push_back(real);
+			profile.push_back(imag);
+		} catch (...) {
+			throw std::runtime_error("Invalid number at line " + std::to_string(lineNumber));
+		}
+	}
+	file.close();
+	if (profile.empty()) throw std::runtime_error("No data found in file: " + filepath);
+
+	// Forward to backend if initialized
+	if (!this->impl->initialized) {
+		throw std::runtime_error("Processor must be initialized before loading fixed pattern noise profile");
+	}
+	this->impl->backend->setFixedPatternNoiseProfile(profile.data(), profile.size()/2);
+}
+
 void Processor::setPostProcessBackgroundWeight(float weight) {
 	this->impl->config.postProcessingParams.backgroundWeight = weight;
 	

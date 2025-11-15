@@ -36,6 +36,11 @@ public:
 	void setPostProcessBackgroundProfile(const float* background, size_t length) override;
 	const std::vector<float>& getPostProcessBackgroundProfile() const override;
 
+	// Fixed-pattern noise management
+	void requestFixedPatternNoiseDetermination() override;
+	void setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) override;
+	const std::vector<float>& getFixedPatternNoiseProfile() const override;
+
 	// Buffer management
 	IOBuffer& getInputBuffer(int index) override;
 	IOBuffer& getNextAvailableInputBuffer() override;

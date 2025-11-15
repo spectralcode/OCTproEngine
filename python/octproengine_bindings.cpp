@@ -444,7 +444,7 @@ PYBIND11_MODULE(octproengine, m) {
 		.def_readwrite("bscan_flip", &ope::ProcessorConfiguration::PostProcessingParameters::bscanFlip)
 		.def_readwrite("sinusoidal_scan_correction", &ope::ProcessorConfiguration::PostProcessingParameters::sinusoidalScanCorrection)
 		.def_readwrite("fixed_pattern_noise_removal", &ope::ProcessorConfiguration::PostProcessingParameters::fixedPatternNoiseRemoval)
-		.def_readwrite("bscans_for_noise_determination", &ope::ProcessorConfiguration::PostProcessingParameters::bscansForNoiseDetermination)
+		.def_readwrite("fixed_pattern_noise_bscan_count", &ope::ProcessorConfiguration::PostProcessingParameters::fixedPatternNoiseBscanCount)
 		.def_readwrite("continuous_fixed_pattern_noise_determination", &ope::ProcessorConfiguration::PostProcessingParameters::continuousFixedPatternNoiseDetermination);
 	
 	// ============================================
@@ -748,6 +748,73 @@ PYBIND11_MODULE(octproengine, m) {
 				throw ConfigurationError(std::string("Failed to load background profile: ") + e.what());
 			}
 		}, py::arg("filepath"), "Load a background profile from a file")
+		
+		.def("request_fixed_pattern_noise_determination", [](ProcessorWrapper& self) {
+			self.processor.requestFixedPatternNoiseDetermination();
+		}, "Request fixed-pattern noise determination on the next frame (one-shot mode)")
+		
+		.def("enable_continuous_fixed_pattern_noise_determination", [](ProcessorWrapper& self, bool enable) {
+			self.processor.enableContinuousFixedPatternNoiseDetermination(enable);
+		}, py::arg("enable"), "Enable or disable continuous fixed-pattern noise determination")
+		
+		.def("set_fixed_pattern_noise_bscan_count", [](ProcessorWrapper& self, int length) {
+			self.processor.setFixedPatternNoiseBscanCount(length);
+		}, py::arg("length"), "Set number of B-scans to use for fixed-pattern noise determination")
+		
+		.def("has_fixed_pattern_noise_profile", [](const ProcessorWrapper& self) {
+			return self.processor.hasFixedPatternNoiseProfile();
+		}, "Check if an fixed-pattern noise profile is currently loaded")
+		
+		.def("get_fixed_pattern_noise_profile_size", [](const ProcessorWrapper& self) {
+			return self.processor.getFixedPatternNoiseProfileSize();
+		}, "Get size of the fixed-pattern noise profile (in complex pairs)")
+		
+		.def("get_fixed_pattern_noise_profile", [](const ProcessorWrapper& self) -> py::array_t<float> {
+			if (!self.processor.hasFixedPatternNoiseProfile()) {
+				throw BufferError("No fixed-pattern noise profile available");
+			}
+			size_t pairs = self.processor.getFixedPatternNoiseProfileSize();
+			const float* data = self.processor.getFixedPatternNoiseProfile();
+			py::array_t<float> result(pairs * 2);  // interleaved real/imag
+			py::buffer_info buf = result.request();
+			float* ptr = static_cast<float*>(buf.ptr);
+			std::memcpy(ptr, data, pairs * 2 * sizeof(float));
+			return result;
+		}, "Get the current fixed-pattern noise profile as a NumPy array (interleaved real/imag)")
+		
+		.def("set_fixed_pattern_noise_profile", [](ProcessorWrapper& self, py::array_t<float> profile) {
+			py::buffer_info buf = profile.request();
+			
+			if (buf.ndim != 1) {
+				throw BufferError("fixed-pattern noise profile must be a 1D array");
+			}
+			
+			if (buf.size % 2 != 0) {
+				throw BufferError("fixed-pattern noise profile must have even length (interleaved real/imag pairs)");
+			}
+			
+			size_t complexPairs = buf.size / 2;
+			self.processor.setFixedPatternNoiseProfile(
+				static_cast<float*>(buf.ptr), 
+				complexPairs
+			);
+		}, py::arg("profile"), "Set the fixed-pattern noise profile from a NumPy array (interleaved real/imag pairs)")
+		
+		.def("save_fixed_pattern_noise_profile_to_file", [](const ProcessorWrapper& self, const std::string& filepath) {
+			try {
+				self.processor.saveFixedPatternNoiseProfileToFile(filepath);
+			} catch (const std::exception& e) {
+				throw ConfigurationError(std::string("Failed to save fixed-pattern noise profile: ") + e.what());
+			}
+		}, py::arg("filepath"), "Save the fixed-pattern noise profile to a CSV file")
+		
+		.def("load_fixed_pattern_noise_profile_from_file", [](ProcessorWrapper& self, const std::string& filepath) {
+			try {
+				self.processor.loadFixedPatternNoiseProfileFromFile(filepath);
+			} catch (const std::exception& e) {
+				throw ConfigurationError(std::string("Failed to load fixed-pattern noise profile: ") + e.what());
+			}
+		}, py::arg("filepath"), "Load an fixed-pattern noise profile from a CSV file")
 		
 		// Context manager support
 		.def("__enter__", &ProcessorWrapper::enter, py::return_value_policy::reference)

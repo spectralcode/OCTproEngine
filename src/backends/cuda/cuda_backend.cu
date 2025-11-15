@@ -88,6 +88,7 @@ struct CudaBackend::Impl {
 	// Fixed pattern noise removal
 	cufftComplex* d_meanALine = nullptr;
 	bool fixedPatternNoiseDetermined = false;
+	std::vector<float> recordedFixedPatternNoise;
 	
 	// Post-processing
 	float* d_postProcBackgroundLine = nullptr;
@@ -643,15 +644,23 @@ void CudaBackend::process(IOBuffer& input) {
 	// Step 5: Fixed-pattern noise removal
 	if (config.postProcessingParams.fixedPatternNoiseRemoval) {
 		int width = signalLength;
-		int height = config.postProcessingParams.bscansForNoiseDetermination * ascansPerBscan;
+		int height = config.postProcessingParams.fixedPatternNoiseBscanCount * ascansPerBscan;
 		
 		if ((!config.postProcessingParams.continuousFixedPatternNoiseDetermination && 
 			 !this->impl->fixedPatternNoiseDetermined) ||
 			config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
-			cuda_kernels::getMinimumVarianceMean<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_meanALine, d_fftBuffer2, width, height,
-				FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS);
-			this->impl->fixedPatternNoiseDetermined = true;
+
+			int ascansInBuffer = samplesPerBuffer / signalLength;
+			if (height > ascansInBuffer) {
+				// not enough ascans in the current buffer to compute FPN; skip
+			} else {
+				// perform computation
+				cuda_kernels::getMinimumVarianceMean<<<gridSize, blockSize, 0, stream>>>(
+					this->impl->d_meanALine, d_fftBuffer2, width, height,
+					FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS);
+
+				this->impl->fixedPatternNoiseDetermined = true;
+			}
 		}
 		
 		cuda_kernels::meanALineSubtraction<<<gridSize/2, blockSize, 0, stream>>>(
@@ -824,6 +833,54 @@ void CudaBackend::updateWindowCurve(const float* curve, size_t length) {
 
 void CudaBackend::requestPostProcessBackgroundRecording() {
 	this->impl->postProcessBackgroundRecordingRequested = true;
+}
+
+void CudaBackend::requestFixedPatternNoiseDetermination() {
+	// Force recomputation on next frame
+	this->impl->fixedPatternNoiseDetermined = false;
+}
+
+void CudaBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
+	if (!profileInterleaved || complexPairs == 0) {
+		throw std::invalid_argument("Invalid fixed pattern noise profile pointer");
+	}
+	// Expect complexPairs == signalLength/2 (positive half length)
+	size_t expectedPairs = static_cast<size_t>(this->impl->signalLength/2);
+	if (complexPairs != expectedPairs) {
+		throw std::invalid_argument("Invalid fixed pattern noise profile size. Expected " + std::to_string(expectedPairs));
+	}
+
+	// Copy interleaved floats into device cufftComplex d_meanALine (only positive half)
+	// Allocate temporary host buffer of cufftComplex size signalLength and zero it, then fill first half
+	std::vector<cufftComplex> hostMean(this->impl->signalLength);
+	for (size_t i = 0; i < this->impl->signalLength; ++i) {
+		hostMean[i].x = 0.0f;
+		hostMean[i].y = 0.0f;
+	}
+	for (size_t i = 0; i < complexPairs; ++i) {
+		hostMean[i].x = profileInterleaved[i*2];
+		hostMean[i].y = profileInterleaved[i*2 + 1];
+	}
+
+	checkCudaErrors(cudaMemcpyAsync(
+		this->impl->d_meanALine,
+		hostMean.data(),
+		sizeof(cufftComplex) * this->impl->signalLength,
+		cudaMemcpyHostToDevice,
+		this->impl->userRequestStream
+	));
+	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
+
+	// Update host copy
+	this->impl->recordedFixedPatternNoise.resize(complexPairs * 2);
+	for (size_t i = 0; i < complexPairs; ++i) {
+		this->impl->recordedFixedPatternNoise[i*2] = profileInterleaved[i*2];
+		this->impl->recordedFixedPatternNoise[i*2+1] = profileInterleaved[i*2+1];
+	}
+}
+
+const std::vector<float>& CudaBackend::getFixedPatternNoiseProfile() const {
+	return this->impl->recordedFixedPatternNoise;
 }
 
 void CudaBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {

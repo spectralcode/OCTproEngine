@@ -19,7 +19,7 @@ except ImportError:
     sys.exit(1)
 
 # ============================================
-# CONFIGURATION (matches C++ test)
+# CONFIGURATION
 # ============================================
 
 SIGNAL_LENGTH = 2048
@@ -33,6 +33,7 @@ ENABLE_BACKGROUND_REMOVAL = True
 ENABLE_LOG_SCALING = True
 ENABLE_BSCAN_FLIP = False
 ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = False
+ENABLE_FIXED_PATTERN_NOISE_DETERMINATION = False
 
 INTERPOLATION_METHOD = ope.InterpolationMethod.CUBIC
 RESAMPLING_COEFFS = [0.5, 2048.0, -100.0, 50.0]
@@ -201,7 +202,10 @@ def configure_processor(processor):
     processor.enable_post_process_background_subtraction(ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION)
     if ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION:
         processor.request_post_process_background_recording()
-
+    
+    processor.enable_fixed_pattern_noise_removal(ENABLE_FIXED_PATTERN_NOISE_DETERMINATION)
+    if ENABLE_FIXED_PATTERN_NOISE_DETERMINATION:
+        processor.request_fixed_pattern_noise_determination()
 
 def run_backend_test(backend_name, backend_type, test_data):
     """Run test with specified backend"""

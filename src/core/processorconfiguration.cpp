@@ -36,6 +36,10 @@ struct ProcessorConfiguration::Impl {
 	std::vector<float> customPostProcessBackgroundProfileOriginal;
 	std::vector<float> customPostProcessBackgroundProfile;
 
+	// Fixed-pattern noise profile (interleaved real/imag, positive half only). original is kept for reference.
+	std::vector<float> customFixedPatternNoiseProfileOriginal;
+	std::vector<float> customFixedPatternNoiseProfile;
+
 	Impl() = default;
 	
 	Impl(const Impl& other)
@@ -47,6 +51,8 @@ struct ProcessorConfiguration::Impl {
 		, customDispersionCurve(other.customDispersionCurve)
 		, customPostProcessBackgroundProfileOriginal(other.customPostProcessBackgroundProfileOriginal)
 		, customPostProcessBackgroundProfile(other.customPostProcessBackgroundProfile)
+		, customFixedPatternNoiseProfileOriginal(other.customFixedPatternNoiseProfileOriginal)
+		, customFixedPatternNoiseProfile(other.customFixedPatternNoiseProfile)
 	{}
 };
 
@@ -324,6 +330,7 @@ void ProcessorConfiguration::adjustAllCustomCurves() {
 	this->adjustCustomWindowCurve();
 	this->adjustCustomDispersionCurve();
 	this->adjustCustomPostProcessBackgroundProfile();
+	this->adjustCustomFixedPatternNoiseProfile();
 }
 
 void ProcessorConfiguration::setCustomPostProcessBackgroundProfile(const float* data, size_t size) {
@@ -370,6 +377,57 @@ void ProcessorConfiguration::adjustCustomPostProcessBackgroundProfile() {
 	} else if (originalSize > targetSize) {
 		// Truncate
 		this->impl->customPostProcessBackgroundProfile.resize(targetSize);
+	}
+}
+
+// Fixed-pattern noise profile management
+void ProcessorConfiguration::setCustomFixedPatternNoiseProfile(const float* data, size_t complexPairs) {
+	if (!data) {
+		throw std::invalid_argument("Custom fixed-pattern noise profile data is null");
+	}
+	if (complexPairs == 0) {
+		throw std::invalid_argument("Custom fixed-pattern noise profile size is zero");
+	}
+	// Store as flat interleaved array (real, imag, real, imag, ...)
+	this->impl->customFixedPatternNoiseProfileOriginal.assign(data, data + complexPairs * 2);
+	// Adjust to current signalLength (FPN profile size = signalLength / 2 complex pairs)
+	this->adjustCustomFixedPatternNoiseProfile();
+}
+
+const float* ProcessorConfiguration::getCustomFixedPatternNoiseProfile() const {
+	if (this->impl->customFixedPatternNoiseProfile.empty()) {
+		return nullptr;
+	}
+	return this->impl->customFixedPatternNoiseProfile.data();
+}
+
+size_t ProcessorConfiguration::getCustomFixedPatternNoiseProfileSize() const {
+	// Return count of complex pairs (not float count)
+	return this->impl->customFixedPatternNoiseProfile.size() / 2;
+}
+
+bool ProcessorConfiguration::hasCustomFixedPatternNoiseProfile() const {
+	return !this->impl->customFixedPatternNoiseProfileOriginal.empty();
+}
+
+void ProcessorConfiguration::adjustCustomFixedPatternNoiseProfile() {
+	if (this->impl->customFixedPatternNoiseProfileOriginal.empty()) {
+		this->impl->customFixedPatternNoiseProfile.clear();
+		return;
+	}
+	
+	// FPN profile length is signalLength / 2 complex pairs (stored as interleaved floats: 2 * (signalLength / 2))
+	size_t targetSize = static_cast<size_t>(this->dataParams.signalLength / 2 * 2);
+	size_t originalSize = this->impl->customFixedPatternNoiseProfileOriginal.size();
+	
+	this->impl->customFixedPatternNoiseProfile = this->impl->customFixedPatternNoiseProfileOriginal;
+	
+	if (originalSize < targetSize) {
+		// Zero-pad
+		this->impl->customFixedPatternNoiseProfile.resize(targetSize, 0.0f);
+	} else if (originalSize > targetSize) {
+		// Truncate
+		this->impl->customFixedPatternNoiseProfile.resize(targetSize);
 	}
 }
 

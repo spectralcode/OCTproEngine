@@ -87,6 +87,20 @@ void linearScaleAndTruncate(
 	T addend
 );
 
+// Fixed-pattern-noise helpers
+template <typename T>
+std::vector<T> getMinimumVarianceMean(
+	const std::vector<std::vector<std::complex<T>>>& allIfftOutputs,
+	int width,
+	int segments
+);
+
+template <typename T>
+void meanALineSubtraction(
+	std::vector<std::complex<T>>& spectrum,
+	const std::vector<T>& meanInterleaved
+);
+
 template <typename T>
 T cubicHermiteInterpolation(
 	const T y0,

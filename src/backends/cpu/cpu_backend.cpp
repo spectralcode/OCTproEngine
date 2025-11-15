@@ -1,11 +1,20 @@
 #include "cpu_backend.h"
 #include "cpu_kernels.h"
 #include <algorithm>
-#include <cmath>
+#include <atomic>
+#include <complex>
+#include <condition_variable>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
+#include <thread>
+#include <vector>
+
 
 namespace ope {
+
 
 // ============================================
 // Internal implementation
@@ -41,6 +50,13 @@ struct CpuBackend::Impl {
 	fftwf_complex* fftIn;
 	fftwf_complex* fftOut;
 	fftwf_plan fftPlan;
+
+	// Storage for per-buffer IFFT outputs when post-processing requires whole-buffer context
+	std::vector<std::vector<std::complex<float>>> allIfftOutputs;
+	
+	// Accumulated IFFT outputs for FPN determination across buffers
+	std::vector<std::vector<std::complex<float>>> accumulatedIfftOutputs;
+	int accumulatedAscanCount = 0;
 	
 	// Curves
 	std::vector<float> resampleCurve;
@@ -48,7 +64,14 @@ struct CpuBackend::Impl {
 	std::vector<float> windowCurve;
 	std::vector<float> postProcessBackgroundProfile;
 
+	// Fixed-pattern noise storage (interleaved real/imag)
+	std::vector<float> recordedFixedPatternNoise;
+	bool fixedPatternNoiseDeterminationRequested = false;
+
 	bool postProcessBackgroundRecordingRequested;
+
+	// Compute Fixed-pattern noise helper 
+	void computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans);
 	
 	Impl() 
 		: currentOutputBuffer(0)
@@ -77,6 +100,7 @@ struct CpuBackend::Impl {
 			fftwf_free(this->fftOut);
 		}
 	}
+
 
 	void recordPostProcessBackground(const float* processedData, int samplesPerAscan, int totalAscans) {
 		this->postProcessBackgroundProfile.resize(samplesPerAscan, 0.0f);
@@ -152,6 +176,10 @@ struct CpuBackend::Impl {
 		
 		float* outputPtr = static_cast<float*>(output.getDataPointer());
 		
+		// Prepare storage for per-A-scan IFFT outputs (some post-processing needs whole buffer)
+		this->allIfftOutputs.clear();
+		this->allIfftOutputs.resize(totalAscans);
+
 		// Process each A-scan
 		for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
 			const void* ascanStart = static_cast<const uint8_t*>(inputData) + 
@@ -209,37 +237,50 @@ struct CpuBackend::Impl {
 				this->fftIn,
 				this->fftOut
 			);
-			
-			// 7. Magnitude calculation, grayscale conversion, truncation
-			std::vector<float> processedAscan;
-			if (config.postProcessingParams.logScaling) {
-				cpu_kernels::logScaleAndTruncate<float>(
-					ifftOutput,
-					processedAscan,
-					config.postProcessingParams.multiplicator,
-					config.postProcessingParams.grayscaleMin,
-					config.postProcessingParams.grayscaleMax,
-					config.postProcessingParams.addend,
-					(config.postProcessingParams.grayscaleMin == config.postProcessingParams.grayscaleMax)
-				);
-			} else {
-				cpu_kernels::linearScaleAndTruncate<float>(
-					ifftOutput,
-					processedAscan,
-					config.postProcessingParams.multiplicator,
-					config.postProcessingParams.grayscaleMin,
-					config.postProcessingParams.grayscaleMax,
-					config.postProcessingParams.addend
-				);
-			}
-			// 8. Copy to output
-			int outputStartIdx = ascanIdx * outputSamplesPerAscan;
-			std::copy(processedAscan.begin(),
-			          processedAscan.end(),
-			          outputPtr + outputStartIdx);
+
+			// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
+			this->allIfftOutputs[ascanIdx] = std::move(ifftOutput);
 		}
 
-		// 9. Post-process background profile subtraction
+			// 7. Fixed-pattern-noise determination
+			this->computeFixedPatternNoiseIfRequested(config, signalLength, totalAscans);
+
+			for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
+				std::vector<std::complex<float>>& ifftOutputRef = this->allIfftOutputs[ascanIdx];
+				if (config.postProcessingParams.fixedPatternNoiseRemoval && !this->recordedFixedPatternNoise.empty()) {
+					const std::vector<float>& meanVec = this->recordedFixedPatternNoise;
+					if (!meanVec.empty()) {
+						cpu_kernels::meanALineSubtraction<float>(ifftOutputRef, meanVec);
+					}
+				}
+				// 8. Magnitude calculation, grayscale conversion, truncation
+				std::vector<float> processedAscan;
+				if (config.postProcessingParams.logScaling) {
+					cpu_kernels::logScaleAndTruncate<float>(
+						ifftOutputRef,
+						processedAscan,
+						config.postProcessingParams.multiplicator,
+						config.postProcessingParams.grayscaleMin,
+						config.postProcessingParams.grayscaleMax,
+						config.postProcessingParams.addend,
+						(config.postProcessingParams.grayscaleMin == config.postProcessingParams.grayscaleMax)
+					);
+				} else {
+					cpu_kernels::linearScaleAndTruncate<float>(
+						ifftOutputRef,
+						processedAscan,
+						config.postProcessingParams.multiplicator,
+						config.postProcessingParams.grayscaleMin,
+						config.postProcessingParams.grayscaleMax,
+						config.postProcessingParams.addend
+					);
+				}
+				// Copy to output
+				int outputStartIdx = ascanIdx * outputSamplesPerAscan;
+				std::copy(processedAscan.begin(), processedAscan.end(), outputPtr + outputStartIdx);
+			}
+
+			// 9. Post-process background profile subtraction
 		if (config.postProcessingParams.backgroundRemoval) {
 			// Record background if requested (must happen BEFORE removal)
 			if (this->postProcessBackgroundRecordingRequested) {
@@ -260,6 +301,61 @@ struct CpuBackend::Impl {
 		}
 	}
 };
+
+void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans) {
+	const int FPN_SEGMENTS = 8; // match CUDA //todo: make configurable?
+
+	for (const auto& ifftOutput : this->allIfftOutputs) {
+		this->accumulatedIfftOutputs.push_back(ifftOutput);
+		this->accumulatedAscanCount++;
+	}
+
+	int requiredAscanCount = config.postProcessingParams.fixedPatternNoiseBscanCount *
+							 config.dataParams.ascansPerBscan;
+
+	// Only compute when we have at least the required number of A-scans.
+	if (!(this->fixedPatternNoiseDeterminationRequested || config.postProcessingParams.continuousFixedPatternNoiseDetermination)) {
+		return;
+	}
+	if (this->accumulatedAscanCount < requiredAscanCount) {
+		return;
+	}
+
+	std::vector<std::vector<std::complex<float>>> inputs;
+	if (this->accumulatedAscanCount == requiredAscanCount) {
+		inputs = this->accumulatedIfftOutputs;
+	} else {
+		inputs.assign(this->accumulatedIfftOutputs.begin(),
+					  this->accumulatedIfftOutputs.begin() + requiredAscanCount);
+	}
+
+	std::vector<float> meanInterleaved = cpu_kernels::getMinimumVarianceMean<float>(inputs, signalLength, FPN_SEGMENTS);
+
+	int positivePairs = signalLength / 2;
+	this->recordedFixedPatternNoise.clear();
+	this->recordedFixedPatternNoise.reserve(static_cast<size_t>(positivePairs) * 2);
+	for (int i = 0; i < positivePairs; ++i) {
+		this->recordedFixedPatternNoise.push_back(meanInterleaved[i * 2]);
+		this->recordedFixedPatternNoise.push_back(meanInterleaved[i * 2 + 1]);
+	}
+
+	// If continuous mode, keep the last requiredAscanCount A-scans as a sliding window.
+	if (config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
+		if (this->accumulatedAscanCount > requiredAscanCount) {
+			// erase newer entries, keep the earliest ones
+			this->accumulatedIfftOutputs.erase(this->accumulatedIfftOutputs.begin() + requiredAscanCount,
+											   this->accumulatedIfftOutputs.end());
+			this->accumulatedAscanCount = requiredAscanCount;
+		}
+	} else {
+		// one-shot determination: clear accumulation after computing
+		this->accumulatedIfftOutputs.clear();
+		this->accumulatedAscanCount = 0;
+	}
+
+	this->fixedPatternNoiseDeterminationRequested = false;
+}
+
 
 // ============================================
 // CpuBackend Implementation
@@ -584,11 +680,56 @@ std::vector<float> CpuBackend::dispersionCompensationAndWindowing(const float* i
 }
 
 std::vector<float> CpuBackend::getMinimumVarianceMean(const float* input, int width, int height, int segments) {
-	return std::vector<float>(width);  // Stub
+	if (!input) {
+		return std::vector<float>();
+	}
+
+	// Convert interleaved input into row-major vector of complex rows
+	std::vector<std::vector<std::complex<float>>> rows;
+	rows.resize(height);
+	for (int r = 0; r < height; ++r) {
+		rows[r].resize(width);
+		for (int c = 0; c < width; ++c) {
+			int idx = (r * width + c) * 2;
+			rows[r][c] = std::complex<float>(input[idx], input[idx + 1]);
+		}
+	}
+
+	return cpu_kernels::getMinimumVarianceMean<float>(rows, width, segments);
 }
 
 std::vector<float> CpuBackend::fixedPatternNoiseRemoval(const float* input, const float* meanALine, int lineWidth, int numLines) {
-	return std::vector<float>(lineWidth * numLines);  // Stub
+	if (!input) {
+		return std::vector<float>();
+	}
+
+	int totalSamples = lineWidth * numLines;
+
+	// Build complex vector and apply mean-line subtraction via kernel
+	std::vector<std::complex<float>> data;
+	data.resize(static_cast<size_t>(totalSamples));
+	for (int i = 0; i < totalSamples; ++i) {
+		int idx = i * 2;
+		data[i] = std::complex<float>(input[idx], input[idx + 1]);
+	}
+
+	std::vector<float> meanVec;
+	if (meanALine) {
+		meanVec.assign(meanALine, meanALine + lineWidth * 2);
+	}
+
+	cpu_kernels::meanALineSubtraction<float>(data, meanVec);
+
+	// Compute magnitudes
+	std::vector<float> output;
+	output.resize(static_cast<size_t>(totalSamples));
+	for (int i = 0; i < totalSamples; ++i) {
+		float re = data[i].real();
+		float im = data[i].imag();
+		output[i] = std::sqrt(re * re + im * im);
+	}
+
+	return output;
 }
 
 std::vector<float> CpuBackend::postProcessTruncate(const float* input, bool logScaling, float grayscaleMax, float grayscaleMin, float addend, float multiplicator, int lineWidth, int samples) {
@@ -666,6 +807,22 @@ void CpuBackend::setPostProcessBackgroundProfile(const float* background, size_t
 
 const std::vector<float>& CpuBackend::getPostProcessBackgroundProfile() const {
 	return this->impl->postProcessBackgroundProfile;
+}
+
+// Fixed-pattern noise management
+void CpuBackend::requestFixedPatternNoiseDetermination() {
+	this->impl->fixedPatternNoiseDeterminationRequested = true;
+}
+
+void CpuBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
+	if (!profileInterleaved && complexPairs > 0) {
+		throw std::invalid_argument("Invalid fixed-pattern noise profile pointer");
+	}
+	this->impl->recordedFixedPatternNoise.assign(profileInterleaved, profileInterleaved + complexPairs * 2);
+}
+
+const std::vector<float>& CpuBackend::getFixedPatternNoiseProfile() const {
+	return this->impl->recordedFixedPatternNoise;
 }
 
 
