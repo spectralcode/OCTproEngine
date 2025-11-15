@@ -61,9 +61,10 @@ public:
 	int getNumInputBuffers() const override;
 	
 	// Post-process background methods
-	void requestPostProcessBackgroundRecording();
-	void setPostProcessBackground(const float* background, size_t length);
-	std::vector<float> getRecordedPostProcessBackground();
+	void requestPostProcessBackgroundRecording() override;
+	void setPostProcessBackgroundProfile(const float* background, size_t length) override;
+	const std::vector<float>& getPostProcessBackgroundProfile() const override;
+
 	
 	// Individual operations (for testing/debugging)
 	std::vector<float> convertInput(
@@ -173,7 +174,7 @@ public:
 		int numBscans
 	) override;
 	
-	std::vector<float> postProcessBackgroundRemoval(
+	std::vector<float> postProcessBackgroundSubtraction(
 		const float* input,
 		const float* backgroundLine,
 		float weight,

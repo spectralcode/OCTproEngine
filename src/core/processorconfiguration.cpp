@@ -32,6 +32,10 @@ struct ProcessorConfiguration::Impl {
 	mutable std::vector<float> generatedWindowCurve;
 	mutable std::vector<float> generatedDispersionCurve;
 	
+	// Background profile. original is used to adjust size when signalLenght is changed
+	std::vector<float> customPostProcessBackgroundProfileOriginal;
+	std::vector<float> customPostProcessBackgroundProfile;
+
 	Impl() = default;
 	
 	Impl(const Impl& other)
@@ -41,6 +45,8 @@ struct ProcessorConfiguration::Impl {
 		, customResamplingCurve(other.customResamplingCurve)
 		, customWindowCurve(other.customWindowCurve)
 		, customDispersionCurve(other.customDispersionCurve)
+		, customPostProcessBackgroundProfileOriginal(other.customPostProcessBackgroundProfileOriginal)
+		, customPostProcessBackgroundProfile(other.customPostProcessBackgroundProfile)
 	{}
 };
 
@@ -317,7 +323,54 @@ void ProcessorConfiguration::adjustAllCustomCurves() {
 	this->adjustCustomResamplingCurve();
 	this->adjustCustomWindowCurve();
 	this->adjustCustomDispersionCurve();
-	// No cache invalidation needed - curves regenerate on demand
+	this->adjustCustomPostProcessBackgroundProfile();
+}
+
+void ProcessorConfiguration::setCustomPostProcessBackgroundProfile(const float* data, size_t size) {
+	if (!data) {
+		throw std::invalid_argument("Custom post-process background curve data is null");
+	}
+	if (size == 0) {
+		throw std::invalid_argument("Custom post-process background curve size is zero");
+	}
+	this->impl->customPostProcessBackgroundProfileOriginal.assign(data, data + size);
+	this->adjustCustomPostProcessBackgroundProfile();
+}
+
+const float* ProcessorConfiguration::getCustomPostProcessBackgroundProfile() const {
+	if (this->impl->customPostProcessBackgroundProfile.empty()) {
+		return nullptr;
+	}
+	return this->impl->customPostProcessBackgroundProfile.data();
+}
+
+size_t ProcessorConfiguration::getCustomPostProcessBackgroundProfileSize() const {
+	return this->impl->customPostProcessBackgroundProfile.size();
+}
+
+bool ProcessorConfiguration::hasCustomPostProcessBackgroundProfile() const {
+	return !this->impl->customPostProcessBackgroundProfileOriginal.empty();
+}
+
+void ProcessorConfiguration::adjustCustomPostProcessBackgroundProfile() {
+	if (this->impl->customPostProcessBackgroundProfileOriginal.empty()) {
+		this->impl->customPostProcessBackgroundProfile.clear();
+		return;
+	}
+	
+	// Background profile length is signalLength / 2 (processed A-scan length)
+	size_t targetSize = static_cast<size_t>(this->dataParams.signalLength / 2);
+	size_t originalSize = this->impl->customPostProcessBackgroundProfileOriginal.size();
+	
+	this->impl->customPostProcessBackgroundProfile = this->impl->customPostProcessBackgroundProfileOriginal;
+	
+	if (originalSize < targetSize) {
+		// Zero-pad
+		this->impl->customPostProcessBackgroundProfile.resize(targetSize, 0.0f);
+	} else if (originalSize > targetSize) {
+		// Truncate
+		this->impl->customPostProcessBackgroundProfile.resize(targetSize);
+	}
 }
 
 // ============================================

@@ -32,6 +32,7 @@ ENABLE_DISPERSION = True
 ENABLE_BACKGROUND_REMOVAL = True
 ENABLE_LOG_SCALING = True
 ENABLE_BSCAN_FLIP = False
+ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = False
 
 INTERPOLATION_METHOD = ope.InterpolationMethod.CUBIC
 RESAMPLING_COEFFS = [0.5, 2048.0, -100.0, 50.0]
@@ -197,6 +198,9 @@ def configure_processor(processor):
     processor.enable_log_scaling(ENABLE_LOG_SCALING)
     processor.set_grayscale_range(GRAYSCALE_MIN, GRAYSCALE_MAX)
     processor.enable_bscan_flip(ENABLE_BSCAN_FLIP)
+    processor.enable_post_process_background_subtraction(ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION)
+    if ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION:
+        processor.request_post_process_background_recording()
 
 
 def run_backend_test(backend_name, backend_type, test_data):

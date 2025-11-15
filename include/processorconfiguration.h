@@ -190,19 +190,23 @@ public:
 	void setCustomResamplingCurve(const float* data, size_t size);
 	void setCustomWindowCurve(const float* data, size_t size);
 	void setCustomDispersionCurve(const float* data, size_t size);
-	
+	void setCustomPostProcessBackgroundProfile(const float* data, size_t size); //todo: think about removing "custom" from background subtraction methods.  
+
 	const float* getCustomResamplingCurve() const;
 	const float* getCustomWindowCurve() const;
 	const float* getCustomDispersionCurve() const;
+	const float* getCustomPostProcessBackgroundProfile() const;
 	
 	size_t getCustomResamplingCurveSize() const;
 	size_t getCustomWindowCurveSize() const;
 	size_t getCustomDispersionCurveSize() const;
-	
+	size_t getCustomPostProcessBackgroundProfileSize() const;
+
 	bool hasCustomResamplingCurve() const;
 	bool hasCustomWindowCurve() const;
 	bool hasCustomDispersionCurve() const;
-	
+	bool hasCustomPostProcessBackgroundProfile() const;
+
 	const float* getGeneratedResamplingCurve() const;
 	const float* getGeneratedWindowCurve() const;
 	const float* getGeneratedDispersionCurve() const;
@@ -210,6 +214,7 @@ public:
 	size_t getGeneratedResamplingCurveSize() const;
 	size_t getGeneratedWindowCurveSize() const;
 	size_t getGeneratedDispersionCurveSize() const;
+	
 	
 	void adjustAllCustomCurves(); // call after changing signalLength
 	
@@ -228,6 +233,7 @@ private:
 	void adjustCustomResamplingCurve();
 	void adjustCustomWindowCurve();
 	void adjustCustomDispersionCurve();
+	void adjustCustomPostProcessBackgroundProfile();
 	
 	template<typename T>
 	T clamp(T value, T min, T max) const {

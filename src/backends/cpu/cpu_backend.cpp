@@ -46,6 +46,9 @@ struct CpuBackend::Impl {
 	std::vector<float> resampleCurve;
 	std::vector<std::complex<float>> dispersionPhaseComplex;
 	std::vector<float> windowCurve;
+	std::vector<float> postProcessBackgroundProfile;
+
+	bool postProcessBackgroundRecordingRequested;
 	
 	Impl() 
 		: currentOutputBuffer(0)
@@ -54,6 +57,7 @@ struct CpuBackend::Impl {
 		, fftPlan(nullptr)
 		, stopProcessing(false)
 		, numInputBuffers(2)  // default: 2 buffers (ping-pong)
+		, postProcessBackgroundRecordingRequested(false)
 	{}
 	
 	~Impl() {
@@ -73,6 +77,21 @@ struct CpuBackend::Impl {
 			fftwf_free(this->fftOut);
 		}
 	}
+
+	void recordPostProcessBackground(const float* processedData, int samplesPerAscan, int totalAscans) {
+		this->postProcessBackgroundProfile.resize(samplesPerAscan, 0.0f);
+		
+		//average all A-scans to create background prfile
+		for (int i = 0; i < samplesPerAscan; ++i) {
+			float sum = 0.0f;
+			for (int ascan = 0; ascan < totalAscans; ++ascan) {
+				sum += processedData[ascan * samplesPerAscan + i];
+			}
+			this->postProcessBackgroundProfile[i] = sum / static_cast<float>(totalAscans);
+		}
+		
+		this->postProcessBackgroundRecordingRequested = false;
+	}	
 	
 	void processingThreadFunc() {
 		while (!this->stopProcessing) {
@@ -213,12 +232,31 @@ struct CpuBackend::Impl {
 					config.postProcessingParams.addend
 				);
 			}
-			
 			// 8. Copy to output
 			int outputStartIdx = ascanIdx * outputSamplesPerAscan;
 			std::copy(processedAscan.begin(),
 			          processedAscan.end(),
 			          outputPtr + outputStartIdx);
+		}
+
+		// 9. Post-process background profile subtraction
+		if (config.postProcessingParams.backgroundRemoval) {
+			// Record background if requested (must happen BEFORE removal)
+			if (this->postProcessBackgroundRecordingRequested) {
+				this->recordPostProcessBackground(outputPtr, outputSamplesPerAscan, totalAscans);
+			}
+			
+			// Apply background removal if we have a background curve
+			if (!this->postProcessBackgroundProfile.empty()) {
+				cpu_kernels::applyPostProcessBackgroundSubtraction<float>(
+					outputPtr,
+					this->postProcessBackgroundProfile.data(),
+					config.postProcessingParams.backgroundWeight,
+					config.postProcessingParams.backgroundOffset,
+					outputSamplesPerAscan,
+					totalAscans
+				);
+			}
 		}
 	}
 };
@@ -565,7 +603,7 @@ std::vector<float> CpuBackend::sinusoidalScanCorrection(const float* input, cons
 	return std::vector<float>(lineWidth * linesPerBscan * numBscans);  // Stub
 }
 
-std::vector<float> CpuBackend::postProcessBackgroundRemoval(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
+std::vector<float> CpuBackend::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
 	return std::vector<float>(samples);  // Stub
 }
 
@@ -606,5 +644,29 @@ float CpuBackend::cubicHermiteInterpolation(float y0, float y1, float y2, float 
 float CpuBackend::clamp(float value, float low, float high) {
 	return cpu_kernels::clamp<float>(value, low, high);
 }
+
+void CpuBackend::requestPostProcessBackgroundRecording() {
+	this->impl->postProcessBackgroundRecordingRequested = true;
+}
+
+void CpuBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
+	if (!background) {
+		throw std::invalid_argument("Background curve data is null");
+	}
+	
+	int expectedSize = this->impl->config.dataParams.signalLength / 2;
+	if (static_cast<int>(length) != expectedSize) {
+		throw std::invalid_argument("Invalid background buffer size. Expected " + 
+		                            std::to_string(expectedSize) + " but got " + 
+		                            std::to_string(length));
+	}
+	
+	this->impl->postProcessBackgroundProfile.assign(background, background + length);
+}
+
+const std::vector<float>& CpuBackend::getPostProcessBackgroundProfile() const {
+	return this->impl->postProcessBackgroundProfile;
+}
+
 
 } // namespace ope

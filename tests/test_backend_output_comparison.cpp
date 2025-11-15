@@ -25,6 +25,7 @@ const bool ENABLE_DISPERSION = true;
 const bool ENABLE_BACKGROUND_REMOVAL = true;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_BSCAN_FLIP = false;
+const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = true;
 
 const ope::InterpolationMethod INTERPOLATION_METHOD = ope::InterpolationMethod::CUBIC;
 const float RESAMPLING_COEFFS[4] = {0.5f, 2048.0f, -100.0f, 50.0f};
@@ -218,6 +219,11 @@ void configureProcessor(ope::Processor& processor) {
 	processor.enableLogScaling(ENABLE_LOG_SCALING);
 	processor.setGrayscaleRange(GRAYSCALE_MIN, GRAYSCALE_MAX);
 	processor.enableBscanFlip(ENABLE_BSCAN_FLIP);
+	processor.enablePostProcessBackgroundSubtraction(ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION);
+
+	if(ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION){
+		processor.requestPostProcessBackgroundRecording();
+	}
 }
 
 // ============================================

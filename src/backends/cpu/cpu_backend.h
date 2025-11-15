@@ -30,7 +30,12 @@ public:
 	void updateResamplingCurve(const float* curve, size_t length) override;
 	void updateDispersionCurve(const float* curve, size_t length) override;
 	void updateWindowCurve(const float* curve, size_t length) override;
-	
+
+	// Post-process background management
+	void requestPostProcessBackgroundRecording() override;
+	void setPostProcessBackgroundProfile(const float* background, size_t length) override;
+	const std::vector<float>& getPostProcessBackgroundProfile() const override;
+
 	// Buffer management
 	IOBuffer& getInputBuffer(int index) override;
 	IOBuffer& getNextAvailableInputBuffer() override;
@@ -80,7 +85,7 @@ public:
 	std::vector<float> postProcessTruncate(const float* input, bool logScaling, float grayscaleMax, float grayscaleMin, float addend, float multiplicator, int lineWidth, int samples) override;
 	std::vector<float> bscanFlip(const float* input, int lineWidth, int linesPerBscan, int numBscans) override;
 	std::vector<float> sinusoidalScanCorrection(const float* input, const float* resampleCurve, int lineWidth, int linesPerBscan, int numBscans) override;
-	std::vector<float> postProcessBackgroundRemoval(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) override;
+	std::vector<float> postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) override;
 
 private:
 	struct Impl;

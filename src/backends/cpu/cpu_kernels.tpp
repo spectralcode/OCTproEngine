@@ -377,6 +377,29 @@ void linearScaleAndTruncate(
 	}
 }
 
+template<typename T>
+void applyPostProcessBackgroundSubtraction(
+	T* data,
+	const T* background,
+	T weight,
+	T offset,
+	int samplesPerAscan,
+	int totalAscans
+) {
+	int totalSamples = samplesPerAscan * totalAscans;
+	
+	for (int i = 0; i < totalSamples; ++i) {
+		int bgIndex = i % samplesPerAscan;
+		T bgValue = weight * background[bgIndex] + offset;
+		T result = data[i] - bgValue;
+		
+		// Saturate to [0, 1] range
+		//data[i] = std::max(static_cast<T>(0), std::min(static_cast<T>(1), result));
+		data[i] = result;
+	}
+}
+
+
 // ============================================
 // Helper functions
 // ============================================

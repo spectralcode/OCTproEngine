@@ -282,7 +282,7 @@ __global__ void getPostProcessBackground(
 	int ascansPerBscan
 );
 
-__global__ void postProcessBackgroundRemoval(
+__global__ void postProcessBackgroundSubtraction(
 	float* data,
 	const float* background,
 	float weight,

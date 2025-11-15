@@ -563,8 +563,163 @@ void Processor::enableFixedPatternNoiseRemoval(bool enable) {
 	this->impl->config.postProcessingParams.fixedPatternNoiseRemoval = enable;
 }
 
-void Processor::enablePostProcessBackgroundRemoval(bool enable) {
+void Processor::enablePostProcessBackgroundSubtraction(bool enable) {
 	this->impl->config.postProcessingParams.backgroundRemoval = enable;
+}
+
+
+// Post-processing background profile management
+void Processor::requestPostProcessBackgroundRecording() {
+	this->impl->backend->requestPostProcessBackgroundRecording();
+}
+
+void Processor::setPostProcessBackgroundWeight(float weight) {
+	this->impl->config.postProcessingParams.backgroundWeight = weight;
+	
+	// Update backend config (hot-swap)
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::setPostProcessBackgroundOffset(float offset) {
+	this->impl->config.postProcessingParams.backgroundOffset = offset;
+	
+	// Update backend config (hot-swap)
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+const float* Processor::getPostProcessBackgroundProfile() const {
+	if (!this->impl->initialized) {
+		// If not initialized, try to get from config
+		return this->impl->config.getCustomPostProcessBackgroundProfile();
+	}
+	
+	
+	// Get from backend (source of truth)
+	const std::vector<float>& curve = this->impl->backend->getPostProcessBackgroundProfile();
+	if (curve.empty()) {
+		return nullptr;
+	}
+	return curve.data();
+}
+
+size_t Processor::getPostProcessBackgroundProfileSize() const {
+	if (!this->impl->initialized) {
+		// If not initialized, try to get from config
+		return this->impl->config.getCustomPostProcessBackgroundProfileSize();
+	}
+	
+	// Get from backend (source of truth)
+	const std::vector<float>& curve = this->impl->backend->getPostProcessBackgroundProfile();
+	return curve.size();
+}
+
+bool Processor::hasPostProcessBackgroundProfile() const {
+	if (!this->impl->initialized) {
+		return this->impl->config.hasCustomPostProcessBackgroundProfile();
+	}
+	
+	// Check if backend has curve
+	const std::vector<float>& curve = this->impl->backend->getPostProcessBackgroundProfile();
+	return !curve.empty();
+}
+
+void Processor::setPostProcessBackgroundProfile(const float* data, size_t size) {
+	if (!data || size == 0) {
+		throw std::invalid_argument("Invalid post-process background curve data");
+	}
+	
+	// Store in configuration (for metadata persistence)
+	this->impl->config.setCustomPostProcessBackgroundProfile(data, size);
+	
+	// Update backend if initialized
+	if (this->impl->initialized) {
+		this->impl->backend->setPostProcessBackgroundProfile(data, size);
+	}
+}
+
+void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepath) const {
+	const float* curve = nullptr;
+	size_t size = 0;
+	
+	if (this->impl->initialized) {
+		const std::vector<float>& bgCurve = this->impl->backend->getPostProcessBackgroundProfile();
+		if (!bgCurve.empty()) {
+			curve = bgCurve.data();
+			size = bgCurve.size();
+		}
+	} else {
+		curve = this->impl->config.getCustomPostProcessBackgroundProfile();
+		size = this->impl->config.getCustomPostProcessBackgroundProfileSize();
+	}
+	
+	if (!curve || size == 0) {
+		throw std::runtime_error("No post-process background curve to save");
+	}
+	
+	std::ofstream file(filepath);
+	if (!file.is_open()) {
+		throw std::runtime_error("Failed to open file for writing: " + filepath);
+	}
+	file << "Sample Number;Sample Value\n";
+	for (size_t i = 0; i < size; ++i) {
+		file << i << ";" << curve[i] << "\n";
+	}
+	
+	file.close();
+	
+	if (!file.good()) {
+		throw std::runtime_error("Error writing to file: " + filepath);
+	}
+}
+
+void Processor::loadPostProcessBackgroundProfileFromFile(const std::string& filepath) {
+	std::ifstream file(filepath);
+	if (!file.is_open()) {
+		throw std::runtime_error("Failed to open file for reading: " + filepath);
+	}
+	
+	std::vector<float> curve;
+	std::string line;
+	
+	if (!std::getline(file, line)) {
+		throw std::runtime_error("Empty file: " + filepath);
+	}
+	
+	int lineNumber = 1;
+	while (std::getline(file, line)) {
+		lineNumber++;
+		if (line.empty()) {
+			continue;
+		}
+		
+		size_t semicolonPos = line.find(';');
+		if (semicolonPos == std::string::npos) {
+			throw std::runtime_error("Invalid format at line " + std::to_string(lineNumber) + 
+			                        ": missing semicolon");
+		}
+		
+		std::string valueStr = line.substr(semicolonPos + 1);
+		
+		try {
+			float value = std::stof(valueStr);
+			curve.push_back(value);
+		} catch (const std::exception& e) {
+			throw std::runtime_error("Invalid number at line " + std::to_string(lineNumber) + 
+			                        ": " + valueStr);
+		}
+	}
+	
+	file.close();
+	
+	if (curve.empty()) {
+		throw std::runtime_error("No data found in file: " + filepath);
+	}
+	
+	this->setPostProcessBackgroundProfile(curve.data(), curve.size());
 }
 
 // ============================================
@@ -646,9 +801,9 @@ std::vector<float> Processor::sinusoidalScanCorrection(const float* input, const
 	return this->impl->backend->sinusoidalScanCorrection(input, resampleCurve, lineWidth, linesPerBscan, numBscans);
 }
 
-std::vector<float> Processor::postProcessBackgroundRemoval(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
+std::vector<float> Processor::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
 	this->impl->ensureInitialized();
-	return this->impl->backend->postProcessBackgroundRemoval(input, backgroundLine, weight, offset, lineWidth, samples);
+	return this->impl->backend->postProcessBackgroundSubtraction(input, backgroundLine, weight, offset, lineWidth, samples);
 }
 
 } // namespace ope

@@ -705,17 +705,19 @@ void CudaBackend::process(IOBuffer& input) {
 				this->impl->d_postProcBackgroundLine, d_currBuffer,
 				signalLength / 2, ascansPerBscan);
 			
-			// Copy to host (resize if needed)
+			// Copy to host
 			size_t bgSize = signalLength / 2;
 			this->impl->recordedPostProcessBackground.resize(bgSize);
 			checkCudaErrors(cudaMemcpyAsync(
 				this->impl->recordedPostProcessBackground.data(),
 				this->impl->d_postProcBackgroundLine,
 				bgSize * sizeof(float),
-				cudaMemcpyDeviceToHost, stream));
+				cudaMemcpyDeviceToHost,
+				stream));
 			
 			this->impl->postProcessBackgroundRecordingRequested = false;
 		}
+
 		
 		// Update background if user provided new one
 		if (this->impl->postProcessBackgroundUpdated) {
@@ -724,7 +726,7 @@ void CudaBackend::process(IOBuffer& input) {
 		}
 		
 		// Apply background removal
-		cuda_kernels::postProcessBackgroundRemoval<<<gridSize/2, blockSize, 0, stream>>>(
+		cuda_kernels::postProcessBackgroundSubtraction<<<gridSize/2, blockSize, 0, stream>>>(
 			d_currBuffer, this->impl->d_postProcBackgroundLine,
 			config.postProcessingParams.backgroundWeight,
 			config.postProcessingParams.backgroundOffset,
@@ -784,41 +786,12 @@ void CudaBackend::updateResamplingCurve(const float* curve, size_t length) {
 	));
 	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
 }
-/*
-void CudaBackend::updateDispersionCurve(const float* curve, size_t length) {
-	if (this->impl->d_dispersionCurve == nullptr || length != static_cast<size_t>(this->impl->signalLength)) {
-		return;
-	}
-	
-	// Copy dispersion curve to device
-	checkCudaErrors(cudaMemcpyAsync(
-		this->impl->d_dispersionCurve,
-		curve,
-		length * sizeof(float),
-		cudaMemcpyHostToDevice,
-		this->impl->userRequestStream
-	));
-	
-	// Fill dispersive phase
-	cuda_kernels::fillDispersivePhase<<<this->impl->signalLength, 1, 0, this->impl->userRequestStream>>>(
-		this->impl->d_phaseCartesian,
-		this->impl->d_dispersionCurve,
-		1.0f,
-		this->impl->signalLength,
-		1
-	);
-	
-	checkCudaErrors(cudaPeekAtLastError());
-	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
-}
-	*/
 
 void CudaBackend::updateDispersionCurve(const float* curve, size_t length) {
     if (this->impl->d_phaseCartesian == nullptr) {
         return;
     }
-    
-    // Copy curve directly (length is in floats, convert to bytes)
+
     checkCudaErrors(cudaMemcpyAsync(
         this->impl->d_phaseCartesian,
         curve,
@@ -853,12 +826,19 @@ void CudaBackend::requestPostProcessBackgroundRecording() {
 	this->impl->postProcessBackgroundRecordingRequested = true;
 }
 
-void CudaBackend::setPostProcessBackground(const float* background, size_t length) {
-	if (this->impl->d_postProcBackgroundLine == nullptr || 
-		length != static_cast<size_t>(this->impl->signalLength / 2)) {
-		throw std::runtime_error("Invalid background buffer size");
+void CudaBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
+	if (!background) {
+		throw std::invalid_argument("Background curve data is null");
 	}
 	
+	size_t expectedSize = static_cast<size_t>(this->impl->signalLength / 2);
+	if (this->impl->d_postProcBackgroundLine == nullptr || length != expectedSize) {
+		throw std::invalid_argument("Invalid background buffer size. Expected " + 
+		                            std::to_string(expectedSize) + " but got " + 
+		                            std::to_string(length));
+	}
+	
+	// Copy to device
 	checkCudaErrors(cudaMemcpyAsync(
 		this->impl->d_postProcBackgroundLine,
 		background,
@@ -868,12 +848,15 @@ void CudaBackend::setPostProcessBackground(const float* background, size_t lengt
 	));
 	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
 	
+	// Update host copy
+	this->impl->recordedPostProcessBackground.assign(background, background + length);
 	this->impl->postProcessBackgroundUpdated = true;
 }
 
-std::vector<float> CudaBackend::getRecordedPostProcessBackground() {
+const std::vector<float>& CudaBackend::getPostProcessBackgroundProfile() const {
 	return this->impl->recordedPostProcessBackground;
-}
+}	
+
 
 // ============================================
 // CUDA-Specific Getters
@@ -1243,7 +1226,7 @@ std::vector<float> CudaBackend::sinusoidalScanCorrection(
 	return std::vector<float>();
 }
 
-std::vector<float> CudaBackend::postProcessBackgroundRemoval(
+std::vector<float> CudaBackend::postProcessBackgroundSubtraction(
 	const float* input,
 	const float* backgroundLine,
 	float weight,

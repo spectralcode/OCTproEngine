@@ -631,7 +631,7 @@ __global__ void getPostProcessBackground(float* __restrict__ output,
 	}
 }
 
-__global__ void postProcessBackgroundRemoval(float* data,
+__global__ void postProcessBackgroundSubtraction(float* data,
                                            const float* __restrict__ background,
                                            const float backgroundWeight,
                                            const float backgroundOffset,
@@ -639,7 +639,8 @@ __global__ void postProcessBackgroundRemoval(float* data,
                                            const int samplesPerBuffer) {
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
 	if (index < samplesPerBuffer) {
-		data[index] = __saturatef(data[index] - (backgroundWeight * background[index%samplesPerAscan] + backgroundOffset));
+		//data[index] = __saturatef(data[index] - (backgroundWeight * background[index%samplesPerAscan] + backgroundOffset)); //saturatef only needed if we want later to convert to original integer datatype (uchar, ushort, etc)
+		data[index] = data[index] - (backgroundWeight * background[index%samplesPerAscan] + backgroundOffset);
 	}
 }
 

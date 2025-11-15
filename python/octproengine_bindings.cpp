@@ -681,9 +681,73 @@ PYBIND11_MODULE(octproengine, m) {
 		.def("enable_fixed_pattern_noise_removal", [](ProcessorWrapper& self, bool enable) {
 			self.processor.enableFixedPatternNoiseRemoval(enable);
 		}, py::arg("enable"), "Enable/disable fixed pattern noise removal")
-		.def("enable_post_process_background_removal", [](ProcessorWrapper& self, bool enable) {
-			self.processor.enablePostProcessBackgroundRemoval(enable);
-		}, py::arg("enable"), "Enable/disable post-process background removal")
+		
+		.def("enable_post_process_background_subtraction", [](ProcessorWrapper& self, bool enable) {
+			self.processor.enablePostProcessBackgroundSubtraction(enable);
+		}, py::arg("enable"), "Enable/disable post-process background subtraction")
+		
+		.def("request_post_process_background_recording", [](ProcessorWrapper& self) {
+			py::gil_scoped_release release;
+			self.processor.requestPostProcessBackgroundRecording();
+		}, "Request recording of next processed frame as background profile")
+		
+		.def("set_post_process_background_weight", [](ProcessorWrapper& self, float weight) {
+			self.processor.setPostProcessBackgroundWeight(weight);
+		}, py::arg("weight"), "Set post-process background subtraction weight")
+		
+		.def("set_post_process_background_offset", [](ProcessorWrapper& self, float offset) {
+			self.processor.setPostProcessBackgroundOffset(offset);
+		}, py::arg("offset"), "Set post-process background subtraction offset")
+		
+		.def("has_post_process_background_profile", [](const ProcessorWrapper& self) {
+			return self.processor.hasPostProcessBackgroundProfile();
+		}, "Check if a background profile is currently loaded")
+		
+		.def("get_post_process_background_profile_size", [](const ProcessorWrapper& self) {
+			return self.processor.getPostProcessBackgroundProfileSize();
+		}, "Get size of the background profile")
+		
+		.def("get_post_process_background_profile", [](const ProcessorWrapper& self) -> py::array_t<float> {
+			if (!self.processor.hasPostProcessBackgroundProfile()) {
+				throw BufferError("No background profile available");
+			}
+			size_t size = self.processor.getPostProcessBackgroundProfileSize();
+			const float* data = self.processor.getPostProcessBackgroundProfile();
+			py::array_t<float> result(size);
+			py::buffer_info buf = result.request();
+			float* ptr = static_cast<float*>(buf.ptr);
+			std::memcpy(ptr, data, size * sizeof(float));
+			return result;
+		}, "Get the current background profile as a NumPy array")
+		
+		.def("set_post_process_background_profile", [](ProcessorWrapper& self, py::array_t<float> profile) {
+			py::buffer_info buf = profile.request();
+			
+			if (buf.ndim != 1) {
+				throw BufferError("Background profile must be a 1D array");
+			}
+			
+			self.processor.setPostProcessBackgroundProfile(
+				static_cast<float*>(buf.ptr), 
+				buf.size
+			);
+		}, py::arg("profile"), "Set the background profile from a NumPy array")
+		
+		.def("save_post_process_background_profile_to_file", [](const ProcessorWrapper& self, const std::string& filepath) {
+			try {
+				self.processor.savePostProcessBackgroundProfileToFile(filepath);
+			} catch (const std::exception& e) {
+				throw ConfigurationError(std::string("Failed to save background profile: ") + e.what());
+			}
+		}, py::arg("filepath"), "Save the background profile to a file")
+		
+		.def("load_post_process_background_profile_from_file", [](ProcessorWrapper& self, const std::string& filepath) {
+			try {
+				self.processor.loadPostProcessBackgroundProfileFromFile(filepath);
+			} catch (const std::exception& e) {
+				throw ConfigurationError(std::string("Failed to load background profile: ") + e.what());
+			}
+		}, py::arg("filepath"), "Load a background profile from a file")
 		
 		// Context manager support
 		.def("__enter__", &ProcessorWrapper::enter, py::return_value_policy::reference)

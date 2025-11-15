@@ -27,7 +27,7 @@ public:
 	virtual void updateConfig(const ProcessorConfiguration& config) = 0;
 	
 	// Hot-swap curve updates
-	virtual void updateResamplingCurve(const float* curve, size_t length) = 0;
+	virtual void updateResamplingCurve(const float* curve, size_t length) = 0; //todo: think about if there should be a distinction between "update" and "set" (maybe "update" to indicate hot-swappable data),	maybe rename. use "set" instead of "update"
 	virtual void updateDispersionCurve(const float* curve, size_t length) = 0;
 	virtual void updateWindowCurve(const float* curve, size_t length) = 0;
 	
@@ -36,6 +36,11 @@ public:
 	virtual IOBuffer& getNextAvailableInputBuffer() = 0;
 	virtual int getNumInputBuffers() const = 0;
 	
+	// Post-process background management
+	virtual void requestPostProcessBackgroundRecording() = 0;
+	virtual void setPostProcessBackgroundProfile(const float* background, size_t length) = 0; // todo consitent naming. either "set" or "update"
+	virtual const std::vector<float>& getPostProcessBackgroundProfile() const = 0;
+
 	// Individual operations for testing
 	virtual std::vector<float> convertInput(
 		const void* input,
@@ -144,7 +149,7 @@ public:
 		int numBscans
 	) = 0;
 	
-	virtual std::vector<float> postProcessBackgroundRemoval(
+	virtual std::vector<float> postProcessBackgroundSubtraction(
 		const float* input,
 		const float* backgroundLine,
 		float weight,

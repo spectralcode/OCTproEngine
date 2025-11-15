@@ -101,20 +101,20 @@ public:
 	
 	// Resampling
 	void setResamplingCoefficients(const float coefficients[4]);
-	void setCustomResamplingCurve(const float* curve, size_t length);
+	void setCustomResamplingCurve(const float* curve, size_t length); //todo: think about renaming it to resamplingLut
 	void useCustomResamplingCurve(bool useCustom);
 	void enableResampling(bool enable);
 	void setInterpolationMethod(InterpolationMethod method);
 	
 	// Dispersion
 	void setDispersionCoefficients(const float coefficients[4], float factor = 1.0f);
-	void setCustomDispersionCurve(const float* curve, size_t length);
+	void setCustomDispersionCurve(const float* curve, size_t length); //todo: think about renaming it to dispersionPhase
 	void useCustomDispersionCurve(bool useCustom);
 	void enableDispersionCompensation(bool enable);
 	
 	// Windowing
 	void setWindowParameters(WindowType type, float centerPosition, float fillFactor);
-	void setCustomWindowCurve(const float* curve, size_t length);
+	void setCustomWindowCurve(const float* curve, size_t length); //todo: think about renaming it to windowFunction
 	void useCustomWindowCurve(bool useCustom);
 	void enableWindowing(bool enable);
 	
@@ -123,15 +123,26 @@ public:
 	void setSignalMultiplicatorAndAddend(float multiplicator, float addend);
 	void enableLogScaling(bool enable);
 	
-	// Background removal
+	// Background removal // todo: rename to DC removal to distinguish from post-process background subraction
 	void enableBackgroundRemoval(bool enable);
 	void setBackgroundRemovalWindowSize(int windowSize);
+
+	// Post-process background profile subtraction
+	void requestPostProcessBackgroundRecording();
+	void setPostProcessBackgroundWeight(float weight);
+	void setPostProcessBackgroundOffset(float offset);
+	const float* getPostProcessBackgroundProfile() const;
+	size_t getPostProcessBackgroundProfileSize() const;
+	bool hasPostProcessBackgroundProfile() const;
+	void setPostProcessBackgroundProfile(const float* data, size_t size);
+	void savePostProcessBackgroundProfileToFile(const std::string& filepath) const;
+	void loadPostProcessBackgroundProfileFromFile(const std::string& filepath);
+	void enablePostProcessBackgroundSubtraction(bool enable); 
 	
 	// Other toggles
 	void enableBscanFlip(bool enable);
 	void enableSinusoidalScanCorrection(bool enable);
 	void enableFixedPatternNoiseRemoval(bool enable);
-	void enablePostProcessBackgroundRemoval(bool enable);
 	
 	// ============================================
 	// LOW-LEVEL API - Individual Operations (for testing)
@@ -244,7 +255,7 @@ public:
 		int numBscans
 	);
 	
-	std::vector<float> postProcessBackgroundRemoval(
+	std::vector<float> postProcessBackgroundSubtraction(
 		const float* input,
 		const float* backgroundLine,
 		float weight,
