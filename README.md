@@ -41,6 +41,18 @@ cmake .. -DBUILD_PYTHON=OFF -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release
 ```
 
+**Build Options:**
+```bash
+# CUDA-only (no CPU backend, no FFTW3 required)
+cmake .. -DBUILD_CPU=OFF -DBUILD_CUDA=ON
+
+# CPU-only (no CUDA required, auto-download FFTW3 on Windows)
+cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=OFF -DFFTW3_AUTO_DOWNLOAD=ON
+
+# Both backends (default)
+cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=ON
+```
+
 ### Linux
 
 not tested yet

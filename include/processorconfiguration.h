@@ -56,20 +56,6 @@ public:
 		{}
 	};
 	
-	struct OPE_API ProcessingParameters { //todo: rename to CudaParameters and rethink if this struct is really needed here
-		int nStreams;
-		int nBuffers;
-		int gridSize;
-		int blockSize;
-		
-		ProcessingParameters()
-			: nStreams(8)
-			, nBuffers(4)
-			, gridSize(4096) //gridSize = samplesPerBuffer / blockSize;
-			, blockSize(128)
-		{}
-	};
-	
 	struct OPE_API ResamplingParameters {
 		bool enabled;
 		InterpolationMethod interpolationMethod;
@@ -172,7 +158,6 @@ public:
 	};
 	
 	DataParameters dataParams;
-	ProcessingParameters processingParams;
 	ResamplingParameters resamplingParams;
 	WindowingParameters windowingParams;
 	DispersionCompensationParameters dispersionParams;

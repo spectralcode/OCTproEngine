@@ -71,7 +71,6 @@ ProcessorConfiguration::~ProcessorConfiguration() {
 
 ProcessorConfiguration::ProcessorConfiguration(const ProcessorConfiguration& other)
 	: dataParams(other.dataParams)
-	, processingParams(other.processingParams)
 	, resamplingParams(other.resamplingParams)
 	, windowingParams(other.windowingParams)
 	, dispersionParams(other.dispersionParams)
@@ -83,7 +82,6 @@ ProcessorConfiguration::ProcessorConfiguration(const ProcessorConfiguration& oth
 
 ProcessorConfiguration::ProcessorConfiguration(ProcessorConfiguration&& other) noexcept
 	: dataParams(other.dataParams)
-	, processingParams(other.processingParams)
 	, resamplingParams(other.resamplingParams)
 	, windowingParams(other.windowingParams)
 	, dispersionParams(other.dispersionParams)
@@ -97,7 +95,6 @@ ProcessorConfiguration::ProcessorConfiguration(ProcessorConfiguration&& other) n
 ProcessorConfiguration& ProcessorConfiguration::operator=(const ProcessorConfiguration& other) {
 	if (this != &other) {
 		this->dataParams = other.dataParams;
-		this->processingParams = other.processingParams;
 		this->resamplingParams = other.resamplingParams;
 		this->windowingParams = other.windowingParams;
 		this->dispersionParams = other.dispersionParams;
@@ -113,7 +110,6 @@ ProcessorConfiguration& ProcessorConfiguration::operator=(const ProcessorConfigu
 ProcessorConfiguration& ProcessorConfiguration::operator=(ProcessorConfiguration&& other) noexcept {
 	if (this != &other) {
 		this->dataParams = other.dataParams;
-		this->processingParams = other.processingParams;
 		this->resamplingParams = other.resamplingParams;
 		this->windowingParams = other.windowingParams;
 		this->dispersionParams = other.dispersionParams;

@@ -1,7 +1,11 @@
 #include "../../include/processor.h"
 #include "../backends/backend_interface.h"
+#ifdef OPE_CUDA_AVAILABLE
 #include "../backends/cuda/cuda_backend.h"
+#endif
+#ifdef OPE_CPU_AVAILABLE
 #include "../backends/cpu/cpu_backend.h"
+#endif
 #include "callback_manager.h" 
 #include <stdexcept>
 #include <fstream>
@@ -19,11 +23,18 @@ public:
 	ProcessorConfiguration config;
 	std::unique_ptr<ProcessingBackend> backend;
 	Backend backendType;
-	
+
 	bool initialized = false;
 	ProcessorConfiguration::DataParameters lastInitializedDataParams = {};
-	
+
 	CallbackManager callbackManager;
+
+	// Backend-specific settings (NOT in config)
+	int numBuffers = 2;           // Default for both backends
+	int cudaDeviceId = 0;         // CUDA: GPU device ID
+	int cudaNumStreams = 8;       // CUDA: Number of streams
+	int cudaBlockSize = 128;      // CUDA: Block size (threads per block)
+	int cudaGridSize = 0;         // CUDA: Grid size (auto-calculated)
 
 	Impl(Backend type) : backendType(type) {
 		this->createBackend(type);
@@ -38,10 +49,36 @@ public:
 	void createBackend(Backend type) {
 		switch (type) {
 			case Backend::CUDA:
-				this->backend = std::make_unique<CudaBackend>();
+#ifdef OPE_CUDA_AVAILABLE
+				{
+					auto cudaBackend = std::make_unique<CudaBackend>();
+
+					// Apply CUDA settings before initialize
+					cudaBackend->setDeviceId(this->cudaDeviceId);
+					cudaBackend->setNumStreams(this->cudaNumStreams);
+					cudaBackend->setBlockSize(this->cudaBlockSize);
+					cudaBackend->setNumInputBuffers(this->numBuffers);
+
+					this->backend = std::move(cudaBackend);
+				}
+#else
+				throw std::runtime_error(
+					"CUDA backend not available. "
+					"OCTproEngine was compiled without CUDA support. "
+					"Use Backend::CPU instead."
+				);
+#endif
 				break;
 			case Backend::CPU:
+#ifdef OPE_CPU_AVAILABLE
 				this->backend = std::make_unique<CpuBackend>();
+#else
+				throw std::runtime_error(
+					"CPU backend not available. "
+					"OCTproEngine was compiled without CPU backend support. "
+					"Use Backend::CUDA instead."
+				);
+#endif
 				break;
 			default:
 				throw std::runtime_error("Unknown backend type");
@@ -924,6 +961,246 @@ std::vector<float> Processor::sinusoidalScanCorrection(const float* input, const
 std::vector<float> Processor::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
 	this->impl->ensureInitialized();
 	return this->impl->backend->postProcessBackgroundSubtraction(input, backgroundLine, weight, offset, lineWidth, samples);
+}
+
+// ============================================
+// BACKEND-SPECIFIC SETTINGS
+// ============================================
+
+void Processor::setNumBuffers(int numBuffers) {
+	if (this->impl->initialized) {
+		throw std::runtime_error(
+			"Cannot change number of buffers after initialization. "
+			"Call cleanup() first."
+		);
+	}
+	if (numBuffers < 1) {
+		throw std::invalid_argument("Number of buffers must be at least 1");
+	}
+
+	this->impl->numBuffers = numBuffers;
+
+	// Apply to CUDA backend if it exists
+#ifdef OPE_CUDA_AVAILABLE
+	if (this->impl->backendType == Backend::CUDA && this->impl->backend) {
+		auto* cudaBackend = static_cast<CudaBackend*>(this->impl->backend.get());
+		cudaBackend->setNumInputBuffers(numBuffers);
+	}
+#endif
+}
+
+int Processor::getNumBuffers() const {
+	return this->impl->numBuffers;
+}
+
+void Processor::setCudaDevice(int deviceId) {
+	if (this->impl->initialized) {
+		throw std::runtime_error(
+			"Cannot change CUDA device after initialization. "
+			"Call cleanup() first."
+		);
+	}
+
+	if (this->impl->backendType != Backend::CUDA) {
+		throw std::runtime_error(
+			"setCudaDevice() requires CUDA backend. "
+			"Current backend: " + std::string(this->impl->backendType == Backend::CPU ? "CPU" : "Unknown")
+		);
+	}
+
+	this->impl->cudaDeviceId = deviceId;
+
+#ifdef OPE_CUDA_AVAILABLE
+	if (this->impl->backend) {
+		auto* cudaBackend = static_cast<CudaBackend*>(this->impl->backend.get());
+		cudaBackend->setDeviceId(deviceId);
+	}
+#endif
+}
+
+void Processor::setCudaNumStreams(int numStreams) {
+	if (this->impl->initialized) {
+		throw std::runtime_error(
+			"Cannot change CUDA streams after initialization. "
+			"Call cleanup() first."
+		);
+	}
+
+	if (this->impl->backendType != Backend::CUDA) {
+		throw std::runtime_error("setCudaNumStreams() requires CUDA backend");
+	}
+
+	if (numStreams < 1) {
+		throw std::invalid_argument("Number of streams must be at least 1");
+	}
+
+	this->impl->cudaNumStreams = numStreams;
+
+#ifdef OPE_CUDA_AVAILABLE
+	if (this->impl->backend) {
+		auto* cudaBackend = static_cast<CudaBackend*>(this->impl->backend.get());
+		cudaBackend->setNumStreams(numStreams);
+	}
+#endif
+}
+
+void Processor::setCudaBlockSize(int blockSize) {
+	if (this->impl->initialized) {
+		throw std::runtime_error(
+			"Cannot change CUDA block size after initialization. "
+			"Call cleanup() first."
+		);
+	}
+
+	if (this->impl->backendType != Backend::CUDA) {
+		throw std::runtime_error("setCudaBlockSize() requires CUDA backend");
+	}
+
+	if (blockSize < 1) {
+		throw std::invalid_argument("Block size must be at least 1");
+	}
+
+	this->impl->cudaBlockSize = blockSize;
+
+#ifdef OPE_CUDA_AVAILABLE
+	if (this->impl->backend) {
+		auto* cudaBackend = static_cast<CudaBackend*>(this->impl->backend.get());
+		cudaBackend->setBlockSize(blockSize);
+	}
+#endif
+}
+
+int Processor::getCudaDevice() const {
+	if (this->impl->backendType != Backend::CUDA) {
+		return -1;
+	}
+	return this->impl->cudaDeviceId;
+}
+
+int Processor::getCudaNumStreams() const {
+	if (this->impl->backendType != Backend::CUDA) {
+		return 0;
+	}
+	return this->impl->cudaNumStreams;
+}
+
+int Processor::getCudaBlockSize() const {
+	if (this->impl->backendType != Backend::CUDA) {
+		return 0;
+	}
+	return this->impl->cudaBlockSize;
+}
+
+int Processor::getCudaGridSize() const {
+	if (this->impl->backendType != Backend::CUDA || !this->impl->initialized) {
+		return 0;
+	}
+	return this->impl->cudaGridSize;
+}
+
+void Processor::saveCudaSettingsToFile(const std::string& filepath) const {
+	std::ofstream file(filepath);
+	if (!file.is_open()) {
+		throw std::runtime_error("Failed to open file for writing: " + filepath);
+	}
+
+	file << "# CUDA Backend Settings\n";
+	file << "# Machine-specific performance tuning\n";
+	file << "# Do NOT share across different systems\n\n";
+
+	file << "[Buffer]\n";
+	file << "numBuffers=" << this->impl->numBuffers << "\n\n";
+
+	file << "[CUDA]\n";
+	file << "deviceId=" << this->impl->cudaDeviceId << "\n";
+	file << "numStreams=" << this->impl->cudaNumStreams << "\n";
+	file << "blockSize=" << this->impl->cudaBlockSize << "\n";
+
+	file.close();
+
+	if (!file.good()) {
+		throw std::runtime_error("Error writing to file: " + filepath);
+	}
+}
+
+void Processor::loadCudaSettingsFromFile(const std::string& filepath) {
+	if (this->impl->initialized) {
+		throw std::runtime_error(
+			"Cannot load CUDA settings while processor is initialized. "
+			"Call cleanup() first."
+		);
+	}
+
+	std::ifstream file(filepath);
+	if (!file.is_open()) {
+		throw std::runtime_error("Failed to open file for reading: " + filepath);
+	}
+
+	std::string line;
+	std::string currentSection;
+
+	while (std::getline(file, line)) {
+		// Trim whitespace
+		line.erase(0, line.find_first_not_of(" \t\r\n"));
+		line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+		// Skip empty lines and comments
+		if (line.empty() || line[0] == '#') {
+			continue;
+		}
+
+		// Section headers
+		if (line[0] == '[' && line[line.length() - 1] == ']') {
+			currentSection = line.substr(1, line.length() - 2);
+			continue;
+		}
+
+		// Parse key=value
+		size_t pos = line.find('=');
+		if (pos == std::string::npos) {
+			continue;
+		}
+
+		std::string key = line.substr(0, pos);
+		std::string value = line.substr(pos + 1);
+
+		// Trim key and value
+		key.erase(0, key.find_first_not_of(" \t"));
+		key.erase(key.find_last_not_of(" \t") + 1);
+		value.erase(0, value.find_first_not_of(" \t"));
+		value.erase(value.find_last_not_of(" \t") + 1);
+
+		try {
+			if (currentSection == "Buffer") {
+				if (key == "numBuffers") {
+					this->setNumBuffers(std::stoi(value));
+				}
+			} else if (currentSection == "CUDA") {
+				if (key == "deviceId") {
+					this->impl->cudaDeviceId = std::stoi(value);
+				} else if (key == "numStreams") {
+					this->impl->cudaNumStreams = std::stoi(value);
+				} else if (key == "blockSize") {
+					this->impl->cudaBlockSize = std::stoi(value);
+				}
+			}
+		} catch (const std::exception& e) {
+			throw std::runtime_error("Error parsing value for key '" + key + "': " + e.what());
+		}
+	}
+
+	file.close();
+
+	// Apply settings to backend if it's CUDA
+	if (this->impl->backendType == Backend::CUDA && this->impl->backend) {
+#ifdef OPE_CUDA_AVAILABLE
+		auto* cudaBackend = static_cast<CudaBackend*>(this->impl->backend.get());
+		cudaBackend->setDeviceId(this->impl->cudaDeviceId);
+		cudaBackend->setNumStreams(this->impl->cudaNumStreams);
+		cudaBackend->setBlockSize(this->impl->cudaBlockSize);
+		cudaBackend->setNumInputBuffers(this->impl->numBuffers);
+#endif
+	}
 }
 
 } // namespace ope

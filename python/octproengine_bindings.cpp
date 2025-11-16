@@ -8,6 +8,7 @@
 #include "iobuffer.h"
 #include "types.h"
 #include "version.h"
+#include "cudautils.h"
 
 namespace py = pybind11;
 
@@ -365,7 +366,71 @@ PYBIND11_MODULE(octproengine, m) {
 		.value("RECTANGULAR", ope::WindowType::RECTANGULAR, "Rectangular window")
 		.value("FLAT_TOP", ope::WindowType::FLAT_TOP, "Flat-top window")
 		.export_values();
-	
+
+	// ============================================
+	// CUDA UTILITIES
+	// ============================================
+
+	py::class_<ope::CudaDeviceInfo>(m, "CudaDeviceInfo")
+		.def(py::init<>())
+		.def_readonly("device_id", &ope::CudaDeviceInfo::deviceId)
+		.def_readonly("name", &ope::CudaDeviceInfo::name)
+		.def_readonly("total_memory", &ope::CudaDeviceInfo::totalMemory)
+		.def_readonly("free_memory", &ope::CudaDeviceInfo::freeMemory)
+		.def_readonly("compute_capability_major", &ope::CudaDeviceInfo::computeCapabilityMajor)
+		.def_readonly("compute_capability_minor", &ope::CudaDeviceInfo::computeCapabilityMinor)
+		.def_readonly("max_threads_per_block", &ope::CudaDeviceInfo::maxThreadsPerBlock)
+		.def_readonly("multiprocessor_count", &ope::CudaDeviceInfo::multiProcessorCount)
+		.def_readonly("is_available", &ope::CudaDeviceInfo::isAvailable)
+		.def("get_compute_capability", &ope::CudaDeviceInfo::getComputeCapability,
+			"Get compute capability as string (e.g., '8.6')")
+		.def("__repr__", [](const ope::CudaDeviceInfo& info) {
+			return "<CudaDeviceInfo(id=" + std::to_string(info.deviceId) +
+			       ", name='" + info.name + "', compute=" + info.getComputeCapability() + ")>";
+		});
+
+	// CudaUtils - pure static utility class (no instances)
+	// Use module-level bindings instead of py::class_ to avoid instantiation issues
+	auto cuda_utils = m.def_submodule("CudaUtils", "CUDA utility functions");
+
+	cuda_utils.def("get_available_devices", &ope::CudaUtils::getAvailableDevices,
+		"Get list of available CUDA devices\n\n"
+		"Returns:\n"
+		"    List[CudaDeviceInfo]: List of available GPUs (empty if no CUDA support)");
+
+	cuda_utils.def("get_device_info", &ope::CudaUtils::getDeviceInfo,
+		py::arg("device_id"),
+		"Get detailed information about specific GPU\n\n"
+		"Args:\n"
+		"    device_id: GPU device ID (0-based)\n\n"
+		"Returns:\n"
+		"    CudaDeviceInfo: Device information\n\n"
+		"Raises:\n"
+		"    RuntimeError: If CUDA not available or device doesn't exist");
+
+	cuda_utils.def("is_device_available", &ope::CudaUtils::isDeviceAvailable,
+		py::arg("device_id"),
+		"Check if specific GPU device is available\n\n"
+		"Args:\n"
+		"    device_id: GPU device ID (0-based)\n\n"
+		"Returns:\n"
+		"    bool: True if device exists and is available");
+
+	cuda_utils.def("get_device_count", &ope::CudaUtils::getDeviceCount,
+		"Get number of available GPU devices\n\n"
+		"Returns:\n"
+		"    int: Number of GPUs (0 if no CUDA support)");
+
+	cuda_utils.def("is_available", &ope::CudaUtils::isAvailable,
+		"Check if CUDA is available in this build\n\n"
+		"Returns:\n"
+		"    bool: True if CUDA compiled and devices available");
+
+	cuda_utils.def("get_current_device", &ope::CudaUtils::getCurrentDevice,
+		"Get current CUDA device ID\n\n"
+		"Returns:\n"
+		"    int: Current device ID, or -1 if no CUDA");
+
 	// ============================================
 	// CONFIGURATION STRUCTS
 	// ============================================
@@ -380,13 +445,6 @@ PYBIND11_MODULE(octproengine, m) {
 		.def_readwrite("bitshift", &ope::ProcessorConfiguration::DataParameters::bitshift)
 		.def("get_bit_depth", &ope::ProcessorConfiguration::DataParameters::getBitDepth)
 		.def("get_bytes_per_sample", &ope::ProcessorConfiguration::DataParameters::getBytesPerSample);
-	
-	py::class_<ope::ProcessorConfiguration::ProcessingParameters>(m, "ProcessingParameters")
-		.def(py::init<>())
-		.def_readwrite("n_streams", &ope::ProcessorConfiguration::ProcessingParameters::nStreams)
-		.def_readwrite("n_buffers", &ope::ProcessorConfiguration::ProcessingParameters::nBuffers)
-		.def_readwrite("grid_size", &ope::ProcessorConfiguration::ProcessingParameters::gridSize)
-		.def_readwrite("block_size", &ope::ProcessorConfiguration::ProcessingParameters::blockSize);
 	
 	py::class_<ope::ProcessorConfiguration::ResamplingParameters>(m, "ResamplingParameters")
 		.def(py::init<>())
@@ -454,7 +512,6 @@ PYBIND11_MODULE(octproengine, m) {
 	py::class_<ope::ProcessorConfiguration>(m, "ProcessorConfiguration")
 		.def(py::init<>())
 		.def_readwrite("data", &ope::ProcessorConfiguration::dataParams)
-		.def_readwrite("processing", &ope::ProcessorConfiguration::processingParams)
 		.def_readwrite("resampling", &ope::ProcessorConfiguration::resamplingParams)
 		.def_readwrite("windowing", &ope::ProcessorConfiguration::windowingParams)
 		.def_readwrite("dispersion", &ope::ProcessorConfiguration::dispersionParams)
@@ -815,7 +872,95 @@ PYBIND11_MODULE(octproengine, m) {
 				throw ConfigurationError(std::string("Failed to load fixed-pattern noise profile: ") + e.what());
 			}
 		}, py::arg("filepath"), "Load an fixed-pattern noise profile from a CSV file")
-		
+
+		// ============================================
+		// BACKEND-SPECIFIC SETTINGS
+		// ============================================
+
+		.def("set_num_buffers", [](ProcessorWrapper& self, int num_buffers) {
+			self.processor.setNumBuffers(num_buffers);
+		}, py::arg("num_buffers"),
+			"Set number of input buffers for pipelining\n\n"
+			"Must be called before initialize() or after cleanup()\n\n"
+			"Args:\n"
+			"    num_buffers: Number of buffers (default: 2)")
+
+		.def("get_num_buffers", [](const ProcessorWrapper& self) {
+			return self.processor.getNumBuffers();
+		}, "Get number of input buffers")
+
+		.def("set_cuda_device", [](ProcessorWrapper& self, int device_id) {
+			self.processor.setCudaDevice(device_id);
+		}, py::arg("device_id"),
+			"Set CUDA device (GPU selection)\n\n"
+			"Must be called before initialize() or after cleanup()\n\n"
+			"Args:\n"
+			"    device_id: GPU device ID (use CudaUtils.get_available_devices())\n\n"
+			"Raises:\n"
+			"    RuntimeError: If not using CUDA backend or already initialized")
+
+		.def("set_cuda_num_streams", [](ProcessorWrapper& self, int num_streams) {
+			self.processor.setCudaNumStreams(num_streams);
+		}, py::arg("num_streams"),
+			"Set number of CUDA streams for concurrent execution\n\n"
+			"Must be called before initialize() or after cleanup()\n\n"
+			"Args:\n"
+			"    num_streams: Number of streams (default: 8)\n\n"
+			"Raises:\n"
+			"    RuntimeError: If not using CUDA backend or already initialized")
+
+		.def("set_cuda_block_size", [](ProcessorWrapper& self, int block_size) {
+			self.processor.setCudaBlockSize(block_size);
+		}, py::arg("block_size"),
+			"Set CUDA block size (threads per block)\n\n"
+			"Must be called before initialize() or after cleanup()\n\n"
+			"Args:\n"
+			"    block_size: Block size (default: 128)\n\n"
+			"Raises:\n"
+			"    RuntimeError: If not using CUDA backend or already initialized")
+
+		.def("get_cuda_device", [](const ProcessorWrapper& self) {
+			return self.processor.getCudaDevice();
+		}, "Get current CUDA device ID (-1 if not using CUDA)")
+
+		.def("get_cuda_num_streams", [](const ProcessorWrapper& self) {
+			return self.processor.getCudaNumStreams();
+		}, "Get number of CUDA streams (0 if not using CUDA)")
+
+		.def("get_cuda_block_size", [](const ProcessorWrapper& self) {
+			return self.processor.getCudaBlockSize();
+		}, "Get CUDA block size (0 if not using CUDA)")
+
+		.def("get_cuda_grid_size", [](const ProcessorWrapper& self) {
+			return self.processor.getCudaGridSize();
+		}, "Get CUDA grid size - auto-calculated (0 if not using CUDA or not initialized)")
+
+		.def("save_cuda_settings_to_file", [](const ProcessorWrapper& self, const std::string& filepath) {
+			try {
+				self.processor.saveCudaSettingsToFile(filepath);
+			} catch (const std::exception& e) {
+				throw ConfigurationError(std::string("Failed to save CUDA settings: ") + e.what());
+			}
+		}, py::arg("filepath"),
+			"Save CUDA settings to file (machine-specific)\n\n"
+			"This file should NOT be shared between different systems\n\n"
+			"Args:\n"
+			"    filepath: Path to save CUDA settings file")
+
+		.def("load_cuda_settings_from_file", [](ProcessorWrapper& self, const std::string& filepath) {
+			try {
+				self.processor.loadCudaSettingsFromFile(filepath);
+			} catch (const std::exception& e) {
+				throw ConfigurationError(std::string("Failed to load CUDA settings: ") + e.what());
+			}
+		}, py::arg("filepath"),
+			"Load CUDA settings from file\n\n"
+			"Processor must not be initialized (call cleanup() first if needed)\n\n"
+			"Args:\n"
+			"    filepath: Path to CUDA settings file\n\n"
+			"Raises:\n"
+			"    RuntimeError: If processor is already initialized")
+
 		// Context manager support
 		.def("__enter__", &ProcessorWrapper::enter, py::return_value_policy::reference)
 		.def("__exit__", &ProcessorWrapper::exit)

@@ -143,10 +143,68 @@ public:
 	void enableBscanFlip(bool enable);
 	void enableSinusoidalScanCorrection(bool enable);
 
+	// ============================================
+	// BACKEND-SPECIFIC SETTINGS
+	// These settings require reinitialization to take effect
+	// Must be set before initialize() or after cleanup()
+	// ============================================
+
+	// Buffer settings (both backends)
+	// Set number of input buffers for pipelining
+	// Must be called before initialize() or requires cleanup() + reinitialize()
+	// @param numBuffers Number of buffers (default: 2)
+	void setNumBuffers(int numBuffers);
+	int getNumBuffers() const;
+
+	// CUDA-specific settings (throw exception if Backend::CUDA not active)
+	// Set CUDA device (GPU selection)
+	// Must be called before initialize() or requires cleanup() + reinitialize()
+	// @param deviceId GPU device ID (use CudaUtils::getAvailableDevices() to query)
+	// @throws std::runtime_error if not using CUDA backend or already initialized
+	void setCudaDevice(int deviceId);
+
+	// Set number of CUDA streams for concurrent execution
+	// Must be called before initialize() or requires cleanup() + reinitialize()
+	// Should be >2 to enable concurrent data transfers and kernel execution
+	// @param numStreams Number of streams (default: 8)
+	// @throws std::runtime_error if not using CUDA backend or already initialized
+	void setCudaNumStreams(int numStreams);
+
+	// Set CUDA block size (threads per block)
+	// Must be called before initialize() or requires cleanup() + reinitialize()
+	// @param blockSize Block size (default: 128)
+	// @throws std::runtime_error if not using CUDA backend or already initialized
+	void setCudaBlockSize(int blockSize);
+
+	// Get current CUDA device ID
+	// @returns Device ID or -1 if not using CUDA
+	int getCudaDevice() const;
+
+	// Get number of CUDA streams. 
+	// @returns Number of streams or 0 if not using CUDA
+	int getCudaNumStreams() const;
+
+	// Get CUDA block size. default is 128
+	// @returns Block size or 0 if not using CUDA
+	int getCudaBlockSize() const;
+
+	// Get CUDA grid size (auto-calculated from samplesPerBuffer / blockSize)
+	// @returns Grid size or 0 if not using CUDA or not initialized
+	int getCudaGridSize() const;
+
+	// Save CUDA settings to file (device ID, streams, block size, buffers)
+	// This file is machine-specific and should NOT be shared between systems
+	void saveCudaSettingsToFile(const std::string& filepath) const;
+
+	// Load CUDA settings from file
+	// Settings are applied immediately if processor not yet initialized
+	// @throws std::runtime_error if processor is already initialized (call cleanup() first)
+	void loadCudaSettingsFromFile(const std::string& filepath);
+
 	// Fixed-pattern noise
 	void enableFixedPatternNoiseRemoval(bool enable);
 	void requestFixedPatternNoiseDetermination();
-	
+
 	/// Set the number of B-scans to accumulate for fixed-pattern noise determination
 	// Note: the CPU backend can accumulate A-scans across multiple process() calls;
 	// the CUDA backend currently operates only on the A-scans contained in the
