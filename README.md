@@ -49,9 +49,14 @@ cmake .. -DBUILD_CPU=OFF -DBUILD_CUDA=ON
 # CPU-only (no CUDA required, auto-download FFTW3 on Windows)
 cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=OFF -DFFTW3_AUTO_DOWNLOAD=ON
 
-# Both backends (default)
-cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=ON
+# Both backends (default) and auto-download FFTW3
+cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=ON -DFFTW3_AUTO_DOWNLOAD=ON
+
+# Build with interactive OCTproViewer (GUI application to manually test OCT output)
+cmake .. -DBUILD_EXAMPLES=ON -DBUILD_OCT_VIEWER=ON -DFFTW3_AUTO_DOWNLOAD=ON
 ```
+
+
 
 ### Linux
 
