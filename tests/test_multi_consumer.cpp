@@ -344,7 +344,7 @@ bool test_legacy_api() {
 		count++;
 	});
 	
-	assert(processor.getCallbackCount() == 1);
+	assert(processor.getOutputCallbackCount() == 1);
 	std::cout << "  [OK] setOutputCallback() registered 1 callback" << std::endl;
 	
 	// Process frame
