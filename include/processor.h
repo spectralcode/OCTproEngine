@@ -14,6 +14,7 @@ namespace ope {
 class OPE_API Processor {
 public:
 	using OutputCallback = std::function<void(const IOBuffer&)>;
+	using InputCallback = std::function<void(const IOBuffer&)>;
 	using CallbackId = int;
 
 	// Construction
@@ -82,11 +83,18 @@ public:
 	// Remove all output callbacks and stop and destroy their threads
 	void clearOutputCallbacks();
 
-	// Get number of registered callback
-	size_t getCallbackCount() const;
-	
+	// Get number of registered output callbacks
+	size_t getOutputCallbackCount() const;
+
+	// Input callbacks - receive input buffer before processing
+	// WARNING: Buffer is still in use by backend, copy data if needed beyond callback
+	CallbackId addInputCallback(InputCallback callback);
+	bool removeInputCallback(CallbackId id);
+	void clearInputCallbacks();
+	size_t getInputCallbackCount() const;
+
 	//dont use this, only for testing. will be removed
-	IOBuffer& getInputBuffer(int index); 
+	IOBuffer& getInputBuffer(int index);
 	int getNumInputBuffers() const;
 
 	// Get next available input buffer for processing

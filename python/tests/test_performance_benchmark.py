@@ -196,11 +196,11 @@ def run_benchmark(backend, signal_length, ascans_per_bscan, bscans_per_buffer, t
     completed_iterations = {'count': 0}
     lock = threading.Lock()
     
-    def on_output(output_array):
+    def on_output(output_array, buffer_id):
         with lock:
             completed_iterations['count'] += 1
-    
-    processor.set_callback(on_output)
+
+    processor.add_output_callback(on_output)
     
     start_time = time.time()
     

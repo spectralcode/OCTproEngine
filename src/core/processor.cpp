@@ -6,7 +6,7 @@
 #ifdef OPE_CPU_AVAILABLE
 #include "../backends/cpu/cpu_backend.h"
 #endif
-#include "callback_manager.h" 
+#include "callback_manager.h"
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
@@ -27,7 +27,9 @@ public:
 	bool initialized = false;
 	ProcessorConfiguration::DataParameters lastInitializedDataParams = {};
 
-	CallbackManager callbackManager;
+	CallbackManager outputCallbackManager;
+	CallbackManager inputCallbackManager;
+	uint64_t nextBufferId = 0;  // Simple counter, not atomic
 
 	// Backend-specific settings (NOT in config)
 	int numBuffers = 2;           // Default for both backends
@@ -112,7 +114,6 @@ public:
 	}
 	
 	std::vector<float> getDispersionCurve() const {
-	// Get phase values (custom or generated - both are phase after refactoring)
 	const float* phaseData;
 	size_t phaseSize;
 	
@@ -174,6 +175,8 @@ public:
 			throw std::runtime_error("Invalid processor configuration");
 		}
 
+		this->nextBufferId = 0;
+
 		// (re-)initialize backend
 		if (this->initialized) {
 			this->backend->cleanup();
@@ -224,7 +227,7 @@ public:
 	}
 
 	void internalCallback(const IOBuffer& output) {
-		this->callbackManager.invokeAll(output);
+		this->outputCallbackManager.invokeAll(output);
 	}
 };
 
@@ -359,31 +362,54 @@ Backend Processor::getBackend() const {
 // PROCESSING
 // ============================================
 Processor::CallbackId Processor::addOutputCallback(OutputCallback callback) {
-	return this->impl->callbackManager.addCallback(callback);
+	return this->impl->outputCallbackManager.addCallback(callback);
 }
 
 bool Processor::removeOutputCallback(CallbackId id) {
-	return this->impl->callbackManager.removeCallback(id);
+	return this->impl->outputCallbackManager.removeCallback(id);
 }
 
 void Processor::clearOutputCallbacks() {
-	this->impl->callbackManager.clear();
+	this->impl->outputCallbackManager.clear();
 }
 
-size_t Processor::getCallbackCount() const {
-	return this->impl->callbackManager.getCallbackCount();
+size_t Processor::getOutputCallbackCount() const {
+	return this->impl->outputCallbackManager.getCallbackCount();
+}
+
+// Input callbacks
+Processor::CallbackId Processor::addInputCallback(InputCallback callback) {
+	return this->impl->inputCallbackManager.addCallback(callback);
+}
+
+bool Processor::removeInputCallback(CallbackId id) {
+	return this->impl->inputCallbackManager.removeCallback(id);
+}
+
+void Processor::clearInputCallbacks() {
+	this->impl->inputCallbackManager.clear();
+}
+
+size_t Processor::getInputCallbackCount() const {
+	return this->impl->inputCallbackManager.getCallbackCount();
 }
 
 void Processor::setOutputCallback(OutputCallback callback) {
 	// Legacy method: clear all and add one
 	// Provided for backwards compatibility
 	// todo: remove this method und update processor.h and all examples, tests, etc
-	this->impl->callbackManager.clear();
-	this->impl->callbackManager.addCallback(callback);
+	this->impl->outputCallbackManager.clear();
+	this->impl->outputCallbackManager.addCallback(callback);
 }
 
 void Processor::process(IOBuffer& input) {
 	this->impl->ensureInitialized();
+
+	uint64_t bufferId = this->impl->nextBufferId++;
+	input.setBufferId(bufferId);
+
+	this->impl->inputCallbackManager.invokeAll(input);
+
 	this->impl->backend->process(input);
 }
 

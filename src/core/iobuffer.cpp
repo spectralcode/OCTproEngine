@@ -33,9 +33,10 @@
 
 namespace ope {
 IOBuffer::IOBuffer()
-	: dataPtr(nullptr), 
-	sizeInBytes(0), 
-	dataType(DataType::UINT8)
+	: dataPtr(nullptr),
+	sizeInBytes(0),
+	dataType(DataType::UINT8),
+	bufferId(0)
 {
 }
 
@@ -113,6 +114,14 @@ const void* IOBuffer::getDataPointer() const {
 
 size_t IOBuffer::getSizeInBytes() const {
 	return this->sizeInBytes;
+}
+
+void IOBuffer::setBufferId(uint64_t id) {
+	this->bufferId = id;
+}
+
+uint64_t IOBuffer::getBufferId() const {
+	return this->bufferId;
 }
 
 } // namespace ope

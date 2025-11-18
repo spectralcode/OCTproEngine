@@ -144,21 +144,27 @@ struct CpuBackend::Impl {
 			
 			// Copy input data (reusing pre-allocated buffer)
 			std::memcpy(this->processingBuffer.data(), inputBuffer->getDataPointer(), inputDataSize);
-			
+
+			// Store buffer ID before returning input buffer
+			uint64_t bufferId = inputBuffer->getBufferId();
+
 			// Return input buffer right after copying to processingBuffer so user can reuse it
 			{
 				std::lock_guard<std::mutex> lock(this->freeQueueMutex);
 				this->freeBuffersQueue.push(inputBuffer);
 			}
 			this->freeQueueCV.notify_one();
-			
+
 			this->currentOutputBuffer = (this->currentOutputBuffer + 1) % 2;
-			IOBuffer& output = (this->currentOutputBuffer == 0) 
-				? this->outputBuffer1 
+			IOBuffer& output = (this->currentOutputBuffer == 0)
+				? this->outputBuffer1
 				: this->outputBuffer2;
-			
+
+			// Propagate buffer ID to output
+			output.setBufferId(bufferId);
+
 			this->processData(this->processingBuffer.data(), output);
-			
+
 			// Invoke callback
 			if (this->callback) {
 				this->callback(output);

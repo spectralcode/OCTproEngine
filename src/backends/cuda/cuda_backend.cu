@@ -453,9 +453,13 @@ void CudaBackend::process(IOBuffer& input) {
 	
 	// Select output buffer (ping-pong)
 	this->impl->currentOutputBuffer = (this->impl->currentOutputBuffer + 1) % 2;
-	IOBuffer* currentOutputBuf = (this->impl->currentOutputBuffer == 0) ? 
+	IOBuffer* currentOutputBuf = (this->impl->currentOutputBuffer == 0) ?
 		&this->impl->outputBuffer1 : &this->impl->outputBuffer2;
-	
+
+	// Get buffer ID from input and propagate to output
+	uint64_t bufferId = input.getBufferId();
+	currentOutputBuf->setBufferId(bufferId);
+
 	// Copy input to device
 	void* d_input = nullptr;
 	
@@ -755,11 +759,10 @@ void CudaBackend::process(IOBuffer& input) {
 	// Step 11: Register callback to be called when stream completes
 	if (this->impl->callback) {
 		// Get pre-allocated callback data for output callback
-		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) % 
+		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
 		          static_cast<int>(this->impl->callbackDataPool.size());
 		Impl::CallbackData* callbackData = &this->impl->callbackDataPool[idx];
 		callbackData->outputBuffer = currentOutputBuf;
-		
 		checkCudaErrors(cudaLaunchHostFunc(stream, outputCallback, callbackData));
 	}
 	

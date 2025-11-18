@@ -79,7 +79,7 @@ bool test_basic_multi_consumer() {
 	});
 	
 	// Verify callback count
-	assert(processor.getCallbackCount() == 3);
+	assert(processor.getOutputCallbackCount() == 3);
 	std::cout << "  [OK] Registered 3 callbacks" << std::endl;
 	
 	// Process one frame
@@ -122,7 +122,7 @@ bool test_remove_callback() {
 	auto id2 = processor.addOutputCallback([&](const ope::IOBuffer& buf) { count2++; });
 	auto id3 = processor.addOutputCallback([&](const ope::IOBuffer& buf) { count3++; });
 	
-	assert(processor.getCallbackCount() == 3);
+	assert(processor.getOutputCallbackCount() == 3);
 	std::cout << "  [OK] Added 3 callbacks" << std::endl;
 	
 	// Remove middle callback
@@ -132,7 +132,7 @@ bool test_remove_callback() {
 		return false;
 	}
 	
-	assert(processor.getCallbackCount() == 2);
+	assert(processor.getOutputCallbackCount() == 2);
 	std::cout << "  [OK] Removed callback 2" << std::endl;
 	
 	// Process frame
@@ -175,13 +175,13 @@ bool test_clear_callbacks() {
 	processor.addOutputCallback([&](const ope::IOBuffer& buf) { count1++; });
 	processor.addOutputCallback([&](const ope::IOBuffer& buf) { count2++; });
 	
-	assert(processor.getCallbackCount() == 2);
+	assert(processor.getOutputCallbackCount() == 2);
 	std::cout << "  [OK] Added 2 callbacks" << std::endl;
 	
 	// Clear all
 	processor.clearOutputCallbacks();
 	
-	assert(processor.getCallbackCount() == 0);
+	assert(processor.getOutputCallbackCount() == 0);
 	std::cout << "  [OK] Cleared all callbacks" << std::endl;
 	
 	// Process frame

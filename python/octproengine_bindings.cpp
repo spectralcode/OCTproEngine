@@ -141,8 +141,8 @@ public:
 				ope::IOBuffer& output_ref = const_cast<ope::IOBuffer&>(output);
 				py::array output_array = buffer_to_numpy(output_ref);
 				
-				// Call Python callback
-				callback(output_array);
+				// Call Python callback with buffer ID
+				callback(output_array, output.getBufferId());
 			} catch (const std::exception& e) {
 				// Handle errors in callback
 				if (!error_callback.is_none()) {
@@ -170,8 +170,8 @@ ope::Processor::CallbackId add_output_callback(py::function cb) {
 				ope::IOBuffer& buffer_ref = const_cast<ope::IOBuffer&>(buffer);
 				py::array output_array = buffer_to_numpy(buffer_ref);
 				
-				// Call Python callback
-				cb(output_array);
+				// Call Python callback with buffer ID
+				cb(output_array, buffer.getBufferId());
 				
 			} catch (const py::error_already_set& e) {
 				// Python exception
@@ -224,25 +224,93 @@ ope::Processor::CallbackId add_output_callback(py::function cb) {
 		pyCallbacks.clear();
 	}
 	
-	size_t get_callback_count() const {
-		return processor.getCallbackCount();
+	size_t get_output_callback_count() const {
+		return processor.getOutputCallbackCount();
+	}
+
+	// Input callback methods (for raw data before processing)
+	ope::Processor::CallbackId add_input_callback(py::function cb) {
+		// Create C++ wrapper callback that handles GIL
+		auto wrappedCallback = [this, cb](const ope::IOBuffer& buffer) {
+			// CRITICAL: Re-acquire GIL before calling Python code
+			py::gil_scoped_acquire acquire;
+
+			try {
+				// Create NumPy view of buffer (zero-copy)
+				ope::IOBuffer& buffer_ref = const_cast<ope::IOBuffer&>(buffer);
+				py::array input_array = buffer_to_numpy(buffer_ref);
+
+				// Call Python callback with buffer ID
+				cb(input_array, buffer.getBufferId());
+
+			} catch (const py::error_already_set& e) {
+				// Python exception
+				py::print("Python error in input callback:", e.what());
+			} catch (const std::exception& e) {
+				// C++ exception
+				py::print("C++ error in input callback:", e.what());
+			}
+		};
+
+		// Register with C++ processor
+		ope::Processor::CallbackId id;
+		{
+			// Release GIL for C++ operation
+			py::gil_scoped_release release;
+			id = processor.addInputCallback(wrappedCallback);
+		}
+
+		// Store Python function to prevent garbage collection
+		{
+			std::lock_guard<std::mutex> lock(callbacksMutex);
+			pyCallbacks[id] = cb;
+		}
+
+		return id;
+	}
+
+	bool remove_input_callback(ope::Processor::CallbackId id) {
+		bool removed;
+		{
+			py::gil_scoped_release release;
+			removed = processor.removeInputCallback(id);
+		}
+
+		if (removed) {
+			std::lock_guard<std::mutex> lock(callbacksMutex);
+			pyCallbacks.erase(id);
+		}
+
+		return removed;
+	}
+
+	void clear_input_callbacks() {
+		{
+			py::gil_scoped_release release;
+			processor.clearInputCallbacks();
+		}
+
+		// Note: We don't clear pyCallbacks here as they might contain output callbacks too
+		// They'll be cleaned up when individual callbacks are removed
+	}
+
+	size_t get_input_callback_count() const {
+		return processor.getInputCallbackCount();
 	}
 
 	void process(py::array buffer_array) {
-		// Validate that callback is set
-		if (callback.is_none()) {
-			throw ProcessingError("Callback must be set before calling process(). Use set_callback() first.");
-		}
-		
+		// Note: We no longer require set_callback() to be called first
+		// Users can now use add_output_callback() instead
+
 		// Get buffer from the array's base object (if it's a view of IOBuffer)
 		py::object base = buffer_array.attr("base");
 		if (base.is_none()) {
 			throw BufferError("Buffer array is not a view of an IOBuffer. Use get_next_available_buffer() first.");
 		}
-		
+
 		// Extract IOBuffer reference
 		ope::IOBuffer* buffer_ptr = base.cast<ope::IOBuffer*>();
-		
+
 		// Release GIL during processing
 		{
 			py::gil_scoped_release release;
@@ -272,7 +340,7 @@ ope::Processor::CallbackId add_output_callback(py::function cb) {
 		}
 	}
 	
-	void stop() {
+	void stop() { // todo: rename to cleanup?
 		py::gil_scoped_release release;
 		processor.cleanup();
 	}
@@ -616,9 +684,10 @@ PYBIND11_MODULE(octproengine, m) {
 		.def("set_callback", &ProcessorWrapper::set_callback,
 			py::arg("callback"),
 			py::arg("error_callback") = py::none(),
-			"Set callback function to receive processed output\n\n"
+			"Set callback function to receive processed output (legacy method)\n\n"
+			"Note: Consider using add_output_callback() for new code.\n\n"
 			"Args:\n"
-			"    callback: Function that takes a NumPy array as argument\n"
+			"    callback: Function that takes (NumPy array, buffer_id) as arguments\n"
 			"    error_callback: Optional function to handle callback errors")
 
 		.def("add_output_callback", &ProcessorWrapper::add_output_callback,
@@ -627,11 +696,12 @@ PYBIND11_MODULE(octproengine, m) {
 			"Allows multiple callbacks to receive processed data in parallel.\n"
 			"Each callback runs in its own thread.\n\n"
 			"Args:\n"
-			"    callback: Function that takes a NumPy array as argument\n\n"
+			"    callback: Function that takes (NumPy array, buffer_id) as arguments\n\n"
 			"Returns:\n"
 			"    int: Callback ID for later removal\n\n"
 			"Example:\n"
-			"    >>> def display(data):\n"
+			"    >>> def display(data, buffer_id):\n"
+			"    ...     print(f'Displaying buffer {buffer_id}')\n"
 			"    ...     cv2.imshow('OCT', data.copy())\n"
 			"    >>> callback_id = processor.add_output_callback(display)\n"
 			"    >>> processor.remove_output_callback(callback_id)")
@@ -648,10 +718,44 @@ PYBIND11_MODULE(octproengine, m) {
 			"Remove all output callbacks\n\n"
 			"Stops all consumer threads and clears all registered callbacks.")
 		
-		.def("get_callback_count", &ProcessorWrapper::get_callback_count,
-			"Get number of registered callbacks\n\n"
+		.def("get_output_callback_count", &ProcessorWrapper::get_output_callback_count,
+			"Get number of registered output callbacks\n\n"
 			"Returns:\n"
-			"    int: Number of active callbacks")
+			"    int: Number of active output callbacks")
+
+		// Input callback methods (raw data before processing)
+		.def("add_input_callback", &ProcessorWrapper::add_input_callback,
+			py::arg("callback"),
+			"Add input callback for raw data before processing\n\n"
+			"Allows multiple callbacks to receive input data before processing.\n"
+			"Each callback runs in its own thread.\n"
+			"WARNING: Buffer is still in use by backend, copy data if needed beyond callback.\n\n"
+			"Args:\n"
+			"    callback: Function that takes (NumPy array, buffer_id) as arguments\n\n"
+			"Returns:\n"
+			"    int: Callback ID for later removal\n\n"
+			"Example:\n"
+			"    >>> def record_raw(data, buffer_id):\n"
+			"    ...     print(f'Recording raw buffer {buffer_id}')\n"
+			"    ...     np.save(f'raw_{buffer_id}.npy', data.copy())\n"
+			"    >>> callback_id = processor.add_input_callback(record_raw)")
+
+		.def("remove_input_callback", &ProcessorWrapper::remove_input_callback,
+			py::arg("callback_id"),
+			"Remove a specific input callback by ID\n\n"
+			"Args:\n"
+			"    callback_id: ID returned from add_input_callback()\n\n"
+			"Returns:\n"
+			"    bool: True if callback was found and removed")
+
+		.def("clear_input_callbacks", &ProcessorWrapper::clear_input_callbacks,
+			"Remove all input callbacks\n\n"
+			"Stops all input callback threads and clears all registered input callbacks.")
+
+		.def("get_input_callback_count", &ProcessorWrapper::get_input_callback_count,
+			"Get number of registered input callbacks\n\n"
+			"Returns:\n"
+			"    int: Number of active input callbacks")
 
 		.def("process", &ProcessorWrapper::process, py::arg("buffer"),
 			"Process the input buffer asynchronously\n\n"

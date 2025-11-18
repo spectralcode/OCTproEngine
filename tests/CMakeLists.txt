@@ -65,6 +65,7 @@ add_ope_test(test_curve_functionality test_curve_functionality.cpp)
 add_ope_test(test_setconfig test_setconfig.cpp)
 add_ope_test(test_multi_consumer test_multi_consumer.cpp)
 add_ope_test(test_cuda_api test_cuda_api.cpp)
+add_ope_test(test_buffer_id_and_raw_callbacks test_buffer_id_and_raw_callbacks.cpp)
 
 # ========================================
 # Copy test data to build directory
