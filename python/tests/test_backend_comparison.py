@@ -124,7 +124,7 @@ class ProcessingResult:
     
     def get_duration_ms(self):
         """Get processing duration in milliseconds"""
-        if self.start_time and self.end_time:
+        if self.start_time is not None and self.end_time is not None:
             return (self.end_time - self.start_time) * 1000.0
         return 0.0
 
@@ -222,17 +222,13 @@ def run_backend_test(backend_name, backend_type, test_data):
     
     result = ProcessingResult()
     
-    def on_output(output_array):
+    def on_output(output_array, buffer_id):
         result.end_time = time.time()
         result.output = output_array.copy()
         result.received = True
         result.event.set()
-    
-    def on_error(error_msg):
-        print(f"  ERROR in callback: {error_msg}")
-        result.event.set()
-    
-    processor.set_callback(on_output, error_callback=on_error)
+
+    processor.add_output_callback(on_output)
     
     result.start_time = time.time()
     buffer = processor.get_next_available_buffer()
@@ -311,9 +307,18 @@ def main():
             return 0
         
         # Performance comparison
-        speedup = cpu_result.get_duration_ms() / cuda_result.get_duration_ms()
+        cpu_ms = cpu_result.get_duration_ms()
+        cuda_ms = cuda_result.get_duration_ms()
+
         print("Performance:")
-        print(f"  Speedup: {speedup:.2f}x")
+        print(f"  CPU time: {cpu_ms:.3f} ms")
+        print(f"  CUDA time: {cuda_ms:.3f} ms")
+
+        if cuda_ms > 0:
+            speedup = cpu_ms / cuda_ms
+            print(f"  Speedup: {speedup:.2f}x")
+        else:
+            print("  Speedup: n/a (CUDA duration was 0 ms)")
         print()
         
         # Compare results
