@@ -12,6 +12,7 @@ High-performance Optical Coherence Tomography (OCT) processing library with GPU 
 	- Win: https://fftw.org/download.html or use `build_windows.bat`  
 	- Linux: `sudo apt-get install libfftw3-dev`
 - **Python** ≥ 3.8 (optional)
+	- pybind11, NumPy
 - **C++ Compiler**  
 	- Win: VS 2019+ (C++14, must be compatible with your cuda version)  
 
