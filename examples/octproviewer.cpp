@@ -434,8 +434,8 @@ void renderDataLoadingUI(AppState* state) {
 	ImGui::Combo("Data Source", &dataSource, "Generate Test Data\0Load Custom File\0");
 
 	if (dataSource == 0) {
-		// Highlight the button if no data is loaded yet
-		if (!state->hasDataLoaded) {
+		bool highlightButton = !state->hasDataLoaded;
+		if (highlightButton) {
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.5f, 0.15f, 1.0f));
@@ -445,8 +445,11 @@ void renderDataLoadingUI(AppState* state) {
 			generateTestData(state);
 		}
 
-		if (!state->hasDataLoaded) {
+		if (highlightButton) {
 			ImGui::PopStyleColor(3);
+		}
+
+		if (!state->hasDataLoaded) {
 			ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Click here to generate test data and see the viewer in action!");
 		}
 	} else {
