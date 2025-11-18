@@ -144,10 +144,10 @@ proc.enable_log_scaling(True)
 proc.initialize()
 
 # Set callback
-def on_output(output_array):
-    print(f"Processed: {output_array.shape}, dtype={output_array.dtype}")
+def on_output(output_array, buffer_id):
+    print(f"Processed buffer {buffer_id}: {output_array.shape}, dtype={output_array.dtype}")
 
-proc.set_callback(on_output)
+proc.add_output_callback(on_output)
 
 # Process data
 data = np.random.randint(0, 65535, size=2048*512, dtype=np.uint16)
