@@ -1,12 +1,14 @@
 # Set minimum CMake version and policies
 cmake_minimum_required(VERSION 3.15)
 
-# Set CMake policies for compatibility with newer pybind11
 if(POLICY CMP0054)
 	cmake_policy(SET CMP0054 NEW)  # Only interpret if() arguments as variables or keywords when unquoted
 endif()
 if(POLICY CMP0057)
 	cmake_policy(SET CMP0057 NEW)  # Support new IN_LIST if() operator
+endif()
+if(POLICY CMP0177)
+    cmake_policy(SET CMP0177 NEW) # LIBRARY DESTINATION is used for both SHARED and MODULE targets
 endif()
 
 # Project declaration
