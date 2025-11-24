@@ -239,7 +239,7 @@ void configureProcessor(ope::Processor& processor) {
 
 int main() {
 	std::cout << "========================================" << std::endl;
-	std::cout << "CPU vs CUDA Comparison Test" << std::endl;
+	std::cout << "Backend Comparison Test (CPU/CUDA/OpenCL)" << std::endl;
 	std::cout << "========================================" << std::endl;
 	std::cout << std::endl;
 	
@@ -345,59 +345,187 @@ int main() {
 	}
 	
 	std::cout << "  Output size: " << cudaResult.output.size() << " samples" << std::endl;
-	std::cout << "  Processing time: " << std::fixed << std::setprecision(3) 
+	std::cout << "  Processing time: " << std::fixed << std::setprecision(3)
 	          << cudaResult.getDurationMs() << " ms" << std::endl;
 	std::cout << std::endl;
-	
+
+	// ============================================
+	// OpenCL Backend
+	// ============================================
+	std::cout << "Processing with OpenCL backend..." << std::endl;
+
+#ifdef OPE_OPENCL_AVAILABLE
+	ProcessingResult openclResult;
+
+	try {
+		ope::Processor openclProcessor(ope::Backend::OPENCL);
+		configureProcessor(openclProcessor);
+		openclProcessor.initialize();
+
+		openclProcessor.setOutputCallback([&openclResult](const ope::IOBuffer& output) {
+			std::lock_guard<std::mutex> lock(openclResult.mutex);
+			openclResult.endTime = std::chrono::high_resolution_clock::now();
+
+			size_t numFloats = output.getSizeInBytes() / sizeof(float);
+			openclResult.output.resize(numFloats);
+			std::memcpy(openclResult.output.data(), output.getDataPointer(), output.getSizeInBytes());
+
+			openclResult.received = true;
+			openclResult.cv.notify_one();
+		});
+
+		openclResult.startTime = std::chrono::high_resolution_clock::now();
+		ope::IOBuffer& openclInputBuf = openclProcessor.getNextAvailableInputBuffer();
+		std::memcpy(openclInputBuf.getDataPointer(), testData.data(), dataSizeBytes);
+		openclProcessor.process(openclInputBuf);
+
+		openclResult.waitForCompletion();
+
+		if (!openclResult.received || openclResult.output.empty()) {
+			std::cerr << "  ERROR: No output from OpenCL backend!" << std::endl;
+			return 1;
+		}
+
+		std::cout << "  Output size: " << openclResult.output.size() << " samples" << std::endl;
+		std::cout << "  Processing time: " << std::fixed << std::setprecision(3)
+		          << openclResult.getDurationMs() << " ms" << std::endl;
+		std::cout << std::endl;
+	}
+	catch (const std::exception& e) {
+		std::cerr << "  ERROR: " << e.what() << std::endl;
+		std::cout << "  OpenCL backend skipped due to errors." << std::endl;
+		std::cout << std::endl;
+	}
+#else
+	std::cout << "  SKIPPED (OpenCL backend not available)" << std::endl;
+	std::cout << std::endl;
+	ProcessingResult openclResult;  // Empty result for compilation
+#endif
+
 	// ============================================
 	// Performance Comparison
 	// ============================================
-	double speedup = cpuResult.getDurationMs() / cudaResult.getDurationMs();
 	std::cout << "Performance:" << std::endl;
-	std::cout << "  Speedup: " << std::fixed << std::setprecision(2) << speedup << "x" << std::endl;
+	std::cout << "  CPU:    " << std::fixed << std::setprecision(3) << cpuResult.getDurationMs() << " ms" << std::endl;
+	std::cout << "  CUDA:   " << cudaResult.getDurationMs() << " ms (Speedup: "
+	          << std::setprecision(2) << (cpuResult.getDurationMs() / cudaResult.getDurationMs()) << "x)" << std::endl;
+#ifdef OPE_OPENCL_AVAILABLE
+	if (openclResult.received) {
+		std::cout << "  OpenCL: " << std::setprecision(3) << openclResult.getDurationMs() << " ms (Speedup: "
+		          << std::setprecision(2) << (cpuResult.getDurationMs() / openclResult.getDurationMs()) << "x)" << std::endl;
+	}
+#endif
 	std::cout << std::endl;
 	
 	// ============================================
 	// Compare Results
 	// ============================================
 	std::cout << "Comparing results..." << std::endl;
-	
+	std::cout << std::endl;
+
 	if (cpuResult.output.size() != cudaResult.output.size()) {
 		std::cerr << "  ERROR: Output size mismatch!" << std::endl;
 		std::cerr << "    CPU: " << cpuResult.output.size() << " samples" << std::endl;
 		std::cerr << "    CUDA: " << cudaResult.output.size() << " samples" << std::endl;
 		return 1;
 	}
-	
+
 	int samplesPerAscan = SIGNAL_LENGTH / 2;  // Output is half due to truncation
-	auto comparison = compareBuffers(
+
+	// CPU vs CUDA comparison
+	std::cout << "CPU vs CUDA:" << std::endl;
+	auto cpuCudaComparison = compareBuffers(
 		cpuResult.output.data(),
 		cudaResult.output.data(),
 		cpuResult.output.size(),
 		samplesPerAscan,
 		TOLERANCE
 	);
-	
-	std::cout << "  Max absolute difference: " << std::scientific << std::setprecision(6) 
-	          << comparison.maxAbsDiff << std::endl;
-	std::cout << "  Mean absolute difference: " << comparison.meanAbsDiff << std::endl;
-	std::cout << "  RMS error: " << comparison.rmsError << std::endl;
-	std::cout << "  Differing samples: " << comparison.differingSamples << " / " 
-	          << comparison.totalSamples;
-	if (comparison.totalSamples > 0) {
-		std::cout << " (" << std::fixed << std::setprecision(2) 
-		          << (100.0 * comparison.differingSamples / comparison.totalSamples) << "%)";
+
+	std::cout << "  Max absolute difference: " << std::scientific << std::setprecision(6)
+	          << cpuCudaComparison.maxAbsDiff << std::endl;
+	std::cout << "  Mean absolute difference: " << cpuCudaComparison.meanAbsDiff << std::endl;
+	std::cout << "  RMS error: " << cpuCudaComparison.rmsError << std::endl;
+	std::cout << "  Differing samples: " << cpuCudaComparison.differingSamples << " / "
+	          << cpuCudaComparison.totalSamples;
+	if (cpuCudaComparison.totalSamples > 0) {
+		std::cout << " (" << std::fixed << std::setprecision(2)
+		          << (100.0 * cpuCudaComparison.differingSamples / cpuCudaComparison.totalSamples) << "%)";
 	}
 	std::cout << std::endl;
-	std::cout << std::endl;
-	
-	// Per-A-scan statistics (important for catching boundary issues!)
-	std::cout << "  First A-scan max diff: " << std::scientific << std::setprecision(6) 
-	          << comparison.maxDiffPerAscan[0] << std::endl;
-	if (comparison.maxDiffPerAscan.size() > 1) {
-		std::cout << "  Last A-scan max diff: " << comparison.maxDiffPerAscan.back() << std::endl;
+	std::cout << "  First A-scan max diff: " << std::scientific << std::setprecision(6)
+	          << cpuCudaComparison.maxDiffPerAscan[0] << std::endl;
+	if (cpuCudaComparison.maxDiffPerAscan.size() > 1) {
+		std::cout << "  Last A-scan max diff: " << cpuCudaComparison.maxDiffPerAscan.back() << std::endl;
 	}
 	std::cout << std::endl;
+
+#ifdef OPE_OPENCL_AVAILABLE
+	if (openclResult.received && !openclResult.output.empty()) {
+		if (cpuResult.output.size() != openclResult.output.size()) {
+			std::cerr << "  ERROR: OpenCL output size mismatch!" << std::endl;
+			std::cerr << "    CPU: " << cpuResult.output.size() << " samples" << std::endl;
+			std::cerr << "    OpenCL: " << openclResult.output.size() << " samples" << std::endl;
+			return 1;
+		}
+
+		// CPU vs OpenCL comparison
+		std::cout << "CPU vs OpenCL:" << std::endl;
+		auto cpuOpenclComparison = compareBuffers(
+			cpuResult.output.data(),
+			openclResult.output.data(),
+			cpuResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+
+		std::cout << "  Max absolute difference: " << std::scientific << std::setprecision(6)
+		          << cpuOpenclComparison.maxAbsDiff << std::endl;
+		std::cout << "  Mean absolute difference: " << cpuOpenclComparison.meanAbsDiff << std::endl;
+		std::cout << "  RMS error: " << cpuOpenclComparison.rmsError << std::endl;
+		std::cout << "  Differing samples: " << cpuOpenclComparison.differingSamples << " / "
+		          << cpuOpenclComparison.totalSamples;
+		if (cpuOpenclComparison.totalSamples > 0) {
+			std::cout << " (" << std::fixed << std::setprecision(2)
+			          << (100.0 * cpuOpenclComparison.differingSamples / cpuOpenclComparison.totalSamples) << "%)";
+		}
+		std::cout << std::endl;
+		std::cout << "  First A-scan max diff: " << std::scientific << std::setprecision(6)
+		          << cpuOpenclComparison.maxDiffPerAscan[0] << std::endl;
+		if (cpuOpenclComparison.maxDiffPerAscan.size() > 1) {
+			std::cout << "  Last A-scan max diff: " << cpuOpenclComparison.maxDiffPerAscan.back() << std::endl;
+		}
+		std::cout << std::endl;
+
+		// CUDA vs OpenCL comparison
+		std::cout << "CUDA vs OpenCL:" << std::endl;
+		auto cudaOpenclComparison = compareBuffers(
+			cudaResult.output.data(),
+			openclResult.output.data(),
+			cudaResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+
+		std::cout << "  Max absolute difference: " << std::scientific << std::setprecision(6)
+		          << cudaOpenclComparison.maxAbsDiff << std::endl;
+		std::cout << "  Mean absolute difference: " << cudaOpenclComparison.meanAbsDiff << std::endl;
+		std::cout << "  RMS error: " << cudaOpenclComparison.rmsError << std::endl;
+		std::cout << "  Differing samples: " << cudaOpenclComparison.differingSamples << " / "
+		          << cudaOpenclComparison.totalSamples;
+		if (cudaOpenclComparison.totalSamples > 0) {
+			std::cout << " (" << std::fixed << std::setprecision(2)
+			          << (100.0 * cudaOpenclComparison.differingSamples / cudaOpenclComparison.totalSamples) << "%)";
+		}
+		std::cout << std::endl;
+		std::cout << "  First A-scan max diff: " << std::scientific << std::setprecision(6)
+		          << cudaOpenclComparison.maxDiffPerAscan[0] << std::endl;
+		if (cudaOpenclComparison.maxDiffPerAscan.size() > 1) {
+			std::cout << "  Last A-scan max diff: " << cudaOpenclComparison.maxDiffPerAscan.back() << std::endl;
+		}
+		std::cout << std::endl;
+	}
+#endif
 	
 	// ============================================
 	// Save Outputs
@@ -406,22 +534,50 @@ int main() {
 		std::cout << "Saving outputs..." << std::endl;
 		saveRawData("output_cpu.raw", cpuResult.output.data(), cpuResult.output.size() * sizeof(float));
 		saveRawData("output_cuda.raw", cudaResult.output.data(), cudaResult.output.size() * sizeof(float));
-		
 		std::cout << "  Saved: output_cpu.raw" << std::endl;
 		std::cout << "  Saved: output_cuda.raw" << std::endl;
+
+#ifdef OPE_OPENCL_AVAILABLE
+		if (openclResult.received && !openclResult.output.empty()) {
+			saveRawData("output_opencl.raw", openclResult.output.data(), openclResult.output.size() * sizeof(float));
+			std::cout << "  Saved: output_opencl.raw" << std::endl;
+		}
+#endif
 		std::cout << std::endl;
 	}
-	
+
 	// ============================================
 	// Result
 	// ============================================
-	if (comparison.match) {
+	bool allTestsPassed = cpuCudaComparison.match;
+
+#ifdef OPE_OPENCL_AVAILABLE
+	if (openclResult.received && !openclResult.output.empty()) {
+		auto cpuOpenclComparison = compareBuffers(
+			cpuResult.output.data(),
+			openclResult.output.data(),
+			cpuResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+		auto cudaOpenclComparison = compareBuffers(
+			cudaResult.output.data(),
+			openclResult.output.data(),
+			cudaResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+		allTestsPassed = allTestsPassed && cpuOpenclComparison.match && cudaOpenclComparison.match;
+	}
+#endif
+
+	if (allTestsPassed) {
 		std::cout << "TEST PASSED" << std::endl;
-		std::cout << "CPU and CUDA outputs match within tolerance." << std::endl;
+		std::cout << "All backend outputs match within tolerance." << std::endl;
 		return 0;
 	} else {
 		std::cout << "TEST FAILED" << std::endl;
-		std::cout << "CPU and CUDA outputs differ beyond tolerance." << std::endl;
+		std::cout << "Some backend outputs differ beyond tolerance." << std::endl;
 		return 1;
 	}
 }

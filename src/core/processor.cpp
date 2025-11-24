@@ -6,6 +6,9 @@
 #ifdef OPE_CPU_AVAILABLE
 #include "../backends/cpu/cpu_backend.h"
 #endif
+#ifdef OPE_OPENCL_AVAILABLE
+#include "../backends/opencl/opencl_backend.h"
+#endif
 #include "callback_manager.h"
 #include <stdexcept>
 #include <fstream>
@@ -37,6 +40,10 @@ public:
 	int cudaNumStreams = 8;       // CUDA: Number of streams
 	int cudaBlockSize = 128;      // CUDA: Block size (threads per block)
 	int cudaGridSize = 0;         // CUDA: Grid size (auto-calculated)
+	int openclPlatformId = 0;     // OpenCL: Platform ID
+	int openclDeviceId = 0;       // OpenCL: Device ID
+	int openclNumQueues = 4;      // OpenCL: Number of command queues
+	int openclWorkGroupSize = 128; // OpenCL: Work group size
 
 	Impl(Backend type) : backendType(type) {
 		this->createBackend(type);
@@ -79,6 +86,28 @@ public:
 					"CPU backend not available. "
 					"OCTproEngine was compiled without CPU backend support. "
 					"Use Backend::CUDA instead."
+				);
+#endif
+				break;
+			case Backend::OPENCL:
+#ifdef OPE_OPENCL_AVAILABLE
+				{
+					auto openclBackend = std::make_unique<OpenClBackend>();
+
+					// Apply OpenCL settings before initialize
+					openclBackend->setPlatformId(this->openclPlatformId);
+					openclBackend->setDeviceId(this->openclDeviceId);
+					openclBackend->setNumCommandQueues(this->openclNumQueues);
+					openclBackend->setWorkGroupSize(this->openclWorkGroupSize);
+					openclBackend->setNumInputBuffers(this->numBuffers);
+
+					this->backend = std::move(openclBackend);
+				}
+#else
+				throw std::runtime_error(
+					"OpenCL backend not available. "
+					"OCTproEngine was compiled without OpenCL support. "
+					"Use Backend::CUDA or Backend::CPU instead."
 				);
 #endif
 				break;

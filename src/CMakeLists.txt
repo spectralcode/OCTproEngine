@@ -27,6 +27,28 @@ set(CUDA_SOURCES
 )
 
 # ========================================
+# OpenCL Kernel Embedding
+# ========================================
+if(BUILD_OPENCL)
+	# Auto-generate opencl_kernels_source.cpp from opencl_kernels.cl
+	add_custom_command(
+		OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/backends/opencl/opencl_kernels_source.cpp
+		COMMAND ${CMAKE_COMMAND}
+			-DINPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/backends/opencl/opencl_kernels.cl
+			-DOUTPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/backends/opencl/opencl_kernels_source.cpp
+			-P ${CMAKE_SOURCE_DIR}/cmake/EmbedOpenCLKernels.cmake
+		DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/backends/opencl/opencl_kernels.cl
+		COMMENT "Embedding OpenCL kernels from opencl_kernels.cl"
+		VERBATIM
+	)
+endif()
+
+set(OPENCL_SOURCES
+	backends/opencl/opencl_backend.cpp
+	backends/opencl/opencl_kernels_source.cpp
+)
+
+# ========================================
 # Build Library
 # ========================================
 
@@ -38,6 +60,10 @@ endif()
 
 if(BUILD_CUDA)
 	list(APPEND BACKEND_SOURCES ${CUDA_SOURCES})
+endif()
+
+if(BUILD_OPENCL)
+	list(APPEND BACKEND_SOURCES ${OPENCL_SOURCES})
 endif()
 
 # Create library
@@ -56,6 +82,10 @@ endif()
 
 if(BUILD_CUDA)
 	list(APPEND LINK_LIBRARIES CUDA::cudart CUDA::cufft)
+endif()
+
+if(BUILD_OPENCL)
+	list(APPEND LINK_LIBRARIES OpenCL::OpenCL clFFT::clFFT)
 endif()
 
 target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES})
@@ -105,6 +135,11 @@ endif()
 if(BUILD_CPU)
 	target_compile_definitions(octproengine PUBLIC OPE_CPU_AVAILABLE)
 	message(STATUS "Defining OPE_CPU_AVAILABLE")
+endif()
+
+if(BUILD_OPENCL)
+	target_compile_definitions(octproengine PUBLIC OPE_OPENCL_AVAILABLE)
+	message(STATUS "Defining OPE_OPENCL_AVAILABLE")
 endif()
 
 # Windows-specific settings

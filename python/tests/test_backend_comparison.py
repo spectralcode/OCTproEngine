@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CPU vs CUDA Backend Output Comparison Test
+CPU vs CUDA vs OpenCL Backend Output Comparison Test
 
 This test mirrors the C++ test_backend_output_comparison.cpp
-It processes the same synthetic data with both CPU and CUDA backends
+It processes the same synthetic data with CPU, CUDA, and OpenCL backends
 and compares the outputs to ensure they match within tolerance.
 """
 
@@ -259,7 +259,7 @@ def run_backend_test(backend_name, backend_type, test_data):
 def main():
     try:
         print("=" * 40)
-        print("CPU vs CUDA Comparison Test")
+        print("Backend Comparison Test")
         print("=" * 40)
         print()
         
@@ -301,77 +301,138 @@ def main():
         
         # Test CUDA backend
         cuda_result = run_backend_test("CUDA", ope.Backend.CUDA, test_data)
-        if cuda_result is None:
-            print("CUDA backend not available, skipping comparison.")
+
+        # Test OpenCL backend
+        opencl_result = run_backend_test("OpenCL", ope.Backend.OPENCL, test_data)
+
+        # Check if we have any GPU backends
+        if cuda_result is None and opencl_result is None:
+            print("No GPU backends available (CUDA and OpenCL both unavailable).")
             print("CPU test passed.")
             return 0
-        
+
         # Performance comparison
         cpu_ms = cpu_result.get_duration_ms()
-        cuda_ms = cuda_result.get_duration_ms()
 
         print("Performance:")
         print(f"  CPU time: {cpu_ms:.3f} ms")
-        print(f"  CUDA time: {cuda_ms:.3f} ms")
 
-        if cuda_ms > 0:
-            speedup = cpu_ms / cuda_ms
-            print(f"  Speedup: {speedup:.2f}x")
-        else:
-            print("  Speedup: n/a (CUDA duration was 0 ms)")
+        if cuda_result is not None:
+            cuda_ms = cuda_result.get_duration_ms()
+            print(f"  CUDA time: {cuda_ms:.3f} ms")
+            if cuda_ms > 0:
+                speedup = cpu_ms / cuda_ms
+                print(f"  CUDA Speedup: {speedup:.2f}x")
+
+        if opencl_result is not None:
+            opencl_ms = opencl_result.get_duration_ms()
+            print(f"  OpenCL time: {opencl_ms:.3f} ms")
+            if opencl_ms > 0:
+                speedup = cpu_ms / opencl_ms
+                print(f"  OpenCL Speedup: {speedup:.2f}x")
+
         print()
         
         # Compare results
-        print("Comparing results...")
-        
-        if len(cpu_result.output) != len(cuda_result.output):
-            print("  ERROR: Output size mismatch!")
-            print(f"    CPU: {len(cpu_result.output)} samples")
-            print(f"    CUDA: {len(cuda_result.output)} samples")
-            return 1
-        
         samples_per_ascan = SIGNAL_LENGTH // 2  # Output is half due to truncation
-        comparison = compare_buffers(
-            cpu_result.output,
-            cuda_result.output,
-            samples_per_ascan,
-            TOLERANCE
-        )
-        
-        print(f"  Max absolute difference: {comparison['max_abs_diff']:.6e}")
-        print(f"  Mean absolute difference: {comparison['mean_abs_diff']:.6e}")
-        print(f"  RMS error: {comparison['rms_error']:.6e}")
-        print(f"  Differing samples: {comparison['differing_samples']} / {comparison['total_samples']}", end="")
-        if comparison['total_samples'] > 0:
-            percent = 100.0 * comparison['differing_samples'] / comparison['total_samples']
-            print(f" ({percent:.2f}%)")
-        else:
+        all_match = True
+
+        # Compare CUDA vs CPU
+        if cuda_result is not None:
+            print("Comparing CPU vs CUDA...")
+
+            if len(cpu_result.output) != len(cuda_result.output):
+                print("  ERROR: Output size mismatch!")
+                print(f"    CPU: {len(cpu_result.output)} samples")
+                print(f"    CUDA: {len(cuda_result.output)} samples")
+                all_match = False
+            else:
+                cuda_comparison = compare_buffers(
+                    cpu_result.output,
+                    cuda_result.output,
+                    samples_per_ascan,
+                    TOLERANCE
+                )
+
+                print(f"  Max absolute difference: {cuda_comparison['max_abs_diff']:.6e}")
+                print(f"  Mean absolute difference: {cuda_comparison['mean_abs_diff']:.6e}")
+                print(f"  RMS error: {cuda_comparison['rms_error']:.6e}")
+                print(f"  Differing samples: {cuda_comparison['differing_samples']} / {cuda_comparison['total_samples']}", end="")
+                if cuda_comparison['total_samples'] > 0:
+                    percent = 100.0 * cuda_comparison['differing_samples'] / cuda_comparison['total_samples']
+                    print(f" ({percent:.2f}%)")
+                else:
+                    print()
+
+                if not cuda_comparison['match']:
+                    all_match = False
+                    print("  CUDA vs CPU: MISMATCH")
+                else:
+                    print("  CUDA vs CPU: MATCH")
             print()
-        print()
-        
-        # Per-A-scan statistics
-        print(f"  First A-scan max diff: {comparison['max_diff_per_ascan'][0]:.6e}")
-        if len(comparison['max_diff_per_ascan']) > 1:
-            print(f"  Last A-scan max diff: {comparison['max_diff_per_ascan'][-1]:.6e}")
-        print()
-        
+
+        # Compare OpenCL vs CPU
+        if opencl_result is not None:
+            print("Comparing CPU vs OpenCL...")
+
+            if len(cpu_result.output) != len(opencl_result.output):
+                print("  ERROR: Output size mismatch!")
+                print(f"    CPU: {len(cpu_result.output)} samples")
+                print(f"    OpenCL: {len(opencl_result.output)} samples")
+                all_match = False
+            else:
+                opencl_comparison = compare_buffers(
+                    cpu_result.output,
+                    opencl_result.output,
+                    samples_per_ascan,
+                    TOLERANCE
+                )
+
+                print(f"  Max absolute difference: {opencl_comparison['max_abs_diff']:.6e}")
+                print(f"  Mean absolute difference: {opencl_comparison['mean_abs_diff']:.6e}")
+                print(f"  RMS error: {opencl_comparison['rms_error']:.6e}")
+                print(f"  Differing samples: {opencl_comparison['differing_samples']} / {opencl_comparison['total_samples']}", end="")
+                if opencl_comparison['total_samples'] > 0:
+                    percent = 100.0 * opencl_comparison['differing_samples'] / opencl_comparison['total_samples']
+                    print(f" ({percent:.2f}%)")
+                else:
+                    print()
+
+                if not opencl_comparison['match']:
+                    all_match = False
+                    print("  OpenCL vs CPU: MISMATCH")
+                else:
+                    print("  OpenCL vs CPU: MATCH")
+            print()
+
         # Save outputs
         if SAVE_OUTPUTS:
             print("Saving outputs...")
             cpu_result.output.tofile("output_cpu.raw")
-            cuda_result.output.tofile("output_cuda.raw")
             print("  Saved: output_cpu.raw")
-            print("  Saved: output_cuda.raw")
+
+            if cuda_result is not None:
+                cuda_result.output.tofile("output_cuda.raw")
+                print("  Saved: output_cuda.raw")
+
+            if opencl_result is not None:
+                opencl_result.output.tofile("output_opencl.raw")
+                print("  Saved: output_opencl.raw")
             print()
-        
+
         # Result
-        if comparison['match']:
+        if all_match:
             print("TEST PASSED")
-            print("CPU and CUDA outputs match within tolerance.")
+            backends_tested = ["CPU"]
+            if cuda_result is not None:
+                backends_tested.append("CUDA")
+            if opencl_result is not None:
+                backends_tested.append("OpenCL")
+            print(f"{', '.join(backends_tested)} outputs match within tolerance.")
             return 0
         else:
             print("TEST FAILED")
-            print("CPU and CUDA outputs differ beyond tolerance.")
+            print("Backend outputs differ beyond tolerance.")
             return 1
     
     except Exception as e:

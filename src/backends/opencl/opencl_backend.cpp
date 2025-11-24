@@ -1,0 +1,1315 @@
+#include "opencl_backend.h"
+#include "opencl_kernels.h"
+#include <clFFT.h>
+#include <stdexcept>
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+#include <iostream>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <cstring>
+
+// Helper macro for checking OpenCL errors
+#define checkOpenClErrors(call) \
+	do { \
+		cl_int err = call; \
+		if (err != CL_SUCCESS) { \
+			std::stringstream ss; \
+			ss << "OpenCL error at " << __FILE__ << ":" << __LINE__ << " - code: " << err; \
+			throw std::runtime_error(ss.str()); \
+		} \
+	} while(0)
+
+// Helper macro for checking clFFT errors
+#define checkClFFTErrors(call) \
+	do { \
+		clfftStatus err = call; \
+		if (err != CLFFT_SUCCESS) { \
+			std::stringstream ss; \
+			ss << "clFFT error at " << __FILE__ << ":" << __LINE__ << " - code: " << err; \
+			throw std::runtime_error(ss.str()); \
+		} \
+	} while(0)
+
+namespace ope {
+
+// ============================================
+// Implementation Structure
+// ============================================
+
+struct OpenClBackend::Impl {
+	//	Configuration
+	ProcessorConfiguration config;
+
+	//	OpenCL parameters
+	int platformId = 0;
+	int deviceId = 0;
+	int numCommandQueues = 2;
+	size_t workGroupSize = 128;
+	size_t maxLocalMemSize = 0;
+	bool openclInitialized = false;
+
+	//	OpenCL objects
+	cl_platform_id platform = nullptr;
+	cl_device_id device = nullptr;
+	cl_context context = nullptr;
+	std::vector<cl_command_queue> commandQueues;
+	cl_program program = nullptr;
+	int currentQueue = 0;
+
+	//	OpenCL kernels
+	cl_kernel kernelInputToComplex = nullptr;
+	cl_kernel kernelInputToComplexBitshift = nullptr;
+	cl_kernel kernelRollingAverage = nullptr;
+	cl_kernel kernelKLinearization = nullptr;
+	cl_kernel kernelKLinearizationCubic = nullptr;
+	cl_kernel kernelKLinearizationLanczos = nullptr;
+	cl_kernel kernelWindowing = nullptr;
+	cl_kernel kernelKLinearizationAndWindowing = nullptr;
+	cl_kernel kernelKLinearizationCubicAndWindowing = nullptr;
+	cl_kernel kernelKLinearizationLanczosAndWindowing = nullptr;
+	cl_kernel kernelFillDispersivePhase = nullptr;
+	cl_kernel kernelDispersionCompensation = nullptr;
+	cl_kernel kernelKLinearizationAndWindowingAndDispersion = nullptr;
+	cl_kernel kernelKLinearizationCubicAndWindowingAndDispersion = nullptr;
+	cl_kernel kernelKLinearizationLanczosAndWindowingAndDispersion = nullptr;
+	cl_kernel kernelPostProcessTruncateLog = nullptr;
+	cl_kernel kernelPostProcessTruncateLin = nullptr;
+	cl_kernel kernelGetMinimumVarianceMean = nullptr;
+	cl_kernel kernelMeanALineSubtraction = nullptr;
+	cl_kernel kernelBscanFlip = nullptr;
+	cl_kernel kernelFillSinusoidalScanCorrectionCurve = nullptr;
+	cl_kernel kernelSinusoidalScanCorrection = nullptr;
+	cl_kernel kernelGetPostProcessBackground = nullptr;
+	cl_kernel kernelPostProcessBackgroundSubtraction = nullptr;
+
+	//	Data dimensions
+	int signalLength = 0;
+	int ascansPerBscan = 0;
+	int bscansPerBuffer = 0;
+	int samplesPerBuffer = 0;
+	int bytesPerSample = 0;
+
+	//	Input buffer management (queue-based, thread-safe)
+	int numInputBuffers = 2;
+	std::vector<IOBuffer> hostInputBuffers;
+	std::queue<IOBuffer*> freeBuffersQueue;
+	std::mutex freeQueueMutex;
+	std::condition_variable freeQueueCV;
+
+	//	Device buffers
+	std::vector<cl_mem> d_inputBuffers;
+	int currentBuffer = 0;
+
+	//	Processing buffers
+	cl_mem d_fftBuffer = nullptr;
+	cl_mem d_inputLinearized = nullptr;
+	cl_mem d_processedBuffer = nullptr;
+
+	//	Curve buffers
+	cl_mem d_resampleCurve = nullptr;
+	cl_mem d_windowCurve = nullptr;
+	cl_mem d_dispersionCurve = nullptr;
+	cl_mem d_phaseCartesian = nullptr;
+
+	//	Fixed pattern noise removal
+	cl_mem d_meanALine = nullptr;
+	bool fixedPatternNoiseDetermined = false;
+	std::vector<float> recordedFixedPatternNoise;
+
+	//	Post-processing
+	cl_mem d_postProcBackgroundLine = nullptr;
+	cl_mem d_sinusoidalScanTmpBuffer = nullptr;
+	cl_mem d_sinusoidalResampleCurve = nullptr;
+	bool postProcessBackgroundRecordingRequested = false;
+	bool postProcessBackgroundUpdated = false;
+	std::vector<float> recordedPostProcessBackground;
+
+	//	clFFT
+	clfftPlanHandle fftPlan = 0;
+	clfftSetupData fftSetup;
+
+	//	Output buffers (ping-pong)
+	IOBuffer outputBuffer1;
+	IOBuffer outputBuffer2;
+	int currentOutputBuffer = 0;
+
+	//	Callback
+	std::function<void(const IOBuffer&)> callback;
+
+	//	Pre-allocated callback data pool
+	struct CallbackData {
+		Impl* impl;
+		IOBuffer* inputBuffer;
+		IOBuffer* outputBuffer;
+	};
+	std::vector<CallbackData> callbackDataPool;
+	std::atomic<int> nextCallbackIndex{0};
+
+	Impl() = default;
+
+	~Impl() {
+		//	Cleanup is handled in cleanup() method
+	}
+};
+
+// ============================================
+// Constructor / Destructor
+// ============================================
+
+OpenClBackend::OpenClBackend() : impl(std::make_unique<Impl>()) {
+}
+
+OpenClBackend::~OpenClBackend() {
+	this->cleanup();
+}
+
+// ============================================
+// Configuration Methods
+// ============================================
+
+void OpenClBackend::setNumInputBuffers(int count) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change number of input buffers after initialization");
+	}
+	if (count < 1) {
+		throw std::invalid_argument("Number of input buffers must be at least 1");
+	}
+	this->impl->numInputBuffers = count;
+}
+
+void OpenClBackend::setNumCommandQueues(int numQueues) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change number of command queues after initialization");
+	}
+	this->impl->numCommandQueues = numQueues;
+}
+
+void OpenClBackend::setWorkGroupSize(int workGroupSize) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change work group size after initialization");
+	}
+	this->impl->workGroupSize = workGroupSize;
+}
+
+void OpenClBackend::setPlatformId(int platformId) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change platform ID after initialization");
+	}
+	this->impl->platformId = platformId;
+}
+
+void OpenClBackend::setDeviceId(int deviceId) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change device ID after initialization");
+	}
+	this->impl->deviceId = deviceId;
+}
+
+int OpenClBackend::getNumCommandQueues() const {
+	return this->impl->numCommandQueues;
+}
+
+int OpenClBackend::getWorkGroupSize() const {
+	return static_cast<int>(this->impl->workGroupSize);
+}
+
+int OpenClBackend::getCurrentPlatformId() const {
+	return this->impl->platformId;
+}
+
+int OpenClBackend::getCurrentDeviceId() const {
+	return this->impl->deviceId;
+}
+
+// ============================================
+// Error Checking Helper
+// ============================================
+
+void OpenClBackend::checkOpenClError(cl_int error, const char* context) {
+	if (error != CL_SUCCESS) {
+		std::stringstream ss;
+		ss << "OpenCL error in " << context << ": code " << error;
+		throw std::runtime_error(ss.str());
+	}
+}
+
+// ============================================
+// Static Device Management Methods
+// ============================================
+
+std::vector<OpenClDeviceInfo> OpenClBackend::getAvailableDevices() {
+	std::vector<OpenClDeviceInfo> devices;
+
+	cl_uint numPlatforms;
+	cl_int err = clGetPlatformIDs(0, nullptr, &numPlatforms);
+	if (err != CL_SUCCESS || numPlatforms == 0) {
+		return devices;
+	}
+
+	std::vector<cl_platform_id> platforms(numPlatforms);
+	checkOpenClErrors(clGetPlatformIDs(numPlatforms, platforms.data(), nullptr));
+
+	for (cl_uint p = 0; p < numPlatforms; p++) {
+		char platformName[256];
+		checkOpenClErrors(clGetPlatformInfo(platforms[p], CL_PLATFORM_NAME, sizeof(platformName), platformName, nullptr));
+
+		cl_uint numDevices;
+		err = clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, 0, nullptr, &numDevices);
+		if (err != CL_SUCCESS || numDevices == 0) {
+			continue;
+		}
+
+		std::vector<cl_device_id> devs(numDevices);
+		checkOpenClErrors(clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, numDevices, devs.data(), nullptr));
+
+		for (cl_uint d = 0; d < numDevices; d++) {
+			OpenClDeviceInfo info;
+			info.platformId = p;
+			info.deviceId = d;
+			info.platformName = platformName;
+
+			char deviceName[256];
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_NAME, sizeof(deviceName), deviceName, nullptr));
+			info.deviceName = deviceName;
+
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_TYPE, sizeof(info.deviceType), &info.deviceType, nullptr));
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(info.globalMemorySize), &info.globalMemorySize, nullptr));
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_LOCAL_MEM_SIZE, sizeof(info.localMemorySize), &info.localMemorySize, nullptr));
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(info.maxWorkGroupSize), &info.maxWorkGroupSize, nullptr));
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(info.maxComputeUnits), &info.maxComputeUnits, nullptr));
+			checkOpenClErrors(clGetDeviceInfo(devs[d], CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(info.maxClockFrequency), &info.maxClockFrequency, nullptr));
+
+			info.isAvailable = true;
+			devices.push_back(info);
+		}
+	}
+
+	return devices;
+}
+
+bool OpenClBackend::selectDevice(int platformId, int deviceId) {
+	try {
+		cl_uint numPlatforms;
+		checkOpenClErrors(clGetPlatformIDs(0, nullptr, &numPlatforms));
+		if (platformId >= static_cast<int>(numPlatforms)) {
+			return false;
+		}
+
+		std::vector<cl_platform_id> platforms(numPlatforms);
+		checkOpenClErrors(clGetPlatformIDs(numPlatforms, platforms.data(), nullptr));
+
+		cl_uint numDevices;
+		checkOpenClErrors(clGetDeviceIDs(platforms[platformId], CL_DEVICE_TYPE_ALL, 0, nullptr, &numDevices));
+		if (deviceId >= static_cast<int>(numDevices)) {
+			return false;
+		}
+
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+OpenClDeviceInfo OpenClBackend::getDeviceInfo(int platformId, int deviceId) {
+	auto devices = getAvailableDevices();
+	for (const auto& dev : devices) {
+		if (dev.platformId == platformId && dev.deviceId == deviceId) {
+			return dev;
+		}
+	}
+	throw std::runtime_error("Device not found");
+}
+
+// ============================================
+// Helper Methods
+// ============================================
+
+void OpenClBackend::createCommandQueues() {
+	this->impl->commandQueues.resize(this->impl->numCommandQueues);
+	for (int i = 0; i < this->impl->numCommandQueues; i++) {
+		cl_int err;
+		this->impl->commandQueues[i] = clCreateCommandQueue(this->impl->context, this->impl->device, 0, &err);
+		checkOpenClError(err, "clCreateCommandQueue");
+	}
+}
+
+void OpenClBackend::destroyCommandQueues() {
+	for (auto& queue : this->impl->commandQueues) {
+		if (queue) {
+			clReleaseCommandQueue(queue);
+			queue = nullptr;
+		}
+	}
+	this->impl->commandQueues.clear();
+}
+
+void OpenClBackend::loadAndBuildKernels() {
+	//	Get kernel source
+	const char* source = ope::opencl::getKernelSource();
+	size_t sourceSize = strlen(source);
+
+	//	Create program
+	cl_int err;
+	this->impl->program = clCreateProgramWithSource(this->impl->context, 1, &source, &sourceSize, &err);
+	checkOpenClError(err, "clCreateProgramWithSource");
+
+	//	Build program
+	err = clBuildProgram(this->impl->program, 1, &this->impl->device, nullptr, nullptr, nullptr);
+	if (err != CL_SUCCESS) {
+		//	Get build log
+		size_t logSize;
+		clGetProgramBuildInfo(this->impl->program, this->impl->device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+		std::vector<char> log(logSize);
+		clGetProgramBuildInfo(this->impl->program, this->impl->device, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
+		std::cerr << "OpenCL build log:\n" << log.data() << std::endl;
+		throw std::runtime_error("clBuildProgram failed");
+	}
+
+	//	Create kernels
+	this->impl->kernelInputToComplex = clCreateKernel(this->impl->program, ope::opencl::KERNEL_INPUT_TO_COMPLEX, &err);
+	checkOpenClError(err, "create inputToComplex kernel");
+
+	this->impl->kernelInputToComplexBitshift = clCreateKernel(this->impl->program, ope::opencl::KERNEL_INPUT_TO_COMPLEX_BITSHIFT, &err);
+	checkOpenClError(err, "create inputToComplexBitshift kernel");
+
+	this->impl->kernelRollingAverage = clCreateKernel(this->impl->program, ope::opencl::KERNEL_ROLLING_AVERAGE_BACKGROUND_REMOVAL, &err);
+	checkOpenClError(err, "create rollingAverage kernel");
+
+	this->impl->kernelKLinearization = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION, &err);
+	checkOpenClError(err, "create kLinearization kernel");
+
+	this->impl->kernelKLinearizationCubic = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_CUBIC, &err);
+	checkOpenClError(err, "create kLinearizationCubic kernel");
+
+	this->impl->kernelKLinearizationLanczos = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_LANCZOS, &err);
+	checkOpenClError(err, "create kLinearizationLanczos kernel");
+
+	this->impl->kernelWindowing = clCreateKernel(this->impl->program, ope::opencl::KERNEL_WINDOWING, &err);
+	checkOpenClError(err, "create windowing kernel");
+
+	this->impl->kernelKLinearizationAndWindowing = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_AND_WINDOWING, &err);
+	checkOpenClError(err, "create kLinearizationAndWindowing kernel");
+
+	this->impl->kernelKLinearizationCubicAndWindowing = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_CUBIC_AND_WINDOWING, &err);
+	checkOpenClError(err, "create kLinearizationCubicAndWindowing kernel");
+
+	this->impl->kernelKLinearizationLanczosAndWindowing = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_LANCZOS_AND_WINDOWING, &err);
+	checkOpenClError(err, "create kLinearizationLanczosAndWindowing kernel");
+
+	this->impl->kernelFillDispersivePhase = clCreateKernel(this->impl->program, ope::opencl::KERNEL_FILL_DISPERSIVE_PHASE, &err);
+	checkOpenClError(err, "create fillDispersivePhase kernel");
+
+	this->impl->kernelDispersionCompensation = clCreateKernel(this->impl->program, ope::opencl::KERNEL_DISPERSION_COMPENSATION, &err);
+	checkOpenClError(err, "create dispersionCompensation kernel");
+
+	this->impl->kernelKLinearizationAndWindowingAndDispersion = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_AND_WINDOWING_AND_DISPERSION, &err);
+	checkOpenClError(err, "create kLinearizationAndWindowingAndDispersion kernel");
+
+	this->impl->kernelKLinearizationCubicAndWindowingAndDispersion = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_CUBIC_AND_WINDOWING_AND_DISPERSION, &err);
+	checkOpenClError(err, "create kLinearizationCubicAndWindowingAndDispersion kernel");
+
+	this->impl->kernelKLinearizationLanczosAndWindowingAndDispersion = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_LANCZOS_AND_WINDOWING_AND_DISPERSION, &err);
+	checkOpenClError(err, "create kLinearizationLanczosAndWindowingAndDispersion kernel");
+
+	this->impl->kernelPostProcessTruncateLog = clCreateKernel(this->impl->program, ope::opencl::KERNEL_POST_PROCESS_TRUNCATE_LOG, &err);
+	checkOpenClError(err, "create postProcessTruncateLog kernel");
+
+	this->impl->kernelPostProcessTruncateLin = clCreateKernel(this->impl->program, ope::opencl::KERNEL_POST_PROCESS_TRUNCATE_LIN, &err);
+	checkOpenClError(err, "create postProcessTruncateLin kernel");
+
+	this->impl->kernelGetMinimumVarianceMean = clCreateKernel(this->impl->program, ope::opencl::KERNEL_GET_MINIMUM_VARIANCE_MEAN, &err);
+	checkOpenClError(err, "create getMinimumVarianceMean kernel");
+
+	this->impl->kernelMeanALineSubtraction = clCreateKernel(this->impl->program, ope::opencl::KERNEL_MEAN_ALINE_SUBTRACTION, &err);
+	checkOpenClError(err, "create meanALineSubtraction kernel");
+
+	this->impl->kernelBscanFlip = clCreateKernel(this->impl->program, ope::opencl::KERNEL_BSCAN_FLIP, &err);
+	checkOpenClError(err, "create bscanFlip kernel");
+
+	this->impl->kernelFillSinusoidalScanCorrectionCurve = clCreateKernel(this->impl->program, ope::opencl::KERNEL_FILL_SINUSOIDAL_SCAN_CURVE, &err);
+	checkOpenClError(err, "create fillSinusoidalScanCorrectionCurve kernel");
+
+	this->impl->kernelSinusoidalScanCorrection = clCreateKernel(this->impl->program, ope::opencl::KERNEL_SINUSOIDAL_SCAN_CORRECTION, &err);
+	checkOpenClError(err, "create sinusoidalScanCorrection kernel");
+
+	this->impl->kernelGetPostProcessBackground = clCreateKernel(this->impl->program, ope::opencl::KERNEL_GET_POST_PROCESS_BACKGROUND, &err);
+	checkOpenClError(err, "create getPostProcessBackground kernel");
+
+	this->impl->kernelPostProcessBackgroundSubtraction = clCreateKernel(this->impl->program, ope::opencl::KERNEL_POST_PROCESS_BACKGROUND_SUBTRACTION, &err);
+	checkOpenClError(err, "create postProcessBackgroundSubtraction kernel");
+}
+
+void OpenClBackend::releaseKernels() {
+	if (this->impl->kernelInputToComplex) { clReleaseKernel(this->impl->kernelInputToComplex); this->impl->kernelInputToComplex = nullptr; }
+	if (this->impl->kernelInputToComplexBitshift) { clReleaseKernel(this->impl->kernelInputToComplexBitshift); this->impl->kernelInputToComplexBitshift = nullptr; }
+	if (this->impl->kernelRollingAverage) { clReleaseKernel(this->impl->kernelRollingAverage); this->impl->kernelRollingAverage = nullptr; }
+	if (this->impl->kernelKLinearization) { clReleaseKernel(this->impl->kernelKLinearization); this->impl->kernelKLinearization = nullptr; }
+	if (this->impl->kernelKLinearizationCubic) { clReleaseKernel(this->impl->kernelKLinearizationCubic); this->impl->kernelKLinearizationCubic = nullptr; }
+	if (this->impl->kernelKLinearizationLanczos) { clReleaseKernel(this->impl->kernelKLinearizationLanczos); this->impl->kernelKLinearizationLanczos = nullptr; }
+	if (this->impl->kernelWindowing) { clReleaseKernel(this->impl->kernelWindowing); this->impl->kernelWindowing = nullptr; }
+	if (this->impl->kernelKLinearizationAndWindowing) { clReleaseKernel(this->impl->kernelKLinearizationAndWindowing); this->impl->kernelKLinearizationAndWindowing = nullptr; }
+	if (this->impl->kernelKLinearizationCubicAndWindowing) { clReleaseKernel(this->impl->kernelKLinearizationCubicAndWindowing); this->impl->kernelKLinearizationCubicAndWindowing = nullptr; }
+	if (this->impl->kernelKLinearizationLanczosAndWindowing) { clReleaseKernel(this->impl->kernelKLinearizationLanczosAndWindowing); this->impl->kernelKLinearizationLanczosAndWindowing = nullptr; }
+	if (this->impl->kernelFillDispersivePhase) { clReleaseKernel(this->impl->kernelFillDispersivePhase); this->impl->kernelFillDispersivePhase = nullptr; }
+	if (this->impl->kernelDispersionCompensation) { clReleaseKernel(this->impl->kernelDispersionCompensation); this->impl->kernelDispersionCompensation = nullptr; }
+	if (this->impl->kernelKLinearizationAndWindowingAndDispersion) { clReleaseKernel(this->impl->kernelKLinearizationAndWindowingAndDispersion); this->impl->kernelKLinearizationAndWindowingAndDispersion = nullptr; }
+	if (this->impl->kernelKLinearizationCubicAndWindowingAndDispersion) { clReleaseKernel(this->impl->kernelKLinearizationCubicAndWindowingAndDispersion); this->impl->kernelKLinearizationCubicAndWindowingAndDispersion = nullptr; }
+	if (this->impl->kernelKLinearizationLanczosAndWindowingAndDispersion) { clReleaseKernel(this->impl->kernelKLinearizationLanczosAndWindowingAndDispersion); this->impl->kernelKLinearizationLanczosAndWindowingAndDispersion = nullptr; }
+	if (this->impl->kernelPostProcessTruncateLog) { clReleaseKernel(this->impl->kernelPostProcessTruncateLog); this->impl->kernelPostProcessTruncateLog = nullptr; }
+	if (this->impl->kernelPostProcessTruncateLin) { clReleaseKernel(this->impl->kernelPostProcessTruncateLin); this->impl->kernelPostProcessTruncateLin = nullptr; }
+	if (this->impl->kernelGetMinimumVarianceMean) { clReleaseKernel(this->impl->kernelGetMinimumVarianceMean); this->impl->kernelGetMinimumVarianceMean = nullptr; }
+	if (this->impl->kernelMeanALineSubtraction) { clReleaseKernel(this->impl->kernelMeanALineSubtraction); this->impl->kernelMeanALineSubtraction = nullptr; }
+	if (this->impl->kernelBscanFlip) { clReleaseKernel(this->impl->kernelBscanFlip); this->impl->kernelBscanFlip = nullptr; }
+	if (this->impl->kernelFillSinusoidalScanCorrectionCurve) { clReleaseKernel(this->impl->kernelFillSinusoidalScanCorrectionCurve); this->impl->kernelFillSinusoidalScanCorrectionCurve = nullptr; }
+	if (this->impl->kernelSinusoidalScanCorrection) { clReleaseKernel(this->impl->kernelSinusoidalScanCorrection); this->impl->kernelSinusoidalScanCorrection = nullptr; }
+	if (this->impl->kernelGetPostProcessBackground) { clReleaseKernel(this->impl->kernelGetPostProcessBackground); this->impl->kernelGetPostProcessBackground = nullptr; }
+	if (this->impl->kernelPostProcessBackgroundSubtraction) { clReleaseKernel(this->impl->kernelPostProcessBackgroundSubtraction); this->impl->kernelPostProcessBackgroundSubtraction = nullptr; }
+
+	if (this->impl->program) {
+		clReleaseProgram(this->impl->program);
+		this->impl->program = nullptr;
+	}
+}
+
+void OpenClBackend::allocateDeviceBuffers() {
+	cl_int err;
+	size_t complexSize = this->impl->samplesPerBuffer * sizeof(float) * 2;  // float2
+
+	//	Input buffers (multiple for pipelining)
+	this->impl->d_inputBuffers.resize(this->impl->numCommandQueues);
+	for (int i = 0; i < this->impl->numCommandQueues; i++) {
+		size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
+		this->impl->d_inputBuffers[i] = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, inputSize, nullptr, &err);
+		checkOpenClError(err, "create input buffer");
+	}
+
+	//	FFT buffer
+	this->impl->d_fftBuffer = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, complexSize, nullptr, &err);
+	checkOpenClError(err, "create FFT buffer");
+
+	//	Linearization buffer
+	this->impl->d_inputLinearized = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, complexSize, nullptr, &err);
+	checkOpenClError(err, "create linearization buffer");
+
+	//	Processed output buffer
+	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
+	this->impl->d_processedBuffer = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, outputSize, nullptr, &err);
+	checkOpenClError(err, "create processed buffer");
+
+	//	Curve buffers
+	size_t curveSize = this->impl->signalLength * sizeof(float);
+	this->impl->d_resampleCurve = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, curveSize, nullptr, &err);
+	checkOpenClError(err, "create resample curve buffer");
+
+	this->impl->d_windowCurve = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, curveSize, nullptr, &err);
+	checkOpenClError(err, "create window curve buffer");
+
+	this->impl->d_dispersionCurve = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, curveSize, nullptr, &err);
+	checkOpenClError(err, "create dispersion curve buffer");
+
+	this->impl->d_phaseCartesian = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, curveSize * 2, nullptr, &err);
+	checkOpenClError(err, "create phase cartesian buffer");
+
+	//	Fixed pattern noise
+	this->impl->d_meanALine = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, curveSize * 2, nullptr, &err);
+	checkOpenClError(err, "create mean A-line buffer");
+
+	//	Post-process background (initialize to zero)
+	this->impl->d_postProcBackgroundLine = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, curveSize, nullptr, &err);
+	checkOpenClError(err, "create post-process background buffer");
+
+	//	Initialize to zero to prevent issues if used before recording
+	std::vector<float> zeros(this->impl->signalLength / 2, 0.0f);
+	checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_postProcBackgroundLine, CL_TRUE, 0,
+		zeros.size() * sizeof(float), zeros.data(), 0, nullptr, nullptr));
+
+	//	Sinusoidal scan correction buffers
+	this->impl->d_sinusoidalScanTmpBuffer = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, outputSize, nullptr, &err);
+	checkOpenClError(err, "create sinusoidal scan tmp buffer");
+
+	size_t sinusoidalCurveSize = this->impl->ascansPerBscan * sizeof(float);
+	this->impl->d_sinusoidalResampleCurve = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, sinusoidalCurveSize, nullptr, &err);
+	checkOpenClError(err, "create sinusoidal resample curve buffer");
+
+	//	Fill sinusoidal scan correction curve
+	if (this->impl->d_sinusoidalResampleCurve != nullptr) {
+		size_t globalWorkSize = this->impl->ascansPerBscan;
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelFillSinusoidalScanCorrectionCurve, 0, sizeof(cl_mem), &this->impl->d_sinusoidalResampleCurve));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelFillSinusoidalScanCorrectionCurve, 1, sizeof(int), &this->impl->ascansPerBscan));
+		checkOpenClErrors(clEnqueueNDRangeKernel(this->impl->commandQueues[0], this->impl->kernelFillSinusoidalScanCorrectionCurve, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr));
+		checkOpenClErrors(clFinish(this->impl->commandQueues[0]));
+	}
+}
+
+void OpenClBackend::releaseDeviceBuffers() {
+	for (auto& buf : this->impl->d_inputBuffers) {
+		if (buf) { clReleaseMemObject(buf); buf = nullptr; }
+	}
+	this->impl->d_inputBuffers.clear();
+
+	if (this->impl->d_fftBuffer) { clReleaseMemObject(this->impl->d_fftBuffer); this->impl->d_fftBuffer = nullptr; }
+	if (this->impl->d_inputLinearized) { clReleaseMemObject(this->impl->d_inputLinearized); this->impl->d_inputLinearized = nullptr; }
+	if (this->impl->d_processedBuffer) { clReleaseMemObject(this->impl->d_processedBuffer); this->impl->d_processedBuffer = nullptr; }
+	if (this->impl->d_resampleCurve) { clReleaseMemObject(this->impl->d_resampleCurve); this->impl->d_resampleCurve = nullptr; }
+	if (this->impl->d_windowCurve) { clReleaseMemObject(this->impl->d_windowCurve); this->impl->d_windowCurve = nullptr; }
+	if (this->impl->d_dispersionCurve) { clReleaseMemObject(this->impl->d_dispersionCurve); this->impl->d_dispersionCurve = nullptr; }
+	if (this->impl->d_phaseCartesian) { clReleaseMemObject(this->impl->d_phaseCartesian); this->impl->d_phaseCartesian = nullptr; }
+	if (this->impl->d_meanALine) { clReleaseMemObject(this->impl->d_meanALine); this->impl->d_meanALine = nullptr; }
+	if (this->impl->d_postProcBackgroundLine) { clReleaseMemObject(this->impl->d_postProcBackgroundLine); this->impl->d_postProcBackgroundLine = nullptr; }
+	if (this->impl->d_sinusoidalScanTmpBuffer) { clReleaseMemObject(this->impl->d_sinusoidalScanTmpBuffer); this->impl->d_sinusoidalScanTmpBuffer = nullptr; }
+	if (this->impl->d_sinusoidalResampleCurve) { clReleaseMemObject(this->impl->d_sinusoidalResampleCurve); this->impl->d_sinusoidalResampleCurve = nullptr; }
+}
+
+void OpenClBackend::registerHostMemory() {
+	//	OpenCL doesn't require explicit host memory registration like CUDA
+	//	Memory transfers are handled by clEnqueueWriteBuffer/clEnqueueReadBuffer
+}
+
+void OpenClBackend::unregisterHostMemory() {
+	//	No-op for OpenCL
+}
+
+// ============================================
+// Lifecycle Methods
+// ============================================
+
+void OpenClBackend::initialize(const ProcessorConfiguration& config) {
+	this->impl->config = config;
+
+	//	Extract dimensions
+	this->impl->signalLength = config.dataParams.signalLength;
+	this->impl->ascansPerBscan = config.dataParams.ascansPerBscan;
+	this->impl->bscansPerBuffer = config.dataParams.bscansPerBuffer;
+	this->impl->samplesPerBuffer = this->impl->signalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
+	this->impl->bytesPerSample = config.dataParams.getBytesPerSample();
+
+	//	Get OpenCL platform
+	cl_uint numPlatforms;
+	checkOpenClErrors(clGetPlatformIDs(0, nullptr, &numPlatforms));
+	if (numPlatforms == 0) {
+		throw std::runtime_error("No OpenCL platforms found");
+	}
+
+	std::vector<cl_platform_id> platforms(numPlatforms);
+	checkOpenClErrors(clGetPlatformIDs(numPlatforms, platforms.data(), nullptr));
+
+	if (this->impl->platformId >= static_cast<int>(numPlatforms)) {
+		throw std::runtime_error("Invalid platform ID");
+	}
+	this->impl->platform = platforms[this->impl->platformId];
+
+	//	Get OpenCL device
+	cl_uint numDevices;
+	checkOpenClErrors(clGetDeviceIDs(this->impl->platform, CL_DEVICE_TYPE_ALL, 0, nullptr, &numDevices));
+	if (numDevices == 0) {
+		throw std::runtime_error("No OpenCL devices found on platform");
+	}
+
+	std::vector<cl_device_id> devices(numDevices);
+	checkOpenClErrors(clGetDeviceIDs(this->impl->platform, CL_DEVICE_TYPE_ALL, numDevices, devices.data(), nullptr));
+
+	if (this->impl->deviceId >= static_cast<int>(numDevices)) {
+		throw std::runtime_error("Invalid device ID");
+	}
+	this->impl->device = devices[this->impl->deviceId];
+
+	//	Query device's local memory size
+	cl_ulong localMemSize;
+	checkOpenClErrors(clGetDeviceInfo(this->impl->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(localMemSize), &localMemSize, nullptr));
+	this->impl->maxLocalMemSize = static_cast<size_t>(localMemSize);
+
+	//	Create context
+	cl_int err;
+	this->impl->context = clCreateContext(nullptr, 1, &this->impl->device, nullptr, nullptr, &err);
+	checkOpenClError(err, "clCreateContext");
+
+	//	Create command queues
+	this->createCommandQueues();
+
+	//	Load and build kernels
+	this->loadAndBuildKernels();
+
+	//	Initialize clFFT library
+	checkClFFTErrors(clfftSetup(&this->impl->fftSetup));
+
+	//	Create clFFT plan for 1D IFFT
+	size_t fftSize = this->impl->signalLength;
+	checkClFFTErrors(clfftCreateDefaultPlan(&this->impl->fftPlan, this->impl->context, CLFFT_1D, &fftSize));
+	checkClFFTErrors(clfftSetPlanPrecision(this->impl->fftPlan, CLFFT_SINGLE));
+	checkClFFTErrors(clfftSetLayout(this->impl->fftPlan, CLFFT_COMPLEX_INTERLEAVED, CLFFT_COMPLEX_INTERLEAVED));
+	checkClFFTErrors(clfftSetResultLocation(this->impl->fftPlan, CLFFT_INPLACE));
+	checkClFFTErrors(clfftSetPlanBatchSize(this->impl->fftPlan, this->impl->ascansPerBscan * this->impl->bscansPerBuffer));
+
+	//	Disable backward FFT scaling to match cuFFT behavior (cuFFT doesn't scale)
+	//	By default, clFFT applies 1/N scaling to backward transform, but we handle normalization in post-processing
+	checkClFFTErrors(clfftSetPlanScale(this->impl->fftPlan, CLFFT_BACKWARD, 1.0f));
+	size_t fftStride = 1;
+	size_t fftDistance = this->impl->signalLength;
+	checkClFFTErrors(clfftSetPlanDistance(this->impl->fftPlan, fftDistance, fftDistance));
+	checkClFFTErrors(clfftSetPlanInStride(this->impl->fftPlan, CLFFT_1D, &fftStride));
+	checkClFFTErrors(clfftSetPlanOutStride(this->impl->fftPlan, CLFFT_1D, &fftStride));
+
+	//	Bake the plan with the first command queue
+	checkClFFTErrors(clfftBakePlan(this->impl->fftPlan, 1, &this->impl->commandQueues[0], nullptr, nullptr));
+
+	//	Allocate device buffers
+	this->allocateDeviceBuffers();
+
+	//	Allocate host input buffers
+	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
+	this->impl->hostInputBuffers.resize(this->impl->numInputBuffers);
+
+	for (int i = 0; i < this->impl->numInputBuffers; ++i) {
+		if (!this->impl->hostInputBuffers[i].allocateMemory(inputSize)) {
+			throw std::runtime_error("Failed to allocate input buffer " + std::to_string(i));
+		}
+
+		this->impl->hostInputBuffers[i].setDataType(config.dataParams.inputDataType);
+
+		//	Add to free queue
+		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
+	}
+
+	//	Allocate output buffers
+	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
+	if (!this->impl->outputBuffer1.allocateMemory(outputSize) ||
+		!this->impl->outputBuffer2.allocateMemory(outputSize)) {
+		throw std::runtime_error("Failed to allocate output buffers");
+	}
+	this->impl->outputBuffer1.setDataType(IOBuffer::DataType::FLOAT32);
+	this->impl->outputBuffer2.setDataType(IOBuffer::DataType::FLOAT32);
+
+	//	Pre-allocate callback data pool
+	int poolSize = this->impl->numCommandQueues * 4;
+	this->impl->callbackDataPool.resize(poolSize);
+	for (auto& data : this->impl->callbackDataPool) {
+		data.impl = this->impl.get();
+	}
+
+	this->impl->openclInitialized = true;
+}
+
+void OpenClBackend::cleanup() {
+	if (!this->impl->openclInitialized) {
+		return;
+	}
+
+	//	Wait for all queues to finish
+	for (auto& queue : this->impl->commandQueues) {
+		if (queue) {
+			clFinish(queue);
+		}
+	}
+
+	//	Release device buffers
+	this->releaseDeviceBuffers();
+
+	//	Unregister host memory
+	this->unregisterHostMemory();
+
+	//	Release kernels
+	this->releaseKernels();
+
+	//	Destroy clFFT plan
+	if (this->impl->fftPlan) {
+		clfftDestroyPlan(&this->impl->fftPlan);
+		this->impl->fftPlan = 0;
+	}
+
+	//	Teardown clFFT library
+	clfftTeardown();
+
+	//	Destroy command queues
+	this->destroyCommandQueues();
+
+	//	Release context
+	if (this->impl->context) {
+		clReleaseContext(this->impl->context);
+		this->impl->context = nullptr;
+	}
+
+	this->impl->openclInitialized = false;
+}
+
+void OpenClBackend::setOutputCallback(std::function<void(const IOBuffer&)> callback) {
+	this->impl->callback = callback;
+}
+
+void OpenClBackend::process(IOBuffer& input) {
+	if (!this->impl->openclInitialized) {
+		throw std::runtime_error("Backend not initialized");
+	}
+
+	//	Round-robin command queue selection
+	this->impl->currentQueue = (this->impl->currentQueue + 1) % this->impl->numCommandQueues;
+	cl_command_queue queue = this->impl->commandQueues[this->impl->currentQueue];
+
+	//	Verify queue is valid
+	if (!queue) {
+		throw std::runtime_error("Command queue is NULL! Queue index: " + std::to_string(this->impl->currentQueue));
+	}
+
+	//	Round-robin device buffer selection
+	this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
+
+	//	Select output buffer (ping-pong)
+	this->impl->currentOutputBuffer = (this->impl->currentOutputBuffer + 1) % 2;
+	IOBuffer* currentOutputBuf = (this->impl->currentOutputBuffer == 0) ?
+		&this->impl->outputBuffer1 : &this->impl->outputBuffer2;
+
+	//	Get buffer ID from input to propagate to output later
+	uint64_t bufferId = input.getBufferId();
+
+	//	Copy input to device
+	cl_mem d_input = this->impl->d_inputBuffers[this->impl->currentBuffer];
+	checkOpenClErrors(clEnqueueWriteBuffer(queue, d_input, CL_FALSE, 0,
+		this->impl->samplesPerBuffer * this->impl->bytesPerSample,
+		input.getDataPointer(), 0, nullptr, nullptr));
+
+	//	Return input buffer after copy (non-blocking, but we trust the queue will execute in order)
+	this->impl->freeQueueMutex.lock();
+	this->impl->freeBuffersQueue.push(&input);
+	this->impl->freeQueueMutex.unlock();
+	this->impl->freeQueueCV.notify_one();
+
+	//	=== PROCESSING PIPELINE ===
+
+	const ProcessorConfiguration& config = this->impl->config;
+	const int signalLength = this->impl->signalLength;
+	const int samplesPerBuffer = this->impl->samplesPerBuffer;
+	const int ascansPerBscan = this->impl->ascansPerBscan;
+	const int bscansPerBuffer = this->impl->bscansPerBuffer;
+
+	size_t globalWorkSize = samplesPerBuffer;
+	size_t localWorkSize = this->impl->workGroupSize;
+
+	//	Round up global work size to be a multiple of local work size
+	if (globalWorkSize % localWorkSize != 0) {
+		globalWorkSize = ((globalWorkSize + localWorkSize - 1) / localWorkSize) * localWorkSize;
+	}
+
+	//	Step 1: Convert input to complex
+	cl_kernel inputKernel = config.dataParams.bitshift ?
+		this->impl->kernelInputToComplexBitshift : this->impl->kernelInputToComplex;
+
+	checkOpenClErrors(clSetKernelArg(inputKernel, 0, sizeof(cl_mem), &this->impl->d_fftBuffer));
+	checkOpenClErrors(clSetKernelArg(inputKernel, 1, sizeof(cl_mem), &d_input));
+	checkOpenClErrors(clSetKernelArg(inputKernel, 2, sizeof(int), &signalLength));
+	checkOpenClErrors(clSetKernelArg(inputKernel, 3, sizeof(int), &signalLength));
+	int bitDepth = config.dataParams.getBitDepth();
+	checkOpenClErrors(clSetKernelArg(inputKernel, 4, sizeof(int), &bitDepth));
+	checkOpenClErrors(clSetKernelArg(inputKernel, 5, sizeof(int), &samplesPerBuffer));
+	checkOpenClErrors(clEnqueueNDRangeKernel(queue, inputKernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+
+	//	Step 2: Rolling average background removal
+	if (config.backgroundRemovalParams.enabled) {
+		int windowSize = config.backgroundRemovalParams.rollingAverageWindowSize;
+		//	Allocate local memory: kernel needs local_size + 2 * rollingAverageWindowSize elements
+		size_t localMemSize = (localWorkSize + 2 * windowSize) * sizeof(float);
+
+		//	Check if local memory exceeds device limit and adjust work group size if needed
+		size_t adjustedLocalWorkSize = localWorkSize;
+		while (localMemSize > this->impl->maxLocalMemSize && adjustedLocalWorkSize > 1) {
+			adjustedLocalWorkSize /= 2;
+			localMemSize = (adjustedLocalWorkSize + 2 * windowSize) * sizeof(float);
+		}
+
+		//	If still too large, throw an error
+		if (localMemSize > this->impl->maxLocalMemSize) {
+			throw std::runtime_error("Rolling average window size too large for device local memory. "
+				"Window size: " + std::to_string(windowSize) + ", "
+				"Required local memory: " + std::to_string(localMemSize) + " bytes, "
+				"Device maximum: " + std::to_string(this->impl->maxLocalMemSize) + " bytes");
+		}
+
+		//	Re-calculate globalWorkSize to be a multiple of adjustedLocalWorkSize
+		size_t adjustedGlobalWorkSize = samplesPerBuffer;
+		if (adjustedGlobalWorkSize % adjustedLocalWorkSize != 0) {
+			adjustedGlobalWorkSize = ((adjustedGlobalWorkSize + adjustedLocalWorkSize - 1) / adjustedLocalWorkSize) * adjustedLocalWorkSize;
+		}
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 0, sizeof(cl_mem), &this->impl->d_inputLinearized));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 1, sizeof(cl_mem), &this->impl->d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 2, sizeof(int), &windowSize));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 4, sizeof(int), &ascansPerBscan));
+		int pitch = signalLength * ascansPerBscan;
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 5, sizeof(int), &pitch));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 6, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelRollingAverage, 7, localMemSize, nullptr));  // __local memory
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelRollingAverage, 1, nullptr, &adjustedGlobalWorkSize, &adjustedLocalWorkSize, 0, nullptr, nullptr));
+
+		//	Swap pointers
+		cl_mem tmpSwapPointer = this->impl->d_inputLinearized;
+		this->impl->d_inputLinearized = this->impl->d_fftBuffer;
+		this->impl->d_fftBuffer = tmpSwapPointer;
+	}
+
+	//	Step 3: K-linearization, windowing, and dispersion compensation
+	cl_mem d_fftBuffer2 = this->impl->d_fftBuffer;
+
+	bool resampling = config.resamplingParams.enabled;
+	bool windowing = config.windowingParams.enabled;
+	bool dispersion = config.dispersionParams.enabled;
+	InterpolationMethod interpMethod = config.resamplingParams.interpolationMethod;
+
+	if (this->impl->d_inputLinearized != nullptr && resampling && windowing && dispersion) {
+		//	K-linearization + windowing + dispersion (most common case)
+		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubicAndWindowingAndDispersion :
+			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearizationAndWindowingAndDispersion :
+			this->impl->kernelKLinearizationLanczosAndWindowingAndDispersion;
+
+		checkOpenClErrors(clSetKernelArg(kernel, 0, sizeof(cl_mem), &this->impl->d_inputLinearized));
+		checkOpenClErrors(clSetKernelArg(kernel, 1, sizeof(cl_mem), &this->impl->d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(kernel, 2, sizeof(cl_mem), &this->impl->d_resampleCurve));
+		checkOpenClErrors(clSetKernelArg(kernel, 3, sizeof(cl_mem), &this->impl->d_windowCurve));
+		checkOpenClErrors(clSetKernelArg(kernel, 4, sizeof(cl_mem), &this->impl->d_phaseCartesian));
+		checkOpenClErrors(clSetKernelArg(kernel, 5, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(kernel, 6, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+
+		d_fftBuffer2 = this->impl->d_inputLinearized;
+	} else if (this->impl->d_inputLinearized != nullptr && resampling && windowing && !dispersion) {
+		//	K-linearization + windowing
+		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubicAndWindowing :
+			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearizationAndWindowing :
+			this->impl->kernelKLinearizationLanczosAndWindowing;
+
+		checkOpenClErrors(clSetKernelArg(kernel, 0, sizeof(cl_mem), &this->impl->d_inputLinearized));
+		checkOpenClErrors(clSetKernelArg(kernel, 1, sizeof(cl_mem), &this->impl->d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(kernel, 2, sizeof(cl_mem), &this->impl->d_resampleCurve));
+		checkOpenClErrors(clSetKernelArg(kernel, 3, sizeof(cl_mem), &this->impl->d_windowCurve));
+		checkOpenClErrors(clSetKernelArg(kernel, 4, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(kernel, 5, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+
+		d_fftBuffer2 = this->impl->d_inputLinearized;
+	} else if (this->impl->d_inputLinearized != nullptr && resampling && !windowing && !dispersion) {
+		//	Just k-linearization
+		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubic :
+			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearization :
+			this->impl->kernelKLinearizationLanczos;
+
+		checkOpenClErrors(clSetKernelArg(kernel, 0, sizeof(cl_mem), &this->impl->d_inputLinearized));
+		checkOpenClErrors(clSetKernelArg(kernel, 1, sizeof(cl_mem), &this->impl->d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(kernel, 2, sizeof(cl_mem), &this->impl->d_resampleCurve));
+		checkOpenClErrors(clSetKernelArg(kernel, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(kernel, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+
+		d_fftBuffer2 = this->impl->d_inputLinearized;
+	} else if (!resampling && windowing && dispersion) {
+		//	Dispersion + windowing
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 2, sizeof(cl_mem), &this->impl->d_phaseCartesian));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelDispersionCompensation, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 2, sizeof(cl_mem), &this->impl->d_windowCurve));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelWindowing, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+	} else if (!resampling && windowing && !dispersion) {
+		//	Just windowing
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 2, sizeof(cl_mem), &this->impl->d_windowCurve));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelWindowing, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelWindowing, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+	} else if (!resampling && !windowing && dispersion) {
+		//	Just dispersion
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 2, sizeof(cl_mem), &this->impl->d_phaseCartesian));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelDispersionCompensation, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+	} else if (this->impl->d_inputLinearized != nullptr && resampling && !windowing && dispersion) {
+		//	K-linearization + dispersion (rarely used)
+		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubic :
+			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearization :
+			this->impl->kernelKLinearizationLanczos;
+
+		checkOpenClErrors(clSetKernelArg(kernel, 0, sizeof(cl_mem), &this->impl->d_inputLinearized));
+		checkOpenClErrors(clSetKernelArg(kernel, 1, sizeof(cl_mem), &this->impl->d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(kernel, 2, sizeof(cl_mem), &this->impl->d_resampleCurve));
+		checkOpenClErrors(clSetKernelArg(kernel, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(kernel, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+
+		d_fftBuffer2 = this->impl->d_inputLinearized;
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 2, sizeof(cl_mem), &this->impl->d_phaseCartesian));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelDispersionCompensation, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+	}
+
+	//	Step 4: IFFT using clFFT
+	checkClFFTErrors(clfftEnqueueTransform(this->impl->fftPlan, CLFFT_BACKWARD, 1, &queue,
+		0, nullptr, nullptr, &d_fftBuffer2, nullptr, nullptr));
+
+	//	Step 5: Fixed-pattern noise removal
+	if (config.postProcessingParams.fixedPatternNoiseRemoval) {
+		int width = signalLength;
+		int height = config.postProcessingParams.fixedPatternNoiseBscanCount * ascansPerBscan;
+
+		if ((!config.postProcessingParams.continuousFixedPatternNoiseDetermination &&
+			!this->impl->fixedPatternNoiseDetermined) ||
+			config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
+
+			int ascansInBuffer = samplesPerBuffer / signalLength;
+			if (height <= ascansInBuffer) {
+				const int segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS (matches CUDA)
+				size_t globalWorkSizeMean = width;
+				//	Round up to be a multiple of local work size
+				if (globalWorkSizeMean % localWorkSize != 0) {
+					globalWorkSizeMean = ((globalWorkSizeMean + localWorkSize - 1) / localWorkSize) * localWorkSize;
+				}
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelGetMinimumVarianceMean, 0, sizeof(cl_mem), &this->impl->d_meanALine));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelGetMinimumVarianceMean, 1, sizeof(cl_mem), &d_fftBuffer2));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelGetMinimumVarianceMean, 2, sizeof(int), &width));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelGetMinimumVarianceMean, 3, sizeof(int), &height));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelGetMinimumVarianceMean, 4, sizeof(int), &segments));
+				checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelGetMinimumVarianceMean, 1, nullptr, &globalWorkSizeMean, &localWorkSize, 0, nullptr, nullptr));
+
+				this->impl->fixedPatternNoiseDetermined = true;
+			}
+		}
+
+		int width2 = width / 2;
+		int samplesPerBuffer2 = samplesPerBuffer / 2;
+		size_t globalWorkSize2 = samplesPerBuffer2;
+		//	Round up to be a multiple of local work size
+		if (globalWorkSize2 % localWorkSize != 0) {
+			globalWorkSize2 = ((globalWorkSize2 + localWorkSize - 1) / localWorkSize) * localWorkSize;
+		}
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelMeanALineSubtraction, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelMeanALineSubtraction, 1, sizeof(cl_mem), &this->impl->d_meanALine));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelMeanALineSubtraction, 2, sizeof(int), &width2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelMeanALineSubtraction, 3, sizeof(int), &samplesPerBuffer2));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelMeanALineSubtraction, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+	}
+
+	//	Step 6: Post-process truncate (magnitude, log scaling, copy to output)
+	cl_mem d_currBuffer = this->impl->d_processedBuffer;
+	size_t globalWorkSize2 = samplesPerBuffer / 2;
+		//	Round up to be a multiple of local work size
+		if (globalWorkSize2 % localWorkSize != 0) {
+			globalWorkSize2 = ((globalWorkSize2 + localWorkSize - 1) / localWorkSize) * localWorkSize;
+		}
+
+	if (config.postProcessingParams.logScaling) {
+		int signalLength2 = signalLength / 2;
+		int samplesPerBuffer2 = samplesPerBuffer / 2;
+		float maxVal = config.postProcessingParams.grayscaleMax;
+		float minVal = config.postProcessingParams.grayscaleMin;
+		float addend = config.postProcessingParams.addend;
+		float multiplicator = config.postProcessingParams.multiplicator;
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 0, sizeof(cl_mem), &d_currBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 2, sizeof(float), &maxVal));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 3, sizeof(float), &minVal));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 4, sizeof(float), &addend));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 5, sizeof(float), &multiplicator));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 6, sizeof(int), &signalLength));  // width_in = full complex A-scan length
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 7, sizeof(int), &signalLength2));  // width_out = output A-scan length
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 8, sizeof(int), &samplesPerBuffer2));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelPostProcessTruncateLog, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+	} else {
+		int signalLength2 = signalLength / 2;
+		int samplesPerBuffer2 = samplesPerBuffer / 2;
+		float maxVal = config.postProcessingParams.grayscaleMax;
+		float minVal = config.postProcessingParams.grayscaleMin;
+		float addend = config.postProcessingParams.addend;
+		float multiplicator = config.postProcessingParams.multiplicator;
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 0, sizeof(cl_mem), &d_currBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 1, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 2, sizeof(float), &maxVal));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 3, sizeof(float), &minVal));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 4, sizeof(float), &addend));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 5, sizeof(float), &multiplicator));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 6, sizeof(int), &signalLength));  // width_in = full complex A-scan length
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 7, sizeof(int), &signalLength2));  // width_out = output A-scan length
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 8, sizeof(int), &samplesPerBuffer2));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelPostProcessTruncateLin, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+	}
+
+	//	Step 7: B-scan flip
+	if (config.postProcessingParams.bscanFlip) {
+		int signalLength2 = signalLength / 2;
+		int pitch = (signalLength * ascansPerBscan) / 2;
+		int samplesPerBuffer4 = samplesPerBuffer / 4;
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelBscanFlip, 0, sizeof(cl_mem), &d_currBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelBscanFlip, 1, sizeof(cl_mem), &d_currBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelBscanFlip, 2, sizeof(int), &signalLength2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelBscanFlip, 3, sizeof(int), &ascansPerBscan));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelBscanFlip, 4, sizeof(int), &pitch));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelBscanFlip, 5, sizeof(int), &samplesPerBuffer4));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelBscanFlip, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+	}
+
+	//	Step 8: Sinusoidal scan correction
+	if (config.postProcessingParams.sinusoidalScanCorrection &&
+		this->impl->d_sinusoidalScanTmpBuffer != nullptr) {
+		size_t copySize = sizeof(float) * samplesPerBuffer / 2;
+		checkOpenClErrors(clEnqueueCopyBuffer(queue, d_currBuffer, this->impl->d_sinusoidalScanTmpBuffer,
+			0, 0, copySize, 0, nullptr, nullptr));
+
+		int signalLength2 = signalLength / 2;
+		int samplesPerBuffer2 = samplesPerBuffer / 2;
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 0, sizeof(cl_mem), &d_currBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 1, sizeof(cl_mem), &this->impl->d_sinusoidalScanTmpBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 2, sizeof(cl_mem), &this->impl->d_sinusoidalResampleCurve));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 3, sizeof(int), &signalLength2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 4, sizeof(int), &ascansPerBscan));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 5, sizeof(int), &bscansPerBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelSinusoidalScanCorrection, 6, sizeof(int), &samplesPerBuffer2));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelSinusoidalScanCorrection, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+	}
+
+	//	Step 9: Post-process background removal
+	if (config.postProcessingParams.backgroundRemoval) {
+		//	Record background if requested
+		if (this->impl->postProcessBackgroundRecordingRequested) {
+			int signalLength2 = signalLength / 2;
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelGetPostProcessBackground, 0, sizeof(cl_mem), &this->impl->d_postProcBackgroundLine));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelGetPostProcessBackground, 1, sizeof(cl_mem), &d_currBuffer));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelGetPostProcessBackground, 2, sizeof(int), &signalLength2));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelGetPostProcessBackground, 3, sizeof(int), &ascansPerBscan));
+			checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelGetPostProcessBackground, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+
+			//	Copy to host
+			size_t bgSize = signalLength / 2;
+			this->impl->recordedPostProcessBackground.resize(bgSize);
+			checkOpenClErrors(clEnqueueReadBuffer(queue, this->impl->d_postProcBackgroundLine, CL_FALSE, 0,
+				bgSize * sizeof(float), this->impl->recordedPostProcessBackground.data(), 0, nullptr, nullptr));
+
+			this->impl->postProcessBackgroundRecordingRequested = false;
+		}
+
+		//	Update background if user provided new one
+		if (this->impl->postProcessBackgroundUpdated) {
+			//	Background was already copied to device in setPostProcessBackground()
+			this->impl->postProcessBackgroundUpdated = false;
+		}
+
+		//	Apply background removal
+		int signalLength2 = signalLength / 2;
+		int samplesPerBuffer2 = samplesPerBuffer / 2;
+		float bgWeight = config.postProcessingParams.backgroundWeight;
+		float bgOffset = config.postProcessingParams.backgroundOffset;
+
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 0, sizeof(cl_mem), &d_currBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 1, sizeof(cl_mem), &this->impl->d_postProcBackgroundLine));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 2, sizeof(float), &bgWeight));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 3, sizeof(float), &bgOffset));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 4, sizeof(int), &signalLength2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 5, sizeof(int), &samplesPerBuffer2));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelPostProcessBackgroundSubtraction, 1, nullptr, &globalWorkSize2, &localWorkSize, 0, nullptr, nullptr));
+	}
+
+	//	Step 10: Copy result to host output buffer asynchronously
+	currentOutputBuf->setBufferId(bufferId);
+	size_t outputSize = (samplesPerBuffer / 2) * sizeof(float);
+
+	//	Verify buffer is valid
+	if (!d_currBuffer) {
+		throw std::runtime_error("d_currBuffer is NULL before readback");
+	}
+
+	//	Copy result back (blocking read will wait for all operations)
+	checkOpenClErrors(clEnqueueReadBuffer(queue, d_currBuffer, CL_TRUE, 0, outputSize,
+		currentOutputBuf->getDataPointer(), 0, nullptr, nullptr));
+
+	//	Step 11: Call output callback
+	if (this->impl->callback) {
+		this->impl->callback(*currentOutputBuf);
+	}
+}
+
+
+void OpenClBackend::updateConfig(const ProcessorConfiguration& config) {
+	this->impl->config = config;
+}
+
+void OpenClBackend::updateResamplingCurve(const float* curve, size_t length) {
+	if (!this->impl->openclInitialized) {
+		return;
+	}
+
+	cl_int err = clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_resampleCurve, CL_TRUE, 0,
+		length * sizeof(float), curve, 0, nullptr, nullptr);
+	checkOpenClError(err, "update resampling curve");
+}
+
+void OpenClBackend::updateDispersionCurve(const float* curve, size_t length) {
+	if (!this->impl->openclInitialized) {
+		return;
+	}
+
+	cl_int err = clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_phaseCartesian, CL_TRUE, 0,
+		length * sizeof(float), curve, 0, nullptr, nullptr);
+	checkOpenClError(err, "update dispersion curve");
+}
+
+void OpenClBackend::updateWindowCurve(const float* curve, size_t length) {
+	if (!this->impl->openclInitialized) {
+		return;
+	}
+
+	cl_int err = clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_windowCurve, CL_TRUE, 0,
+		length * sizeof(float), curve, 0, nullptr, nullptr);
+	checkOpenClError(err, "update window curve");
+}
+
+IOBuffer& OpenClBackend::getInputBuffer(int index) {
+	if (index < 0 || index >= this->impl->numInputBuffers) {
+		throw std::out_of_range("Input buffer index out of range");
+	}
+	return this->impl->hostInputBuffers[index];
+}
+
+IOBuffer& OpenClBackend::getNextAvailableInputBuffer() {
+	std::unique_lock<std::mutex> lock(this->impl->freeQueueMutex);
+	this->impl->freeQueueCV.wait(lock, [this]() { return !this->impl->freeBuffersQueue.empty(); });
+
+	IOBuffer* buffer = this->impl->freeBuffersQueue.front();
+	this->impl->freeBuffersQueue.pop();
+	return *buffer;
+}
+
+int OpenClBackend::getNumInputBuffers() const {
+	return this->impl->numInputBuffers;
+}
+
+void OpenClBackend::requestPostProcessBackgroundRecording() {
+	this->impl->postProcessBackgroundRecordingRequested = true;
+}
+
+void OpenClBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
+	if (!this->impl->openclInitialized) {
+		return;
+	}
+
+	cl_int err = clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_postProcBackgroundLine, CL_TRUE, 0,
+		length * sizeof(float), background, 0, nullptr, nullptr);
+	checkOpenClError(err, "set post-process background");
+
+	this->impl->recordedPostProcessBackground.assign(background, background + length);
+	this->impl->postProcessBackgroundUpdated = true;
+}
+
+const std::vector<float>& OpenClBackend::getPostProcessBackgroundProfile() const {
+	return this->impl->recordedPostProcessBackground;
+}
+
+void OpenClBackend::requestFixedPatternNoiseDetermination() {
+	//	todo
+}
+
+void OpenClBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
+	if (!this->impl->openclInitialized) {
+		return;
+	}
+
+	cl_int err = clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_meanALine, CL_TRUE, 0,
+		complexPairs * 2 * sizeof(float), profileInterleaved, 0, nullptr, nullptr);
+	checkOpenClError(err, "set fixed pattern noise profile");
+
+	this->impl->recordedFixedPatternNoise.assign(profileInterleaved, profileInterleaved + complexPairs * 2);
+	this->impl->fixedPatternNoiseDetermined = true;
+}
+
+const std::vector<float>& OpenClBackend::getFixedPatternNoiseProfile() const {
+	return this->impl->recordedFixedPatternNoise;
+}
+
+//	Individual test methods. not needed, will be removed from all backends in future
+std::vector<float> OpenClBackend::convertInput(const void* input, IOBuffer::DataType inputType, int bitDepth, int samples, bool applyBitshift) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::rollingAverageBackgroundRemoval(const float* input, int windowSize, int lineWidth, int numLines) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::kLinearization(const float* input, const float* resampleCurve, InterpolationMethod method, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::windowing(const float* input, const float* windowCurve, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::dispersionCompensation(const float* input, const float* phaseComplex, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::kLinearizationAndWindowing(const float* input, const float* resampleCurve, const float* windowCurve, InterpolationMethod method, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::kLinearizationAndWindowingAndDispersion(const float* input, const float* resampleCurve, const float* windowCurve, const float* phaseComplex, InterpolationMethod method, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::dispersionCompensationAndWindowing(const float* input, const float* phaseComplex, const float* windowCurve, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::fft(const float* input, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::ifft(const float* input, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::getMinimumVarianceMean(const float* input, int width, int height, int segments) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::fixedPatternNoiseRemoval(const float* input, const float* meanALine, int lineWidth, int numLines) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::postProcessTruncate(const float* input, bool logScaling, float grayscaleMax, float grayscaleMin, float addend, float multiplicator, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::bscanFlip(const float* input, int lineWidth, int linesPerBscan, int numBscans) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::sinusoidalScanCorrection(const float* input, const float* resampleCurve, int lineWidth, int linesPerBscan, int numBscans) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+std::vector<float> OpenClBackend::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
+	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
+}
+
+void CL_CALLBACK OpenClBackend::returnBufferCallback(cl_event event, cl_int status, void* userData) {
+	//todo
+}
+
+void CL_CALLBACK OpenClBackend::outputCallback(cl_event event, cl_int status, void* userData) {
+	//todo
+}
+
+} // namespace ope

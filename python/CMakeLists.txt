@@ -115,6 +115,43 @@ if(WIN32)
 			)
 		endif()
 	endif()
+
+	# Copy OpenCL DLLs if OpenCL is enabled
+	if(BUILD_OPENCL)
+		# Find OpenCL DLL (search system paths for GPU driver-provided OpenCL)
+		find_file(OPENCL_DLL
+			NAMES OpenCL.dll
+			PATHS
+				"${CMAKE_SOURCE_DIR}/thirdparty/opencl/bin"
+				"$ENV{CUDA_PATH}/bin"
+				"C:/Windows/System32"
+		)
+
+		# Find clFFT DLLs
+		find_file(CLFFT_DLL
+			NAMES clFFT.dll
+			PATHS "${CMAKE_SOURCE_DIR}/thirdparty/clfft/bin"
+			NO_DEFAULT_PATH
+		)
+
+		if(OPENCL_DLL)
+			add_custom_command(TARGET octproengine_python POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different
+					"${OPENCL_DLL}"
+					"$<TARGET_FILE_DIR:octproengine_python>"
+				COMMENT "Copying OpenCL DLL to Python module directory"
+			)
+		endif()
+
+		if(CLFFT_DLL)
+			add_custom_command(TARGET octproengine_python POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different
+					"${CLFFT_DLL}"
+					"$<TARGET_FILE_DIR:octproengine_python>"
+				COMMENT "Copying clFFT DLL to Python module directory"
+			)
+		endif()
+	endif()
 endif()
 
 # Linux: Set RPATH so the module can find shared libraries

@@ -405,6 +405,7 @@ PYBIND11_MODULE(octproengine, m) {
 	py::enum_<ope::Backend>(m, "Backend")
 		.value("CUDA", ope::Backend::CUDA, "NVIDIA CUDA GPU backend")
 		.value("CPU", ope::Backend::CPU, "CPU backend")
+		.value("OPENCL", ope::Backend::OPENCL, "OpenCL GPU backend")
 		.export_values();
 	
 	py::enum_<ope::DataType>(m, "DataType")
@@ -1091,7 +1092,8 @@ PYBIND11_MODULE(octproengine, m) {
 		
 		// String representation
 		.def("__repr__", [](const ProcessorWrapper& self) {
-			std::string backend_str = (self.processor.getBackend() == ope::Backend::CUDA) ? "CUDA" : "CPU";
+			std::string backend_str = (self.processor.getBackend() == ope::Backend::CUDA) ? "CUDA" :
+			                          (self.processor.getBackend() == ope::Backend::OPENCL) ? "OpenCL" : "CPU";
 			return "<Processor(backend=" + backend_str + ")>";
 		});
 

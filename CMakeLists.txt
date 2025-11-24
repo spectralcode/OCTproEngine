@@ -15,9 +15,10 @@ configure_file(
 # Options
 option(BUILD_CUDA "Build with CUDA support" ON)
 option(BUILD_CPU "Build with CPU backend" ON)
+option(BUILD_OPENCL "Build with OpenCL backend" ON)
 option(BUILD_PYTHON "Build Python bindings" OFF)
 option(BUILD_TESTS "Build tests" ON)
-option(BUILD_EXAMPLES "Build examples" OFF)
+option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TOOLS "Build optional ProcessorTools (Recorder, etc.)" ON)
 option(FFTW3_AUTO_DOWNLOAD "Automatically download FFTW3 to thirdparty/fftw if not found (Windows only)" ON)
 
@@ -32,8 +33,8 @@ if(MSVC)
 endif()
 
 # Validate backend selection
-if(NOT BUILD_CUDA AND NOT BUILD_CPU)
-	message(FATAL_ERROR "At least one backend must be enabled (BUILD_CUDA or BUILD_CPU)")
+if(NOT BUILD_CUDA AND NOT BUILD_CPU AND NOT BUILD_OPENCL)
+	message(FATAL_ERROR "At least one backend must be enabled (BUILD_CUDA, BUILD_CPU, or BUILD_OPENCL)")
 endif()
 
 # Add cmake module path for custom Find modules
@@ -51,6 +52,15 @@ if(BUILD_CPU)
 	find_package(FFTW3 REQUIRED)
 else()
 	message(STATUS "Building without CPU backend - FFTW3 not required")
+endif()
+
+# Find OpenCL and clFFT (only needed for OpenCL backend)
+if(BUILD_OPENCL)
+	find_package(OpenCL REQUIRED)
+	message(STATUS "Found OpenCL: ${OpenCL_LIBRARIES}")
+	find_package(clFFT REQUIRED)
+else()
+	message(STATUS "Building without OpenCL backend")
 endif()
 
 # octproengine src folder
@@ -78,6 +88,7 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "CUDA backend: ${BUILD_CUDA}")
 message(STATUS "CPU backend: ${BUILD_CPU}")
+message(STATUS "OpenCL backend: ${BUILD_OPENCL}")
 message(STATUS "Python bindings: ${BUILD_PYTHON}")
 message(STATUS "Build tests: ${BUILD_TESTS}")
 message(STATUS "Build examples: ${BUILD_EXAMPLES}")

@@ -106,7 +106,7 @@ if /i "%DOWNLOAD_CHOICE%"=="Y" (
 
 REM Configure (FFTW will auto-download to thirdparty/fftw if user said yes)
 echo Configuring CMake...
-cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=ON -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=ON -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 (
 	echo.
 	echo ERROR: CMake configuration failed!

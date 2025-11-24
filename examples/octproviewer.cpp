@@ -198,7 +198,8 @@ void initializeProcessor(AppState* state) {
 	state->processorInitialized = true;
 
 	std::cout << "Processor initialized ("
-			  << (state->dataParams.backend == ope::Backend::CUDA ? "CUDA" : "CPU")
+			  << (state->dataParams.backend == ope::Backend::CUDA ? "CUDA" :
+			      (state->dataParams.backend == ope::Backend::CPU ? "CPU" : "OpenCL"))
 			  << ")" << std::endl;
 }
 
@@ -413,10 +414,10 @@ void renderDataParametersUI(AppState* state) {
 		dp.hasChanged = true;
 	}
 
-	const char* backends[] = {"CUDA", "CPU"};
-	int backendIdx = dp.backend == ope::Backend::CUDA ? 0 : 1;
-	if (ImGui::Combo("Backend", &backendIdx, backends, 2)) {
-		dp.backend = backendIdx == 0 ? ope::Backend::CUDA : ope::Backend::CPU;
+	const char* backends[] = {"CUDA", "CPU", "OpenCL"};
+	int backendIdx = dp.backend == ope::Backend::CUDA ? 0 : (dp.backend == ope::Backend::CPU ? 1 : 2);
+	if (ImGui::Combo("Backend", &backendIdx, backends, 3)) {
+		dp.backend = backendIdx == 0 ? ope::Backend::CUDA : (backendIdx == 1 ? ope::Backend::CPU : ope::Backend::OPENCL);
 		dp.hasChanged = true;
 	}
 

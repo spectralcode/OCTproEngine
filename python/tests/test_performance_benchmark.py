@@ -4,7 +4,7 @@ OCT Processing Performance Benchmark
 
 This test mirrors the C++ test_performance_benchmark.cpp
 It benchmarks processing performance across different buffer configurations
-and optionally compares CPU vs CUDA performance.
+and optionally compares CPU, CUDA, and OpenCL performance.
 """
 
 import sys
@@ -25,6 +25,7 @@ except ImportError:
 # Which backends to benchmark
 BENCHMARK_CPU = False
 BENCHMARK_CUDA = True
+BENCHMARK_OPENCL = True
 
 # Buffer sizes to test (will test all combinations)
 SIGNAL_LENGTHS = [512, 1024, 2048, 4096]
@@ -181,7 +182,8 @@ def run_benchmark(backend, signal_length, ascans_per_bscan, bscans_per_buffer, t
     result.signal_length = signal_length
     result.ascans_per_bscan = ascans_per_bscan
     result.bscans_per_buffer = bscans_per_buffer
-    result.backend = "CPU" if backend == ope.Backend.CPU else "CUDA"
+    result.backend = ("CPU" if backend == ope.Backend.CPU else
+                     "CUDA" if backend == ope.Backend.CUDA else "OpenCL")
     result.iterations = ITERATIONS
     
     try:
@@ -328,6 +330,8 @@ def print_configuration():
         print("CPU ", end="")
     if BENCHMARK_CUDA:
         print("CUDA ", end="")
+    if BENCHMARK_OPENCL:
+        print("OpenCL ", end="")
     print()
     print()
 
@@ -348,9 +352,9 @@ def main():
         print()
         
         all_results = []
-        
+
         # Calculate total number of tests
-        num_backends = (1 if BENCHMARK_CPU else 0) + (1 if BENCHMARK_CUDA else 0)
+        num_backends = (1 if BENCHMARK_CPU else 0) + (1 if BENCHMARK_CUDA else 0) + (1 if BENCHMARK_OPENCL else 0)
         total_tests = len(SIGNAL_LENGTHS) * len(ASCANS_PER_BSCAN) * len(BSCANS_PER_BUFFER) * num_backends
         current_test = 0
         
@@ -361,9 +365,10 @@ def main():
                     
                     # Generate test data once for this size
                     test_data = generate_test_data(signal_length, ascans_per_bscan, bscans_per_buffer)
-                    
+
                     cpu_result = None
                     cuda_result = None
+                    opencl_result = None
                     
                     # Benchmark CPU
                     if BENCHMARK_CPU:
@@ -385,19 +390,42 @@ def main():
                         current_test += 1
                         print(f"[{current_test}/{total_tests}] Testing CUDA: "
                               f"{signal_length}x{ascans_per_bscan}x{bscans_per_buffer} ... ", end="", flush=True)
-                        
-                        cuda_result = run_benchmark(ope.Backend.CUDA, signal_length, 
+
+                        cuda_result = run_benchmark(ope.Backend.CUDA, signal_length,
                                                    ascans_per_bscan, bscans_per_buffer, test_data)
-                        
+
                         if cuda_result:
                             # Calculate speedup if we have CPU result
                             if cpu_result:
                                 cuda_result.speedup = cpu_result.avg_time_ms / cuda_result.avg_time_ms
-                            
+
                             all_results.append(cuda_result)
                             print(f"{cuda_result.avg_time_ms:.3f} ms", end="")
                             if cpu_result:
                                 print(f" (speedup: {cuda_result.speedup:.2f}x)")
+                            else:
+                                print()
+                        else:
+                            print("FAILED")
+
+                    # Benchmark OpenCL
+                    if BENCHMARK_OPENCL:
+                        current_test += 1
+                        print(f"[{current_test}/{total_tests}] Testing OpenCL: "
+                              f"{signal_length}x{ascans_per_bscan}x{bscans_per_buffer} ... ", end="", flush=True)
+
+                        opencl_result = run_benchmark(ope.Backend.OPENCL, signal_length,
+                                                     ascans_per_bscan, bscans_per_buffer, test_data)
+
+                        if opencl_result:
+                            # Calculate speedup if we have CPU result
+                            if cpu_result:
+                                opencl_result.speedup = cpu_result.avg_time_ms / opencl_result.avg_time_ms
+
+                            all_results.append(opencl_result)
+                            print(f"{opencl_result.avg_time_ms:.3f} ms", end="")
+                            if cpu_result:
+                                print(f" (speedup: {opencl_result.speedup:.2f}x)")
                             else:
                                 print()
                         else:

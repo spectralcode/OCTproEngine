@@ -21,6 +21,7 @@
 // Which backends to benchmark
 const bool BENCHMARK_CPU = false;
 const bool BENCHMARK_CUDA = true;
+const bool BENCHMARK_OPENCL = false;
 
 // Buffer sizes to test (will test all combinations)
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048, 4096};
@@ -187,7 +188,8 @@ BenchmarkResult runBenchmark(
 	result.signalLength = signalLength;
 	result.ascansPerBscan = ascansPerBscan;
 	result.bscansPerBuffer = bscansPerBuffer;
-	result.backend = (backend == ope::Backend::CPU) ? "CPU" : "CUDA";
+	result.backend = (backend == ope::Backend::CPU) ? "CPU" :
+	                 (backend == ope::Backend::CUDA) ? "CUDA" : "OpenCL";
 	result.iterations = ITERATIONS;
 	result.speedup = 1.0;
 	
@@ -353,6 +355,7 @@ void printConfiguration() {
 	std::cout << "  Backends: ";
 	if (BENCHMARK_CPU) std::cout << "CPU ";
 	if (BENCHMARK_CUDA) std::cout << "CUDA ";
+	if (BENCHMARK_OPENCL) std::cout << "OpenCL ";
 	std::cout << std::endl;
 	std::cout << std::endl;
 }
@@ -378,7 +381,7 @@ int main() {
 	int numSignalLengths = sizeof(SIGNAL_LENGTHS) / sizeof(SIGNAL_LENGTHS[0]);
 	int numAscans = sizeof(ASCANS_PER_BSCAN) / sizeof(ASCANS_PER_BSCAN[0]);
 	int numBscans = sizeof(BSCANS_PER_BUFFER) / sizeof(BSCANS_PER_BUFFER[0]);
-	int numBackends = (BENCHMARK_CPU ? 1 : 0) + (BENCHMARK_CUDA ? 1 : 0);
+	int numBackends = (BENCHMARK_CPU ? 1 : 0) + (BENCHMARK_CUDA ? 1 : 0) + (BENCHMARK_OPENCL ? 1 : 0);
 	int totalTests = numSignalLengths * numAscans * numBscans * numBackends;
 	int currentTest = 0;
 	
@@ -395,7 +398,7 @@ int main() {
 				// Generate test data once for this size
 				auto testData = generateTestData(signalLength, ascansPerBscan, bscansPerBuffer);
 				
-				BenchmarkResult cpuResult, cudaResult;
+				BenchmarkResult cpuResult, cudaResult, openclResult;
 				
 				// Benchmark CPU
 				if (BENCHMARK_CPU) {
@@ -416,19 +419,42 @@ int main() {
 					std::cout << "[" << currentTest << "/" << totalTests << "] "
 					          << "Testing CUDA: " << signalLength << "x" << ascansPerBscan << "x" << bscansPerBuffer
 					          << " ... " << std::flush;
-					
+
 					cudaResult = runBenchmark(ope::Backend::CUDA, signalLength, ascansPerBscan, bscansPerBuffer, testData);
-					
+
 					// Calculate speedup if we have CPU result
 					if (BENCHMARK_CPU) {
 						cudaResult.speedup = cpuResult.avgTimeMs / cudaResult.avgTimeMs;
 					}
-					
+
 					allResults.push_back(cudaResult);
-					
+
 					std::cout << std::fixed << std::setprecision(3) << cudaResult.avgTimeMs << " ms";
 					if (BENCHMARK_CPU) {
 						std::cout << " (speedup: " << std::setprecision(2) << cudaResult.speedup << "x)";
+					}
+					std::cout << std::endl;
+				}
+
+				// Benchmark OpenCL
+				if (BENCHMARK_OPENCL) {
+					currentTest++;
+					std::cout << "[" << currentTest << "/" << totalTests << "] "
+					          << "Testing OpenCL: " << signalLength << "x" << ascansPerBscan << "x" << bscansPerBuffer
+					          << " ... " << std::flush;
+
+					openclResult = runBenchmark(ope::Backend::OPENCL, signalLength, ascansPerBscan, bscansPerBuffer, testData);
+
+					// Calculate speedup if we have CPU result
+					if (BENCHMARK_CPU) {
+						openclResult.speedup = cpuResult.avgTimeMs / openclResult.avgTimeMs;
+					}
+
+					allResults.push_back(openclResult);
+
+					std::cout << std::fixed << std::setprecision(3) << openclResult.avgTimeMs << " ms";
+					if (BENCHMARK_CPU) {
+						std::cout << " (speedup: " << std::setprecision(2) << openclResult.speedup << "x)";
 					}
 					std::cout << std::endl;
 				}
