@@ -67,6 +67,19 @@ add_ope_test(test_multi_consumer test_multi_consumer.cpp)
 add_ope_test(test_cuda_api test_cuda_api.cpp)
 add_ope_test(test_buffer_id_and_raw_callbacks test_buffer_id_and_raw_callbacks.cpp)
 
+# Recorder test (requires BUILD_TOOLS=ON)
+if(BUILD_TOOLS)
+	add_executable(test_recorder test_recorder.cpp)
+	target_link_libraries(test_recorder PRIVATE octproengine)
+	add_test(NAME test_recorder COMMAND test_recorder)
+
+	if(WIN32)
+		add_dependencies(test_recorder copy_test_dlls)
+	endif()
+
+	message(STATUS "Recorder test enabled (BUILD_TOOLS=ON)")
+endif()
+
 # ========================================
 # Copy test data to build directory
 # ========================================

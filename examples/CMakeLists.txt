@@ -165,3 +165,32 @@ if(BUILD_OCT_VIEWER)
 else()
 	message(STATUS "OCTproViewer disabled (use -DBUILD_OCT_VIEWER=ON to enable)")
 endif()
+
+# Recorder example (requires BUILD_TOOLS=ON)
+if(BUILD_TOOLS)
+	add_executable(example_recorder example_recorder.cpp)
+	target_link_libraries(example_recorder PRIVATE octproengine)
+
+	if(WIN32)
+		add_custom_command(TARGET example_recorder POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				$<TARGET_FILE:octproengine>
+				$<TARGET_FILE_DIR:example_recorder>
+			COMMENT "Copying octproengine.dll to example_recorder directory"
+		)
+
+		# Copy FFTW DLL if building with CPU backend
+		if(BUILD_CPU AND FFTW3_DLL)
+			add_custom_command(TARGET example_recorder POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different
+					"${FFTW3_DLL}"
+					$<TARGET_FILE_DIR:example_recorder>
+				COMMENT "Copying FFTW DLL to example_recorder directory"
+			)
+		endif()
+	endif()
+
+	message(STATUS "Recorder example enabled (BUILD_TOOLS=ON)")
+else()
+	message(STATUS "Recorder example disabled (use -DBUILD_TOOLS=ON to enable)")
+endif()

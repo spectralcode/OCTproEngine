@@ -12,6 +12,11 @@ set(CORE_SOURCES
 	core/cudautils.cpp
 )
 
+set(TOOLS_SOURCES)
+if(BUILD_TOOLS)
+	list(APPEND TOOLS_SOURCES tools/recorder.cpp)
+endif()
+
 set(CPU_SOURCES
 	backends/cpu/cpu_backend.cpp
 )
@@ -38,6 +43,7 @@ endif()
 # Create library
 add_library(octproengine SHARED
 	${CORE_SOURCES}
+	${TOOLS_SOURCES}
 	${BACKEND_SOURCES}
 )
 
