@@ -7,6 +7,7 @@ set(CORE_SOURCES
 	core/iobuffer.cpp
 	core/processor.cpp
 	core/processorconfiguration.cpp
+	core/backendconfig.cpp
 	core/callback_manager.cpp
 	core/processortool.cpp
 	core/cudautils.cpp

@@ -200,7 +200,8 @@ public:
 	void setNumCommandQueues(int numQueues);
 	void setWorkGroupSize(int workGroupSize);
 	void setPlatformId(int platformId);
-	void setDeviceId(int deviceId);
+	void setDeviceId(int deviceId);  // -1 = auto-select based on preferGpu
+	void setPreferGpu(bool prefer);  // Used when deviceId is -1
 
 	int getNumCommandQueues() const;
 	int getWorkGroupSize() const;

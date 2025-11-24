@@ -75,7 +75,8 @@ struct OpenClBackend::Impl {
 
 	//	OpenCL parameters
 	int platformId = 0;
-	int deviceId = 0;
+	int deviceId = -1;
+	bool preferGpu = true;
 	int numCommandQueues = 2;
 	size_t workGroupSize = 128;
 	size_t maxLocalMemSize = 0;
@@ -246,6 +247,13 @@ void OpenClBackend::setDeviceId(int deviceId) {
 		throw std::runtime_error("Cannot change device ID after initialization");
 	}
 	this->impl->deviceId = deviceId;
+}
+
+void OpenClBackend::setPreferGpu(bool prefer) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change preferGpu after initialization");
+	}
+	this->impl->preferGpu = prefer;
 }
 
 int OpenClBackend::getNumCommandQueues() const {
@@ -655,6 +663,29 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 
 	std::vector<cl_device_id> devices(numDevices);
 	checkOpenClErrors(clGetDeviceIDs(this->impl->platform, CL_DEVICE_TYPE_ALL, numDevices, devices.data(), nullptr));
+
+	//	Auto-select device if deviceId is -1
+	if (this->impl->deviceId < 0) {
+		cl_device_type preferredType = this->impl->preferGpu ? CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_CPU;
+		int selectedDevice = -1;
+
+		//	First pass: find preferred device type
+		for (cl_uint d = 0; d < numDevices; d++) {
+			cl_device_type deviceType;
+			checkOpenClErrors(clGetDeviceInfo(devices[d], CL_DEVICE_TYPE, sizeof(deviceType), &deviceType, nullptr));
+			if (deviceType & preferredType) {
+				selectedDevice = static_cast<int>(d);
+				break;
+			}
+		}
+
+		//	Fallback: use first available device
+		if (selectedDevice < 0) {
+			selectedDevice = 0;
+		}
+
+		this->impl->deviceId = selectedDevice;
+	}
 
 	if (this->impl->deviceId >= static_cast<int>(numDevices)) {
 		throw std::runtime_error("Invalid device ID");

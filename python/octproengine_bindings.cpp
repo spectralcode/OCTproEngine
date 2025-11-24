@@ -5,6 +5,7 @@
 
 #include "processor.h"
 #include "processorconfiguration.h"
+#include "backendconfig.h"
 #include "iobuffer.h"
 #include "types.h"
 #include "version.h"
@@ -300,9 +301,6 @@ ope::Processor::CallbackId add_output_callback(py::function cb) {
 	}
 
 	void process(py::array buffer_array) {
-		// Note: We no longer require set_callback() to be called first
-		// Users can now use add_output_callback() instead
-
 		// Get buffer from the array's base object (if it's a view of IOBuffer)
 		py::object base = buffer_array.attr("base");
 		if (base.is_none()) {
@@ -455,6 +453,101 @@ PYBIND11_MODULE(octproengine, m) {
 		.value("COMPLETE", ope::tools::Recorder::Status::COMPLETE, "Last recording succeeded")
 		.value("ERROR_STATUS", ope::tools::Recorder::Status::ERROR, "Last recording failed")
 		.export_values();
+
+	// ============================================
+	// BACKEND CONFIGURATION
+	// ============================================
+
+	// DeviceInfo structure
+	py::class_<ope::DeviceInfo>(m, "DeviceInfo")
+		.def(py::init<>())
+		.def_readonly("id", &ope::DeviceInfo::id)
+		.def_readonly("name", &ope::DeviceInfo::name)
+		.def_readonly("total_memory", &ope::DeviceInfo::totalMemory)
+		.def_readonly("available_memory", &ope::DeviceInfo::availableMemory)
+		.def_readonly("compute_capability_major", &ope::DeviceInfo::computeCapabilityMajor)
+		.def_readonly("compute_capability_minor", &ope::DeviceInfo::computeCapabilityMinor)
+		.def_readonly("vendor_name", &ope::DeviceInfo::vendorName)
+		.def_readonly("device_version", &ope::DeviceInfo::deviceVersion)
+		.def("__repr__", [](const ope::DeviceInfo& info) {
+			return "<DeviceInfo(id=" + std::to_string(info.id) +
+			       ", name='" + info.name + "')>";
+		});
+
+	// Base BackendConfig class
+	py::class_<ope::BackendConfig>(m, "BackendConfig")
+		.def("get_backend_type", &ope::BackendConfig::getBackendType,
+			"Get the backend type for this configuration")
+		.def("is_valid", &ope::BackendConfig::isValid,
+			"Check if the configuration is valid")
+		.def("to_string", &ope::BackendConfig::toString,
+			"Get human-readable string representation")
+		.def("__repr__", [](const ope::BackendConfig& config) {
+			return "<BackendConfig(" + config.toString() + ")>";
+		});
+
+	// CudaConfig derived class
+	py::class_<ope::CudaConfig, ope::BackendConfig>(m, "CudaConfig")
+		.def(py::init<>())
+		.def_readwrite("device_id", &ope::CudaConfig::deviceId,
+			"CUDA device ID (default: 0)")
+		.def_readwrite("enable_zero_copy", &ope::CudaConfig::enableZeroCopy,
+			"Enable zero-copy mode for Jetson devices (default: False)")
+		.def("__repr__", [](const ope::CudaConfig& config) {
+			return "<CudaConfig(device_id=" + std::to_string(config.deviceId) +
+			       ", enable_zero_copy=" + (config.enableZeroCopy ? "True" : "False") + ")>";
+		});
+
+	// OpenCLConfig derived class
+	py::class_<ope::OpenCLConfig, ope::BackendConfig>(m, "OpenCLConfig")
+		.def(py::init<>())
+		.def_readwrite("platform_id", &ope::OpenCLConfig::platformId,
+			"OpenCL platform ID (default: 0)")
+		.def_readwrite("device_id", &ope::OpenCLConfig::deviceId,
+			"OpenCL device ID (default: 0)")
+		.def_readwrite("prefer_gpu", &ope::OpenCLConfig::preferGpu,
+			"Prefer GPU devices (default: True)")
+		.def("__repr__", [](const ope::OpenCLConfig& config) {
+			return "<OpenCLConfig(platform_id=" + std::to_string(config.platformId) +
+			       ", device_id=" + std::to_string(config.deviceId) +
+			       ", prefer_gpu=" + (config.preferGpu ? "True" : "False") + ")>";
+		});
+
+	// CpuConfig derived class
+	py::class_<ope::CpuConfig, ope::BackendConfig>(m, "CpuConfig")
+		.def(py::init<>())
+		.def_readwrite("num_threads", &ope::CpuConfig::numThreads,
+			"Number of threads (0 = auto-detect, default: 0)")
+		.def_readwrite("enable_simd", &ope::CpuConfig::enableSimd,
+			"Enable SIMD optimizations (default: True)")
+		.def("__repr__", [](const ope::CpuConfig& config) {
+			return "<CpuConfig(num_threads=" + std::to_string(config.numThreads) +
+			       ", enable_simd=" + (config.enableSimd ? "True" : "False") + ")>";
+		});
+
+	// BackendUtils class
+	py::class_<ope::BackendUtils>(m, "BackendUtils")
+		.def_static("get_cuda_devices", &ope::BackendUtils::getCudaDevices,
+			"Get list of available CUDA devices")
+		.def_static("get_opencl_devices", &ope::BackendUtils::getOpenCLDevices,
+			"Get list of available OpenCL devices")
+		.def_static("get_cpu_info", &ope::BackendUtils::getCpuInfo,
+			"Get CPU information")
+		.def_static("is_cuda_available", &ope::BackendUtils::isCudaAvailable,
+			"Check if CUDA is available")
+		.def_static("is_opencl_available", &ope::BackendUtils::isOpenCLAvailable,
+			"Check if OpenCL is available")
+		.def_static("is_cpu_available", &ope::BackendUtils::isCpuAvailable,
+			"Check if CPU backend is available")
+		.def_static("create_default_config", &ope::BackendUtils::createDefaultConfig,
+			py::arg("backend"),
+			"Create default configuration for a backend")
+		.def_static("parse_config", &ope::BackendUtils::parseConfig,
+			py::arg("config_string"),
+			"Parse configuration from string")
+		.def_static("serialize_config", &ope::BackendUtils::serializeConfig,
+			py::arg("config"),
+			"Serialize configuration to string");
 
 	// ============================================
 	// CUDA UTILITIES
@@ -696,10 +789,45 @@ PYBIND11_MODULE(octproengine, m) {
 		.def("set_backend", [](ProcessorWrapper& self, ope::Backend backend) {
 			py::gil_scoped_release release;
 			self.processor.setBackend(backend);
-		}, py::arg("backend"), "Switch backend (CUDA <-> CPU)")
-		.def("get_backend", [](const ProcessorWrapper& self) { 
-			return self.processor.getBackend(); 
+		}, py::arg("backend"), "Switch backend (CUDA <-> CPU <-> OpenCL)")
+		.def("get_backend", [](const ProcessorWrapper& self) {
+			return self.processor.getBackend();
 		}, "Get current backend")
+
+		// Unified backend configuration API
+		.def("set_backend_config", [](ProcessorWrapper& self, const ope::BackendConfig& config) {
+			py::gil_scoped_release release;
+			self.processor.setBackendConfig(config);
+		}, py::arg("config"),
+			"Set backend configuration\n\n"
+			"Automatically switches backend if type differs from current.\n"
+			"Preserves all processing configuration.\n\n"
+			"Args:\n"
+			"    config: Backend-specific configuration (CudaConfig, OpenCLConfig, or CpuConfig)\n\n"
+			"Example:\n"
+			"    >>> cuda_config = CudaConfig()\n"
+			"    >>> cuda_config.device_id = 1\n"
+			"    >>> processor.set_backend_config(cuda_config)")
+
+		.def("get_backend_config", [](const ProcessorWrapper& self) -> std::unique_ptr<ope::BackendConfig> {
+			return self.processor.getBackendConfig();
+		}, "Get current backend configuration")
+
+		.def("save_backend_config_to_file", [](const ProcessorWrapper& self, const std::string& filepath) {
+			self.processor.saveBackendConfigToFile(filepath);
+		}, py::arg("filepath"),
+			"Save backend configuration to file\n\n"
+			"Args:\n"
+			"    filepath: Path to save configuration")
+
+		.def("load_backend_config_from_file", [](ProcessorWrapper& self, const std::string& filepath) {
+			py::gil_scoped_release release;
+			self.processor.loadBackendConfigFromFile(filepath);
+		}, py::arg("filepath"),
+			"Load backend configuration from file\n\n"
+			"Automatically switches backend if type differs from current.\n\n"
+			"Args:\n"
+			"    filepath: Path to load configuration from")
 		
 		// Processing
 		.def("set_callback", &ProcessorWrapper::set_callback,
@@ -1013,78 +1141,6 @@ PYBIND11_MODULE(octproengine, m) {
 		.def("get_num_buffers", [](const ProcessorWrapper& self) {
 			return self.processor.getNumBuffers();
 		}, "Get number of input buffers")
-
-		.def("set_cuda_device", [](ProcessorWrapper& self, int device_id) {
-			self.processor.setCudaDevice(device_id);
-		}, py::arg("device_id"),
-			"Set CUDA device (GPU selection)\n\n"
-			"Must be called before initialize() or after cleanup()\n\n"
-			"Args:\n"
-			"    device_id: GPU device ID (use CudaUtils.get_available_devices())\n\n"
-			"Raises:\n"
-			"    RuntimeError: If not using CUDA backend or already initialized")
-
-		.def("set_cuda_num_streams", [](ProcessorWrapper& self, int num_streams) {
-			self.processor.setCudaNumStreams(num_streams);
-		}, py::arg("num_streams"),
-			"Set number of CUDA streams for concurrent execution\n\n"
-			"Must be called before initialize() or after cleanup()\n\n"
-			"Args:\n"
-			"    num_streams: Number of streams (default: 8)\n\n"
-			"Raises:\n"
-			"    RuntimeError: If not using CUDA backend or already initialized")
-
-		.def("set_cuda_block_size", [](ProcessorWrapper& self, int block_size) {
-			self.processor.setCudaBlockSize(block_size);
-		}, py::arg("block_size"),
-			"Set CUDA block size (threads per block)\n\n"
-			"Must be called before initialize() or after cleanup()\n\n"
-			"Args:\n"
-			"    block_size: Block size (default: 128)\n\n"
-			"Raises:\n"
-			"    RuntimeError: If not using CUDA backend or already initialized")
-
-		.def("get_cuda_device", [](const ProcessorWrapper& self) {
-			return self.processor.getCudaDevice();
-		}, "Get current CUDA device ID (-1 if not using CUDA)")
-
-		.def("get_cuda_num_streams", [](const ProcessorWrapper& self) {
-			return self.processor.getCudaNumStreams();
-		}, "Get number of CUDA streams (0 if not using CUDA)")
-
-		.def("get_cuda_block_size", [](const ProcessorWrapper& self) {
-			return self.processor.getCudaBlockSize();
-		}, "Get CUDA block size (0 if not using CUDA)")
-
-		.def("get_cuda_grid_size", [](const ProcessorWrapper& self) {
-			return self.processor.getCudaGridSize();
-		}, "Get CUDA grid size - auto-calculated (0 if not using CUDA or not initialized)")
-
-		.def("save_cuda_settings_to_file", [](const ProcessorWrapper& self, const std::string& filepath) {
-			try {
-				self.processor.saveCudaSettingsToFile(filepath);
-			} catch (const std::exception& e) {
-				throw ConfigurationError(std::string("Failed to save CUDA settings: ") + e.what());
-			}
-		}, py::arg("filepath"),
-			"Save CUDA settings to file (machine-specific)\n\n"
-			"This file should NOT be shared between different systems\n\n"
-			"Args:\n"
-			"    filepath: Path to save CUDA settings file")
-
-		.def("load_cuda_settings_from_file", [](ProcessorWrapper& self, const std::string& filepath) {
-			try {
-				self.processor.loadCudaSettingsFromFile(filepath);
-			} catch (const std::exception& e) {
-				throw ConfigurationError(std::string("Failed to load CUDA settings: ") + e.what());
-			}
-		}, py::arg("filepath"),
-			"Load CUDA settings from file\n\n"
-			"Processor must not be initialized (call cleanup() first if needed)\n\n"
-			"Args:\n"
-			"    filepath: Path to CUDA settings file\n\n"
-			"Raises:\n"
-			"    RuntimeError: If processor is already initialized")
 
 		// Context manager support
 		.def("__enter__", &ProcessorWrapper::enter, py::return_value_policy::reference)

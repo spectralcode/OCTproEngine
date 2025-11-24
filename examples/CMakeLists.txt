@@ -141,6 +141,11 @@ else()
 	message(STATUS "OCTproViewer disabled (use -DBUILD_OCT_VIEWER=ON to enable)")
 endif()
 
+# CUDA device selection example
+add_executable(example_cuda_device_selection example_cuda_device_selection.cpp)
+target_link_libraries(example_cuda_device_selection PRIVATE octproengine)
+copy_required_dlls(example_cuda_device_selection)
+
 # Recorder example (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)
 	add_executable(example_recorder example_recorder.cpp)
