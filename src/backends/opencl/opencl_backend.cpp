@@ -12,6 +12,35 @@
 #include <atomic>
 #include <cstring>
 
+//	Uncomment to enable profiling (adds overhead, use only for debugging)
+//#define OPENCL_PROFILE_TIMING
+
+#ifdef OPENCL_PROFILE_TIMING
+#include <iomanip>
+struct ProfilingData {
+	double inputTransferMs = 0;
+	double fftMs = 0;
+	double kernelsMs = 0;
+	double outputTransferMs = 0;
+	double linearizationMs = 0;
+	double windowingMs = 0;
+	double dispersionMs = 0;
+	double postProcessMs = 0;
+	size_t inputBytes = 0;
+	size_t outputBytes = 0;
+	int frameCount = 0;
+};
+static ProfilingData g_profiling;
+static std::mutex g_profilingMutex;
+
+static double getEventDurationMs(cl_event event) {
+	cl_ulong start, end;
+	clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start, nullptr);
+	clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end, nullptr);
+	return (end - start) / 1000000.0;  //	Convert ns to ms
+}
+#endif
+
 // Helper macro for checking OpenCL errors
 #define checkOpenClErrors(call) \
 	do { \
@@ -59,6 +88,11 @@ struct OpenClBackend::Impl {
 	std::vector<cl_command_queue> commandQueues;
 	cl_program program = nullptr;
 	int currentQueue = 0;
+
+	//	Event tracking for async operations
+	std::vector<cl_event> transferEvents;
+	std::vector<cl_event> outputEvents;
+	std::mutex eventMutex;
 
 	//	OpenCL kernels
 	cl_kernel kernelInputToComplex = nullptr;
@@ -145,9 +179,14 @@ struct OpenClBackend::Impl {
 		Impl* impl;
 		IOBuffer* inputBuffer;
 		IOBuffer* outputBuffer;
+		cl_event event;  // Track the associated event for cleanup
 	};
 	std::vector<CallbackData> callbackDataPool;
 	std::atomic<int> nextCallbackIndex{0};
+
+	//	Track heap-allocated callbacks for async operations
+	std::vector<CallbackData*> pendingCallbacks;
+	std::mutex pendingCallbacksMutex;
 
 	Impl() = default;
 
@@ -332,7 +371,12 @@ void OpenClBackend::createCommandQueues() {
 	this->impl->commandQueues.resize(this->impl->numCommandQueues);
 	for (int i = 0; i < this->impl->numCommandQueues; i++) {
 		cl_int err;
+		//	Use in-order queues (like CUDA streams) - operations execute sequentially
+#ifdef OPENCL_PROFILE_TIMING
+		this->impl->commandQueues[i] = clCreateCommandQueue(this->impl->context, this->impl->device, CL_QUEUE_PROFILING_ENABLE, &err);
+#else
 		this->impl->commandQueues[i] = clCreateCommandQueue(this->impl->context, this->impl->device, 0, &err);
+#endif
 		checkOpenClError(err, "clCreateCommandQueue");
 	}
 }
@@ -479,11 +523,11 @@ void OpenClBackend::allocateDeviceBuffers() {
 	cl_int err;
 	size_t complexSize = this->impl->samplesPerBuffer * sizeof(float) * 2;  // float2
 
-	//	Input buffers (multiple for pipelining)
+	//	Input buffers (multiple for pipelining with pinned memory)
 	this->impl->d_inputBuffers.resize(this->impl->numCommandQueues);
 	for (int i = 0; i < this->impl->numCommandQueues; i++) {
 		size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
-		this->impl->d_inputBuffers[i] = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, inputSize, nullptr, &err);
+		this->impl->d_inputBuffers[i] = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, inputSize, nullptr, &err);
 		checkOpenClError(err, "create input buffer");
 	}
 
@@ -495,9 +539,9 @@ void OpenClBackend::allocateDeviceBuffers() {
 	this->impl->d_inputLinearized = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, complexSize, nullptr, &err);
 	checkOpenClError(err, "create linearization buffer");
 
-	//	Processed output buffer
+	//	Processed output buffer (with pinned memory for faster readback)
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
-	this->impl->d_processedBuffer = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, outputSize, nullptr, &err);
+	this->impl->d_processedBuffer = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, outputSize, nullptr, &err);
 	checkOpenClError(err, "create processed buffer");
 
 	//	Curve buffers
@@ -698,11 +742,24 @@ void OpenClBackend::cleanup() {
 		return;
 	}
 
-	//	Wait for all queues to finish
+	//	Wait for all queues to finish before cleanup
+	//	This ensures all event callbacks complete before we destroy resources
 	for (auto& queue : this->impl->commandQueues) {
 		if (queue) {
 			clFinish(queue);
 		}
+	}
+
+	//	Cleanup any remaining pending callbacks (should be none after clFinish)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->pendingCallbacksMutex);
+		for (auto* cbData : this->impl->pendingCallbacks) {
+			if (cbData) {
+				clReleaseEvent(cbData->event);
+				delete cbData;
+			}
+		}
+		this->impl->pendingCallbacks.clear();
 	}
 
 	//	Release device buffers
@@ -764,17 +821,38 @@ void OpenClBackend::process(IOBuffer& input) {
 	//	Get buffer ID from input to propagate to output later
 	uint64_t bufferId = input.getBufferId();
 
-	//	Copy input to device
+	//	Copy input to device (async for better pipelining)
 	cl_mem d_input = this->impl->d_inputBuffers[this->impl->currentBuffer];
+	cl_event inputEvent;
+	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
 	checkOpenClErrors(clEnqueueWriteBuffer(queue, d_input, CL_FALSE, 0,
-		this->impl->samplesPerBuffer * this->impl->bytesPerSample,
-		input.getDataPointer(), 0, nullptr, nullptr));
+		inputSize,
+		input.getDataPointer(), 0, nullptr, &inputEvent));
 
-	//	Return input buffer after copy (non-blocking, but we trust the queue will execute in order)
-	this->impl->freeQueueMutex.lock();
-	this->impl->freeBuffersQueue.push(&input);
-	this->impl->freeQueueMutex.unlock();
-	this->impl->freeQueueCV.notify_one();
+#ifdef OPENCL_PROFILE_TIMING
+	//	Track input transfer time
+	clWaitForEvents(1, &inputEvent);
+	double inputTransferMs = getEventDurationMs(inputEvent);
+	{
+		std::lock_guard<std::mutex> lock(g_profilingMutex);
+		g_profiling.inputTransferMs += inputTransferMs;
+		g_profiling.inputBytes += inputSize;
+	}
+#endif
+
+	//	Return input buffer as soon as transfer completes (like CUDA does)
+	Impl::CallbackData* inputCbData = new Impl::CallbackData();
+	inputCbData->impl = this->impl.get();
+	inputCbData->inputBuffer = &input;
+	inputCbData->outputBuffer = nullptr;
+	inputCbData->event = inputEvent;
+
+	{
+		std::lock_guard<std::mutex> lock(this->impl->pendingCallbacksMutex);
+		this->impl->pendingCallbacks.push_back(inputCbData);
+	}
+
+	checkOpenClErrors(clSetEventCallback(inputEvent, CL_COMPLETE, returnBufferCallback, inputCbData));
 
 	//	=== PROCESSING PIPELINE ===
 
@@ -957,8 +1035,21 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 
 	//	Step 4: IFFT using clFFT
+#ifdef OPENCL_PROFILE_TIMING
+	cl_event fftEvent;
+	checkClFFTErrors(clfftEnqueueTransform(this->impl->fftPlan, CLFFT_BACKWARD, 1, &queue,
+		0, nullptr, &fftEvent, &d_fftBuffer2, nullptr, nullptr));
+	clWaitForEvents(1, &fftEvent);
+	double fftMs = getEventDurationMs(fftEvent);
+	clReleaseEvent(fftEvent);
+	{
+		std::lock_guard<std::mutex> lock(g_profilingMutex);
+		g_profiling.fftMs += fftMs;
+	}
+#else
 	checkClFFTErrors(clfftEnqueueTransform(this->impl->fftPlan, CLFFT_BACKWARD, 1, &queue,
 		0, nullptr, nullptr, &d_fftBuffer2, nullptr, nullptr));
+#endif
 
 	//	Step 5: Fixed-pattern noise removal
 	if (config.postProcessingParams.fixedPatternNoiseRemoval) {
@@ -1132,14 +1223,67 @@ void OpenClBackend::process(IOBuffer& input) {
 		throw std::runtime_error("d_currBuffer is NULL before readback");
 	}
 
-	//	Copy result back (blocking read will wait for all operations)
-	checkOpenClErrors(clEnqueueReadBuffer(queue, d_currBuffer, CL_TRUE, 0, outputSize,
-		currentOutputBuf->getDataPointer(), 0, nullptr, nullptr));
+	//	Copy result back (async with event to enable callback)
+	cl_event outputEvent;
+	checkOpenClErrors(clEnqueueReadBuffer(queue, d_currBuffer, CL_FALSE, 0, outputSize,
+		currentOutputBuf->getDataPointer(), 0, nullptr, &outputEvent));
 
-	//	Step 11: Call output callback
-	if (this->impl->callback) {
-		this->impl->callback(*currentOutputBuf);
+#ifdef OPENCL_PROFILE_TIMING
+	//	Track output transfer time
+	clWaitForEvents(1, &outputEvent);
+	double outputTransferMs = getEventDurationMs(outputEvent);
+	{
+		std::lock_guard<std::mutex> lock(g_profilingMutex);
+		g_profiling.outputTransferMs += outputTransferMs;
+		g_profiling.outputBytes += outputSize;
+		g_profiling.frameCount++;
+
+		//	Print profiling stats every 100 frames
+		if (g_profiling.frameCount % 100 == 0) {
+			double avgInputMs = g_profiling.inputTransferMs / g_profiling.frameCount;
+			double avgOutputMs = g_profiling.outputTransferMs / g_profiling.frameCount;
+			double avgFftMs = g_profiling.fftMs / g_profiling.frameCount;
+			double avgKernelsMs = g_profiling.kernelsMs / g_profiling.frameCount;
+			double avgLinearMs = g_profiling.linearizationMs / g_profiling.frameCount;
+			double avgWindowMs = g_profiling.windowingMs / g_profiling.frameCount;
+			double avgDispersionMs = g_profiling.dispersionMs / g_profiling.frameCount;
+			double avgPostProcMs = g_profiling.postProcessMs / g_profiling.frameCount;
+			double avgTotalMs = avgInputMs + avgOutputMs + avgFftMs + avgKernelsMs + avgLinearMs + avgWindowMs + avgDispersionMs + avgPostProcMs;
+
+			double inputGBps = (g_profiling.inputBytes / (g_profiling.inputTransferMs / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
+			double outputGBps = (g_profiling.outputBytes / (g_profiling.outputTransferMs / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
+
+			std::cout << "\n=== OpenCL Profiling (avg over " << g_profiling.frameCount << " frames) ===" << std::endl;
+			std::cout << std::fixed << std::setprecision(3);
+			std::cout << "  Input transfer:  " << avgInputMs << " ms (" << inputGBps << " GB/s)" << std::endl;
+			std::cout << "  Linearization:   " << avgLinearMs << " ms" << std::endl;
+			std::cout << "  Windowing:       " << avgWindowMs << " ms" << std::endl;
+			std::cout << "  FFT operations:  " << avgFftMs << " ms" << std::endl;
+			std::cout << "  Dispersion comp: " << avgDispersionMs << " ms" << std::endl;
+			std::cout << "  Post-process:    " << avgPostProcMs << " ms" << std::endl;
+			std::cout << "  Other kernels:   " << avgKernelsMs << " ms" << std::endl;
+			std::cout << "  Output transfer: " << avgOutputMs << " ms (" << outputGBps << " GB/s)" << std::endl;
+			std::cout << "  Total GPU time:  " << avgTotalMs << " ms" << std::endl;
+			std::cout << "=============================================\n" << std::endl;
+		}
 	}
+#endif
+
+	//	Create callback data for user output callback
+	Impl::CallbackData* outputCbData = new Impl::CallbackData();
+	outputCbData->impl = this->impl.get();
+	outputCbData->inputBuffer = nullptr;
+	outputCbData->outputBuffer = currentOutputBuf;
+	outputCbData->event = outputEvent;
+
+	//	Track pending callback for cleanup
+	{
+		std::lock_guard<std::mutex> lock(this->impl->pendingCallbacksMutex);
+		this->impl->pendingCallbacks.push_back(outputCbData);
+	}
+
+	//	Register callback to trigger user callback when output transfer completes
+	checkOpenClErrors(clSetEventCallback(outputEvent, CL_COMPLETE, outputCallback, outputCbData));
 }
 
 
@@ -1305,11 +1449,65 @@ std::vector<float> OpenClBackend::postProcessBackgroundSubtraction(const float* 
 }
 
 void CL_CALLBACK OpenClBackend::returnBufferCallback(cl_event event, cl_int status, void* userData) {
-	//todo
+	if (status != CL_COMPLETE) {
+		return;
+	}
+
+	Impl::CallbackData* data = static_cast<Impl::CallbackData*>(userData);
+	if (!data || !data->impl || !data->inputBuffer) {
+		return;
+	}
+
+	//	Return input buffer to free queue (like CUDA does)
+	{
+		std::lock_guard<std::mutex> lock(data->impl->freeQueueMutex);
+		data->impl->freeBuffersQueue.push(data->inputBuffer);
+		data->impl->freeQueueCV.notify_one();
+	}
+
+	//	Remove from pending callbacks list
+	{
+		std::lock_guard<std::mutex> lock(data->impl->pendingCallbacksMutex);
+		auto it = std::find(data->impl->pendingCallbacks.begin(),
+		                    data->impl->pendingCallbacks.end(), data);
+		if (it != data->impl->pendingCallbacks.end()) {
+			data->impl->pendingCallbacks.erase(it);
+		}
+	}
+
+	//	Release the event and cleanup
+	clReleaseEvent(event);
+	delete data;
 }
 
 void CL_CALLBACK OpenClBackend::outputCallback(cl_event event, cl_int status, void* userData) {
-	//todo
+	if (status != CL_COMPLETE) {
+		return;
+	}
+
+	Impl::CallbackData* data = static_cast<Impl::CallbackData*>(userData);
+	if (!data || !data->impl || !data->outputBuffer) {
+		return;
+	}
+
+	//	Call user callback with output buffer
+	if (data->impl->callback) {
+		data->impl->callback(*data->outputBuffer);
+	}
+
+	//	Remove from pending callbacks list
+	{
+		std::lock_guard<std::mutex> lock(data->impl->pendingCallbacksMutex);
+		auto it = std::find(data->impl->pendingCallbacks.begin(),
+		                    data->impl->pendingCallbacks.end(), data);
+		if (it != data->impl->pendingCallbacks.end()) {
+			data->impl->pendingCallbacks.erase(it);
+		}
+	}
+
+	//	Release the event and cleanup
+	clReleaseEvent(event);
+	delete data;
 }
 
 } // namespace ope
