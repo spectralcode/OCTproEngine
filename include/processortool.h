@@ -49,14 +49,6 @@ public:
 	 */
 	Processor* getProcessor() const;
 
-	/**
-	 * @brief Check if this tool requires a processor to function
-	 *
-	 * Override this to indicate whether the tool can work standalone.
-	 *
-	 * @return true if processor is required, false if tool can work standalone
-	 */
-	virtual bool requiresProcessor() const = 0;
 
 protected:
 	/**

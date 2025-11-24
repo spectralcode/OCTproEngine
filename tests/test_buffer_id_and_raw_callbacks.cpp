@@ -22,10 +22,6 @@ public:
 	std::vector<BufferRecord> recordedBuffers;
 	std::map<uint64_t, int> idMatchCount;  // Tracks how many times each ID appears
 
-	bool requiresProcessor() const override {
-		return false;  // Can work standalone for testing
-	}
-
 	void recordBuffer(const ope::IOBuffer& buffer, bool isRaw) {
 		BufferRecord record;
 		record.bufferId = buffer.getBufferId();
