@@ -104,7 +104,7 @@ struct CpuBackend::Impl {
 
 	void recordPostProcessBackground(const float* processedData, int samplesPerAscan, int totalAscans) {
 		this->postProcessBackgroundProfile.resize(samplesPerAscan, 0.0f);
-		
+
 		//average all A-scans to create background prfile
 		for (int i = 0; i < samplesPerAscan; ++i) {
 			float sum = 0.0f;
@@ -113,7 +113,15 @@ struct CpuBackend::Impl {
 			}
 			this->postProcessBackgroundProfile[i] = sum / static_cast<float>(totalAscans);
 		}
-		
+
+		//sync recorded profile to configuration
+		if (!this->postProcessBackgroundProfile.empty()) {
+			this->config.setCustomPostProcessBackgroundProfile(
+				this->postProcessBackgroundProfile.data(),
+				this->postProcessBackgroundProfile.size()
+			);
+		}
+
 		this->postProcessBackgroundRecordingRequested = false;
 	}	
 	
@@ -345,6 +353,14 @@ void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfig
 		this->recordedFixedPatternNoise.push_back(meanInterleaved[i * 2 + 1]);
 	}
 
+	//sync recorded profile to configuration
+	if (!this->recordedFixedPatternNoise.empty()) {
+		this->config.setCustomFixedPatternNoiseProfile(
+			this->recordedFixedPatternNoise.data(),
+			positivePairs
+		);
+	}
+
 	// If continuous mode, keep the last requiredAscanCount A-scans as a sliding window.
 	if (config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
 		if (this->accumulatedAscanCount > requiredAscanCount) {
@@ -429,7 +445,19 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->resampleCurve.resize(signalLength);
 	this->impl->dispersionPhaseComplex.resize(signalLength);
 	this->impl->windowCurve.resize(signalLength);
-	
+
+	//load recorded profiles from configuration
+	if (config.hasCustomPostProcessBackgroundProfile()) {
+		const float* profile = config.getCustomPostProcessBackgroundProfile();
+		size_t profileSize = config.getCustomPostProcessBackgroundProfileSize();
+		this->impl->postProcessBackgroundProfile.assign(profile, profile + profileSize);
+	}
+	if (config.hasCustomFixedPatternNoiseProfile()) {
+		const float* profile = config.getCustomFixedPatternNoiseProfile();
+		size_t complexPairs = config.getCustomFixedPatternNoiseProfileSize();
+		this->impl->recordedFixedPatternNoise.assign(profile, profile + complexPairs * 2);
+	}
+
 	// Start processing thread
 	this->impl->stopProcessing = false;
 	this->impl->processingThread = std::thread([this]() {

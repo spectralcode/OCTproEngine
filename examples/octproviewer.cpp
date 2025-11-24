@@ -174,6 +174,56 @@ void applyProcessingParams(ope::Processor* proc, const ProcessingParams& params)
 }
 
 void initializeProcessor(AppState* state) {
+	// If we have a processor and only the backend changed, use setBackend() to preserve profiles
+	if (state->processorInitialized && state->processor) {
+		// Check if current backend differs from requested
+		if (state->processor->getBackend() != state->dataParams.backend) {
+			// Just switch backend to preserve recorded profiles
+			std::cout << "Switching backend to "
+			          << (state->dataParams.backend == ope::Backend::CUDA ? "CUDA" :
+			              (state->dataParams.backend == ope::Backend::CPU ? "CPU" : "OpenCL"))
+			          << " (preserving profiles)..." << std::endl;
+
+			state->processor->setBackend(state->dataParams.backend);
+			return;
+		}
+		// If backend is the same but hasChanged is true, other params changed - need to recreate
+	}
+
+	// Save profiles before recreating processor (if they can be reused)
+	std::vector<float> savedBgProfile;
+	std::vector<float> savedFpnProfile;
+	bool canReuseBgProfile = false;
+	bool canReuseFpnProfile = false;
+	int oldSignalLength = 0;
+
+	if (state->processor && state->processorInitialized) {
+		// Get current signal length to check if profiles are still valid
+		// Note: We'd need to track this or get it from processor - for now assume profiles
+		// are only valid if signal length (samplesPerAscan) hasn't changed
+		// Since we can't easily get the old signal length, we'll just save the profiles
+
+		// Save background profile if it exists
+		const float* bgProfile = state->processor->getPostProcessBackgroundProfile();
+		size_t bgSize = state->processor->getPostProcessBackgroundProfileSize();
+		if (bgProfile && bgSize > 0) {
+			savedBgProfile.assign(bgProfile, bgProfile + bgSize);
+			// Background profile size should be signalLength/2
+			// Check if it would still be valid for new signal length
+			canReuseBgProfile = (bgSize == state->dataParams.samplesPerAscan / 2);
+		}
+
+		// Save fixed pattern noise profile if it exists
+		const float* fpnProfile = state->processor->getFixedPatternNoiseProfile();
+		size_t fpnSize = state->processor->getFixedPatternNoiseProfileSize();
+		if (fpnProfile && fpnSize > 0) {
+			savedFpnProfile.assign(fpnProfile, fpnProfile + fpnSize * 2); // fpnSize is in complex pairs
+			// FPN profile should be valid if signal length hasn't changed
+			canReuseFpnProfile = (fpnSize == state->dataParams.samplesPerAscan);
+		}
+	}
+
+	// Recreate processor (either first init or params changed)
 	if (state->processor) {
 		state->processor->cleanup();
 		delete state->processor;
@@ -196,6 +246,17 @@ void initializeProcessor(AppState* state) {
 
 	state->processor->initialize();
 	state->processorInitialized = true;
+
+	// Restore profiles if they're still valid
+	if (canReuseBgProfile && !savedBgProfile.empty()) {
+		std::cout << "Restoring background profile..." << std::endl;
+		state->processor->setPostProcessBackgroundProfile(savedBgProfile.data(), savedBgProfile.size());
+	}
+
+	if (canReuseFpnProfile && !savedFpnProfile.empty()) {
+		std::cout << "Restoring fixed pattern noise profile..." << std::endl;
+		state->processor->setFixedPatternNoiseProfile(savedFpnProfile.data(), savedFpnProfile.size() / 2);
+	}
 
 	std::cout << "Processor initialized ("
 			  << (state->dataParams.backend == ope::Backend::CUDA ? "CUDA" :

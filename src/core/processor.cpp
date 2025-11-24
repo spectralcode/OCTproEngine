@@ -382,15 +382,47 @@ void Processor::setBackend(Backend backend) {
 	if (this->impl->backendType == backend) {
 		return;
 	}
-	
-	// Clean up old backend if initialized
+
+	// Remember if old backend was initialized
+	bool wasInitialized = this->impl->initialized;
+
+	// Sync backend's recorded profiles to processor's config before cleanup
 	if (this->impl->initialized) {
+		// Get profiles from backend and update processor's config
+		const std::vector<float>& bgProfile = this->impl->backend->getPostProcessBackgroundProfile();
+		if (!bgProfile.empty()) {
+			this->impl->config.setCustomPostProcessBackgroundProfile(bgProfile.data(), bgProfile.size());
+		}
+
+		const std::vector<float>& fpnProfile = this->impl->backend->getFixedPatternNoiseProfile();
+		if (!fpnProfile.empty()) {
+			size_t complexPairs = fpnProfile.size() / 2;
+			this->impl->config.setCustomFixedPatternNoiseProfile(fpnProfile.data(), complexPairs);
+		}
+
+		// Clean up old backend
 		this->impl->backend->cleanup();
 		this->impl->initialized = false;
 	}
-	
+
 	// Create new backend
 	this->impl->createBackend(backend);
+
+	// If old backend was initialized, initialize new backend with config
+	// The new backend will load any recorded profiles from config during initialization
+	if (wasInitialized) {
+		this->impl->backend->initialize(this->impl->config);
+
+		// Setup internal callback that distributes to all consumers
+		this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
+			this->impl->internalCallback(output);
+		});
+
+		this->impl->initialized = true;
+
+		// Send curves to backend
+		this->impl->updateAllBackendCurves();
+	}
 }
 
 Backend Processor::getBackend() const {
@@ -663,10 +695,20 @@ void Processor::enableSinusoidalScanCorrection(bool enable) {
 
 void Processor::enableFixedPatternNoiseRemoval(bool enable) {
 	this->impl->config.postProcessingParams.fixedPatternNoiseRemoval = enable;
+
+	// Update backend config if initialized
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
 }
 
 void Processor::enablePostProcessBackgroundSubtraction(bool enable) {
 	this->impl->config.postProcessingParams.backgroundRemoval = enable;
+
+	// Update backend config if initialized
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
 }
 
 
@@ -707,41 +749,25 @@ void Processor::setFixedPatternNoiseProfile(const float* data, size_t complexPai
 }
 
 const float* Processor::getFixedPatternNoiseProfile() const {
-	if (!this->impl->initialized) {
-		return nullptr;
-	}
-	const std::vector<float>& v = this->impl->backend->getFixedPatternNoiseProfile();
-	if (v.empty()) return nullptr;
-	return v.data();
+	// Get from config (single source of truth for recorded profiles)
+	return this->impl->config.getCustomFixedPatternNoiseProfile();
 }
 
 size_t Processor::getFixedPatternNoiseProfileSize() const {
-	if (!this->impl->initialized) return 0;
-	const std::vector<float>& v = this->impl->backend->getFixedPatternNoiseProfile();
-	return v.size()/2; // complex pairs
+	// Get from config (single source of truth for recorded profiles)
+	return this->impl->config.getCustomFixedPatternNoiseProfileSize(); // returns complex pairs
 }
 
 bool Processor::hasFixedPatternNoiseProfile() const {
-	if (!this->impl->initialized) return false;
-	const std::vector<float>& v = this->impl->backend->getFixedPatternNoiseProfile();
-	return !v.empty();
+	// Get from config (single source of truth for recorded profiles)
+	return this->impl->config.hasCustomFixedPatternNoiseProfile();
 }
 
 void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) const {
-	const float* profile = nullptr;
-	size_t size = 0;
-	
-	if (this->impl->initialized) {
-		const std::vector<float>& fpnProfile = this->impl->backend->getFixedPatternNoiseProfile();
-		if (!fpnProfile.empty()) {
-			profile = fpnProfile.data();
-			size = fpnProfile.size();
-		}
-	} else {
-		profile = this->impl->config.getCustomFixedPatternNoiseProfile();
-		size = this->impl->config.getCustomFixedPatternNoiseProfileSize() * 2; // convert pairs to float count
-	}
-	
+	// Get from config (single source of truth)
+	const float* profile = this->impl->config.getCustomFixedPatternNoiseProfile();
+	size_t size = this->impl->config.getCustomFixedPatternNoiseProfileSize() * 2; // convert pairs to float count
+
 	if (!profile || size == 0) {
 		throw std::runtime_error("No fixed pattern noise profile to save");
 	}
@@ -814,39 +840,39 @@ void Processor::setPostProcessBackgroundOffset(float offset) {
 }
 
 const float* Processor::getPostProcessBackgroundProfile() const {
-	if (!this->impl->initialized) {
-		// If not initialized, try to get from config
-		return this->impl->config.getCustomPostProcessBackgroundProfile();
+	// Check backend first if initialized (it has the most recent data)
+	if (this->impl->initialized) {
+		const std::vector<float>& profile = this->impl->backend->getPostProcessBackgroundProfile();
+		if (!profile.empty()) {
+			return profile.data();
+		}
 	}
-	
-	
-	// Get from backend (source of truth)
-	const std::vector<float>& curve = this->impl->backend->getPostProcessBackgroundProfile();
-	if (curve.empty()) {
-		return nullptr;
-	}
-	return curve.data();
+	// Fall back to config
+	return this->impl->config.getCustomPostProcessBackgroundProfile();
 }
 
 size_t Processor::getPostProcessBackgroundProfileSize() const {
-	if (!this->impl->initialized) {
-		// If not initialized, try to get from config
-		return this->impl->config.getCustomPostProcessBackgroundProfileSize();
+	// Check backend first if initialized (it has the most recent data)
+	if (this->impl->initialized) {
+		const std::vector<float>& profile = this->impl->backend->getPostProcessBackgroundProfile();
+		if (!profile.empty()) {
+			return profile.size();
+		}
 	}
-	
-	// Get from backend (source of truth)
-	const std::vector<float>& curve = this->impl->backend->getPostProcessBackgroundProfile();
-	return curve.size();
+	// Fall back to config
+	return this->impl->config.getCustomPostProcessBackgroundProfileSize();
 }
 
 bool Processor::hasPostProcessBackgroundProfile() const {
-	if (!this->impl->initialized) {
-		return this->impl->config.hasCustomPostProcessBackgroundProfile();
+	// Check backend first if initialized (it has the most recent data)
+	if (this->impl->initialized) {
+		const std::vector<float>& profile = this->impl->backend->getPostProcessBackgroundProfile();
+		if (!profile.empty()) {
+			return true;
+		}
 	}
-	
-	// Check if backend has curve
-	const std::vector<float>& curve = this->impl->backend->getPostProcessBackgroundProfile();
-	return !curve.empty();
+	// Fall back to config
+	return this->impl->config.hasCustomPostProcessBackgroundProfile();
 }
 
 void Processor::setPostProcessBackgroundProfile(const float* data, size_t size) {
@@ -864,20 +890,10 @@ void Processor::setPostProcessBackgroundProfile(const float* data, size_t size) 
 }
 
 void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepath) const {
-	const float* curve = nullptr;
-	size_t size = 0;
-	
-	if (this->impl->initialized) {
-		const std::vector<float>& bgCurve = this->impl->backend->getPostProcessBackgroundProfile();
-		if (!bgCurve.empty()) {
-			curve = bgCurve.data();
-			size = bgCurve.size();
-		}
-	} else {
-		curve = this->impl->config.getCustomPostProcessBackgroundProfile();
-		size = this->impl->config.getCustomPostProcessBackgroundProfileSize();
-	}
-	
+	// Get from config (single source of truth)
+	const float* curve = this->impl->config.getCustomPostProcessBackgroundProfile();
+	size_t size = this->impl->config.getCustomPostProcessBackgroundProfileSize();
+
 	if (!curve || size == 0) {
 		throw std::runtime_error("No post-process background curve to save");
 	}

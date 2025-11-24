@@ -49,6 +49,7 @@ add_ope_test(test_setconfig test_setconfig.cpp)
 add_ope_test(test_multi_consumer test_multi_consumer.cpp)
 add_ope_test(test_cuda_api test_cuda_api.cpp)
 add_ope_test(test_buffer_id_and_raw_callbacks test_buffer_id_and_raw_callbacks.cpp)
+add_ope_test(test_backend_state_transfer test_backend_state_transfer.cpp)
 
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)

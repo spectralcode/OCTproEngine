@@ -734,6 +734,34 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 		data.impl = this->impl.get();
 	}
 
+	//load recorded profiles from configuration
+	if (config.hasCustomPostProcessBackgroundProfile()) {
+		const float* profile = config.getCustomPostProcessBackgroundProfile();
+		size_t profileSize = config.getCustomPostProcessBackgroundProfileSize();
+		this->impl->recordedPostProcessBackground.assign(profile, profile + profileSize);
+		//copy to device
+		checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_postProcBackgroundLine, CL_TRUE, 0,
+			profileSize * sizeof(float), profile, 0, nullptr, nullptr));
+	}
+	if (config.hasCustomFixedPatternNoiseProfile()) {
+		const float* profile = config.getCustomFixedPatternNoiseProfile();
+		size_t complexPairs = config.getCustomFixedPatternNoiseProfileSize();
+		this->impl->recordedFixedPatternNoise.resize(complexPairs * 2);
+		for (size_t i = 0; i < complexPairs; ++i) {
+			this->impl->recordedFixedPatternNoise[i*2] = profile[i*2];
+			this->impl->recordedFixedPatternNoise[i*2+1] = profile[i*2+1];
+		}
+		//copy to device (need to pad to full signal length with zeros)
+		std::vector<float> hostMeanInterleaved(this->impl->signalLength * 2, 0.0f);
+		for (size_t i = 0; i < complexPairs; ++i) {
+			hostMeanInterleaved[i*2] = profile[i*2];
+			hostMeanInterleaved[i*2+1] = profile[i*2+1];
+		}
+		checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_meanALine, CL_TRUE, 0,
+			this->impl->signalLength * 2 * sizeof(float), hostMeanInterleaved.data(), 0, nullptr, nullptr));
+		this->impl->fixedPatternNoiseDetermined = true;
+	}
+
 	this->impl->openclInitialized = true;
 }
 
@@ -1075,6 +1103,24 @@ void OpenClBackend::process(IOBuffer& input) {
 				checkOpenClErrors(clSetKernelArg(this->impl->kernelGetMinimumVarianceMean, 4, sizeof(int), &segments));
 				checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelGetMinimumVarianceMean, 1, nullptr, &globalWorkSizeMean, &localWorkSize, 0, nullptr, nullptr));
 
+				//copy fixed pattern noise profile to host and sync to configuration
+				int positivePairs = signalLength / 2;
+				std::vector<float> hostMeanInterleaved(signalLength * 2);
+				checkOpenClErrors(clEnqueueReadBuffer(queue, this->impl->d_meanALine, CL_TRUE, 0,
+					signalLength * 2 * sizeof(float), hostMeanInterleaved.data(), 0, nullptr, nullptr));
+
+				this->impl->recordedFixedPatternNoise.resize(positivePairs * 2);
+				for (int i = 0; i < positivePairs; ++i) {
+					this->impl->recordedFixedPatternNoise[i*2] = hostMeanInterleaved[i*2];
+					this->impl->recordedFixedPatternNoise[i*2+1] = hostMeanInterleaved[i*2+1];
+				}
+
+				//sync to configuration
+				this->impl->config.setCustomFixedPatternNoiseProfile(
+					this->impl->recordedFixedPatternNoise.data(),
+					positivePairs
+				);
+
 				this->impl->fixedPatternNoiseDetermined = true;
 			}
 		}
@@ -1187,8 +1233,14 @@ void OpenClBackend::process(IOBuffer& input) {
 			//	Copy to host
 			size_t bgSize = signalLength / 2;
 			this->impl->recordedPostProcessBackground.resize(bgSize);
-			checkOpenClErrors(clEnqueueReadBuffer(queue, this->impl->d_postProcBackgroundLine, CL_FALSE, 0,
+			checkOpenClErrors(clEnqueueReadBuffer(queue, this->impl->d_postProcBackgroundLine, CL_TRUE, 0,
 				bgSize * sizeof(float), this->impl->recordedPostProcessBackground.data(), 0, nullptr, nullptr));
+
+			//sync recorded profile to configuration
+			this->impl->config.setCustomPostProcessBackgroundProfile(
+				this->impl->recordedPostProcessBackground.data(),
+				bgSize
+			);
 
 			this->impl->postProcessBackgroundRecordingRequested = false;
 		}

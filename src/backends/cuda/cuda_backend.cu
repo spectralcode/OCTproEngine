@@ -287,7 +287,49 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	
 	// Reset fixed pattern noise state
 	this->impl->fixedPatternNoiseDetermined = false;
-	
+
+	//load recorded profiles from configuration
+	if (config.hasCustomPostProcessBackgroundProfile()) {
+		const float* profile = config.getCustomPostProcessBackgroundProfile();
+		size_t profileSize = config.getCustomPostProcessBackgroundProfileSize();
+		this->impl->recordedPostProcessBackground.assign(profile, profile + profileSize);
+		//copy to device
+		checkCudaErrors(cudaMemcpyAsync(
+			this->impl->d_postProcBackgroundLine,
+			profile,
+			profileSize * sizeof(float),
+			cudaMemcpyHostToDevice,
+			this->impl->streams[0]));
+		checkCudaErrors(cudaStreamSynchronize(this->impl->streams[0]));
+	}
+	if (config.hasCustomFixedPatternNoiseProfile()) {
+		const float* profile = config.getCustomFixedPatternNoiseProfile();
+		size_t complexPairs = config.getCustomFixedPatternNoiseProfileSize();
+		this->impl->recordedFixedPatternNoise.resize(complexPairs * 2);
+		for (size_t i = 0; i < complexPairs; ++i) {
+			this->impl->recordedFixedPatternNoise[i*2] = profile[i*2];
+			this->impl->recordedFixedPatternNoise[i*2+1] = profile[i*2+1];
+		}
+		//copy to device
+		std::vector<cufftComplex> hostMean(this->impl->signalLength);
+		for (size_t i = 0; i < this->impl->signalLength; ++i) {
+			hostMean[i].x = 0.0f;
+			hostMean[i].y = 0.0f;
+		}
+		for (size_t i = 0; i < complexPairs; ++i) {
+			hostMean[i].x = profile[i*2];
+			hostMean[i].y = profile[i*2+1];
+		}
+		checkCudaErrors(cudaMemcpyAsync(
+			this->impl->d_meanALine,
+			hostMean.data(),
+			sizeof(cufftComplex) * this->impl->signalLength,
+			cudaMemcpyHostToDevice,
+			this->impl->streams[0]));
+		checkCudaErrors(cudaStreamSynchronize(this->impl->streams[0]));
+		this->impl->fixedPatternNoiseDetermined = true;
+	}
+
 	this->impl->cudaInitialized = true;
 }
 
@@ -650,7 +692,7 @@ void CudaBackend::process(IOBuffer& input) {
 		int width = signalLength;
 		int height = config.postProcessingParams.fixedPatternNoiseBscanCount * ascansPerBscan;
 		
-		if ((!config.postProcessingParams.continuousFixedPatternNoiseDetermination && 
+		if ((!config.postProcessingParams.continuousFixedPatternNoiseDetermination &&
 			 !this->impl->fixedPatternNoiseDetermined) ||
 			config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
 
@@ -662,6 +704,29 @@ void CudaBackend::process(IOBuffer& input) {
 				cuda_kernels::getMinimumVarianceMean<<<gridSize, blockSize, 0, stream>>>(
 					this->impl->d_meanALine, d_fftBuffer2, width, height,
 					FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS);
+
+				//copy fixed pattern noise profile to host and sync to configuration
+				int positivePairs = signalLength / 2;
+				std::vector<cufftComplex> hostMean(signalLength);
+				checkCudaErrors(cudaMemcpyAsync(
+					hostMean.data(),
+					this->impl->d_meanALine,
+					sizeof(cufftComplex) * signalLength,
+					cudaMemcpyDeviceToHost,
+					stream));
+				checkCudaErrors(cudaStreamSynchronize(stream));
+
+				this->impl->recordedFixedPatternNoise.resize(positivePairs * 2);
+				for (int i = 0; i < positivePairs; ++i) {
+					this->impl->recordedFixedPatternNoise[i*2] = hostMean[i].x;
+					this->impl->recordedFixedPatternNoise[i*2+1] = hostMean[i].y;
+				}
+
+				//sync to configuration
+				this->impl->config.setCustomFixedPatternNoiseProfile(
+					this->impl->recordedFixedPatternNoise.data(),
+					positivePairs
+				);
 
 				this->impl->fixedPatternNoiseDetermined = true;
 			}
@@ -717,7 +782,7 @@ void CudaBackend::process(IOBuffer& input) {
 			cuda_kernels::getPostProcessBackground<<<gridSize/2, blockSize, 0, stream>>>(
 				this->impl->d_postProcBackgroundLine, d_currBuffer,
 				signalLength / 2, ascansPerBscan);
-			
+
 			// Copy to host
 			size_t bgSize = signalLength / 2;
 			this->impl->recordedPostProcessBackground.resize(bgSize);
@@ -727,7 +792,14 @@ void CudaBackend::process(IOBuffer& input) {
 				bgSize * sizeof(float),
 				cudaMemcpyDeviceToHost,
 				stream));
-			
+			checkCudaErrors(cudaStreamSynchronize(stream));
+
+			//sync recorded profile to configuration
+			this->impl->config.setCustomPostProcessBackgroundProfile(
+				this->impl->recordedPostProcessBackground.data(),
+				bgSize
+			);
+
 			this->impl->postProcessBackgroundRecordingRequested = false;
 		}
 
