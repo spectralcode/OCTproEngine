@@ -19,14 +19,14 @@
 // ============================================
 
 // Which backends to benchmark
-const bool BENCHMARK_CPU = false;
+const bool BENCHMARK_CPU = true;
 const bool BENCHMARK_CUDA = true;
-const bool BENCHMARK_OPENCL = false;
+const bool BENCHMARK_OPENCL = true;
 
 // Buffer sizes to test (will test all combinations)
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048, 4096};
 const int ASCANS_PER_BSCAN[] = {256, 512, 1024, 2048};
-const int BSCANS_PER_BUFFER[] = {1, 8};
+const int BSCANS_PER_BUFFER[] = {1};
 
 // Number of iterations per test
 const int ITERATIONS = 100;
@@ -375,90 +375,85 @@ int main() {
 	std::cout << "Running benchmarks..." << std::endl;
 	std::cout << std::endl;
 	
-	std::vector<BenchmarkResult> allResults;
-	
 	// Calculate total number of tests
 	int numSignalLengths = sizeof(SIGNAL_LENGTHS) / sizeof(SIGNAL_LENGTHS[0]);
 	int numAscans = sizeof(ASCANS_PER_BSCAN) / sizeof(ASCANS_PER_BSCAN[0]);
 	int numBscans = sizeof(BSCANS_PER_BUFFER) / sizeof(BSCANS_PER_BUFFER[0]);
+	int numConfigs = numSignalLengths * numAscans * numBscans;
 	int numBackends = (BENCHMARK_CPU ? 1 : 0) + (BENCHMARK_CUDA ? 1 : 0) + (BENCHMARK_OPENCL ? 1 : 0);
-	int totalTests = numSignalLengths * numAscans * numBscans * numBackends;
+	int totalTests = numConfigs;// * numBackends;
 	int currentTest = 0;
 	
-	// Iterate through all combinations
-	for (int sl = 0; sl < numSignalLengths; ++sl) {
-		int signalLength = SIGNAL_LENGTHS[sl];
+	// Store results per backend
+	std::vector<BenchmarkResult> cpuResults;
+	std::vector<BenchmarkResult> cudaResults;
+	std::vector<BenchmarkResult> openclResults;
+	
+	// Helper lambda to run all configurations for a backend
+	auto runAllConfigs = [&](ope::Backend backend, const std::string& backendName, std::vector<BenchmarkResult>& results) {
+		std::cout << "--- " << backendName << " Backend ---" << std::endl;
 		
-		for (int ap = 0; ap < numAscans; ++ap) {
-			int ascansPerBscan = ASCANS_PER_BSCAN[ap];
+		for (int sl = 0; sl < numSignalLengths; ++sl) {
+			int signalLength = SIGNAL_LENGTHS[sl];
 			
-			for (int bp = 0; bp < numBscans; ++bp) {
-				int bscansPerBuffer = BSCANS_PER_BUFFER[bp];
+			for (int ap = 0; ap < numAscans; ++ap) {
+				int ascansPerBscan = ASCANS_PER_BSCAN[ap];
 				
-				// Generate test data once for this size
-				auto testData = generateTestData(signalLength, ascansPerBscan, bscansPerBuffer);
-				
-				BenchmarkResult cpuResult, cudaResult, openclResult;
-				
-				// Benchmark CPU
-				if (BENCHMARK_CPU) {
+				for (int bp = 0; bp < numBscans; ++bp) {
+					int bscansPerBuffer = BSCANS_PER_BUFFER[bp];
+					
 					currentTest++;
 					std::cout << "[" << currentTest << "/" << totalTests << "] "
-					          << "Testing CPU: " << signalLength << "x" << ascansPerBscan << "x" << bscansPerBuffer
+					          << "Testing " << backendName << ": " << signalLength << "x" << ascansPerBscan << "x" << bscansPerBuffer
 					          << " ... " << std::flush;
 					
-					cpuResult = runBenchmark(ope::Backend::CPU, signalLength, ascansPerBscan, bscansPerBuffer, testData);
-					allResults.push_back(cpuResult);
+					auto testData = generateTestData(signalLength, ascansPerBscan, bscansPerBuffer);
+					auto result = runBenchmark(backend, signalLength, ascansPerBscan, bscansPerBuffer, testData);
+					results.push_back(result);
 					
-					std::cout << std::fixed << std::setprecision(3) << cpuResult.avgTimeMs << " ms" << std::endl;
-				}
-				
-				// Benchmark CUDA
-				if (BENCHMARK_CUDA) {
-					currentTest++;
-					std::cout << "[" << currentTest << "/" << totalTests << "] "
-					          << "Testing CUDA: " << signalLength << "x" << ascansPerBscan << "x" << bscansPerBuffer
-					          << " ... " << std::flush;
-
-					cudaResult = runBenchmark(ope::Backend::CUDA, signalLength, ascansPerBscan, bscansPerBuffer, testData);
-
-					// Calculate speedup if we have CPU result
-					if (BENCHMARK_CPU) {
-						cudaResult.speedup = cpuResult.avgTimeMs / cudaResult.avgTimeMs;
-					}
-
-					allResults.push_back(cudaResult);
-
-					std::cout << std::fixed << std::setprecision(3) << cudaResult.avgTimeMs << " ms";
-					if (BENCHMARK_CPU) {
-						std::cout << " (speedup: " << std::setprecision(2) << cudaResult.speedup << "x)";
-					}
-					std::cout << std::endl;
-				}
-
-				// Benchmark OpenCL
-				if (BENCHMARK_OPENCL) {
-					currentTest++;
-					std::cout << "[" << currentTest << "/" << totalTests << "] "
-					          << "Testing OpenCL: " << signalLength << "x" << ascansPerBscan << "x" << bscansPerBuffer
-					          << " ... " << std::flush;
-
-					openclResult = runBenchmark(ope::Backend::OPENCL, signalLength, ascansPerBscan, bscansPerBuffer, testData);
-
-					// Calculate speedup if we have CPU result
-					if (BENCHMARK_CPU) {
-						openclResult.speedup = cpuResult.avgTimeMs / openclResult.avgTimeMs;
-					}
-
-					allResults.push_back(openclResult);
-
-					std::cout << std::fixed << std::setprecision(3) << openclResult.avgTimeMs << " ms";
-					if (BENCHMARK_CPU) {
-						std::cout << " (speedup: " << std::setprecision(2) << openclResult.speedup << "x)";
-					}
-					std::cout << std::endl;
+					std::cout << std::fixed << std::setprecision(3) << result.avgTimeMs << " ms" << std::endl;
 				}
 			}
+		}
+		std::cout << std::endl;
+	};
+	
+	// Run benchmarks backend by backend
+	if (BENCHMARK_CPU) {
+		runAllConfigs(ope::Backend::CPU, "CPU", cpuResults);
+	}
+	
+	if (BENCHMARK_CUDA) {
+		runAllConfigs(ope::Backend::CUDA, "CUDA", cudaResults);
+	}
+	
+	if (BENCHMARK_OPENCL) {
+		runAllConfigs(ope::Backend::OPENCL, "OpenCL", openclResults);
+	}
+	
+	// Calculate speedups relative to CPU
+	if (BENCHMARK_CPU) {
+		for (size_t i = 0; i < cpuResults.size(); ++i) {
+			if (BENCHMARK_CUDA && i < cudaResults.size()) {
+				cudaResults[i].speedup = cpuResults[i].avgTimeMs / cudaResults[i].avgTimeMs;
+			}
+			if (BENCHMARK_OPENCL && i < openclResults.size()) {
+				openclResults[i].speedup = cpuResults[i].avgTimeMs / openclResults[i].avgTimeMs;
+			}
+		}
+	}
+	
+	// Merge results grouped by configuration (CPU, CUDA, OpenCL for each config)
+	std::vector<BenchmarkResult> allResults;
+	for (int i = 0; i < numConfigs; ++i) {
+		if (BENCHMARK_CPU && i < static_cast<int>(cpuResults.size())) {
+			allResults.push_back(cpuResults[i]);
+		}
+		if (BENCHMARK_CUDA && i < static_cast<int>(cudaResults.size())) {
+			allResults.push_back(cudaResults[i]);
+		}
+		if (BENCHMARK_OPENCL && i < static_cast<int>(openclResults.size())) {
+			allResults.push_back(openclResults[i]);
 		}
 	}
 	
