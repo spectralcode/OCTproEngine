@@ -23,36 +23,19 @@ if(WIN32)
 	add_custom_target(copy_test_dlls ALL
 		COMMENT "Copying DLLs to test directory..."
 	)
-	
+
 	# Make sure the output directory exists first
 	add_custom_command(TARGET copy_test_dlls PRE_BUILD
 		COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>
 		COMMENT "Ensuring test output directory exists"
 	)
 
-	# Copy octproengine.dll
-	add_custom_command(TARGET copy_test_dlls POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different
-			$<TARGET_FILE:octproengine>
-			${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>
-		COMMENT "Copying octproengine.dll"
-	)
-	
-	# Copy FFTW3 DLL (FindFFTW3.cmake sets FFTW3_DLL variable)
-	if(FFTW3_DLL)
-		add_custom_command(TARGET copy_test_dlls POST_BUILD
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${FFTW3_DLL}"
-				${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>
-			COMMENT "Copying FFTW DLL"
-		)
-	else()
-		message(WARNING "FFTW3_DLL not found; tests may fail to run")
-	endif()
-	
+	# Copy all required DLLs to test directory
+	copy_required_dlls_to_dir(copy_test_dlls ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>)
+
 	# Make copy_test_dlls depend on octproengine being built
 	add_dependencies(copy_test_dlls octproengine)
-	
+
 endif()
 
 # ========================================

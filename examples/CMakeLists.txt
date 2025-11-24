@@ -3,15 +3,7 @@
 # Basic console example (no GUI dependencies)
 add_executable(example_basic example_basic.cpp)
 target_link_libraries(example_basic PRIVATE octproengine)
-
-if(WIN32)
-	add_custom_command(TARGET example_basic POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different
-			$<TARGET_FILE:octproengine>
-			$<TARGET_FILE_DIR:example_basic>
-		COMMENT "Copying octproengine.dll to example_basic directory"
-	)
-endif()
+copy_required_dlls(example_basic)
 
 # OCTproViewer with ImGui (optional)
 option(BUILD_OCT_VIEWER "Build interactive OCTproViewer with ImGui" OFF)
@@ -131,24 +123,7 @@ if(BUILD_OCT_VIEWER)
 	endif()
 
 	# Windows: Copy DLLs to executable directory
-	if(WIN32)
-		add_custom_command(TARGET octproviewer POST_BUILD
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				$<TARGET_FILE:octproengine>
-				$<TARGET_FILE_DIR:octproviewer>
-			COMMENT "Copying octproengine.dll to octproviewer directory"
-		)
-
-		# Copy FFTW DLL if building with CPU backend
-		if(BUILD_CPU AND FFTW3_DLL)
-			add_custom_command(TARGET octproviewer POST_BUILD
-				COMMAND ${CMAKE_COMMAND} -E copy_if_different
-					"${FFTW3_DLL}"
-					$<TARGET_FILE_DIR:octproviewer>
-				COMMENT "Copying FFTW DLL to octproviewer directory"
-			)
-		endif()
-	endif()
+	copy_required_dlls(octproviewer)
 
 	message(STATUS "")
 	message(STATUS "============================================")
@@ -170,25 +145,7 @@ endif()
 if(BUILD_TOOLS)
 	add_executable(example_recorder example_recorder.cpp)
 	target_link_libraries(example_recorder PRIVATE octproengine)
-
-	if(WIN32)
-		add_custom_command(TARGET example_recorder POST_BUILD
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				$<TARGET_FILE:octproengine>
-				$<TARGET_FILE_DIR:example_recorder>
-			COMMENT "Copying octproengine.dll to example_recorder directory"
-		)
-
-		# Copy FFTW DLL if building with CPU backend
-		if(BUILD_CPU AND FFTW3_DLL)
-			add_custom_command(TARGET example_recorder POST_BUILD
-				COMMAND ${CMAKE_COMMAND} -E copy_if_different
-					"${FFTW3_DLL}"
-					$<TARGET_FILE_DIR:example_recorder>
-				COMMENT "Copying FFTW DLL to example_recorder directory"
-			)
-		endif()
-	endif()
+	copy_required_dlls(example_recorder)
 
 	message(STATUS "Recorder example enabled (BUILD_TOOLS=ON)")
 else()

@@ -63,6 +63,9 @@ else()
 	message(STATUS "Building without OpenCL backend")
 endif()
 
+# Include DLL copying helper for Windows
+include(cmake/CopyDLLs.cmake)
+
 # octproengine src folder
 add_subdirectory(src)
 
