@@ -10,6 +10,7 @@ Configuration:
   Processing: Resampling(CUBIC) + Windowing + Dispersion + BG-Removal + Log-Scale  
   Iterations per test: 100  
   Backends: CPU CUDA OpenCL  
+  Bitdepth: 16-bit unsigned integer
 
 _Signal_ is the number of samples per raw A-scan  
 _Ascans_ is the number of A-scans per B-scan  
