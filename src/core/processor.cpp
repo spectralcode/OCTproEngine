@@ -317,13 +317,15 @@ void Processor::setInputParameters(
 	DataType type)
 {
 	int oldSignalLength = this->impl->config.dataParams.signalLength;
-	
+
 	this->impl->config.dataParams.signalLength = samplesPerRawAscan;
 	this->impl->config.dataParams.ascansPerBscan = ascansPerBscan;
 	this->impl->config.dataParams.bscansPerBuffer = bscansPerBuffer;
 	this->impl->config.dataParams.samplesPerBuffer = samplesPerRawAscan * ascansPerBscan * bscansPerBuffer;
 	this->impl->config.dataParams.inputDataType = type;
-	
+	this->impl->config.dataParams.outputSignalLength = samplesPerRawAscan / 2; 	// currently truncate step always produces signalLength/2 processe samples. todo: make truncate optional and/or add zero-padding option that can increae samples per ascan
+
+
 	// If signalLength changed, re-adjust all custom curves
 	if (samplesPerRawAscan != oldSignalLength) {
 		this->impl->config.adjustAllCustomCurves();
@@ -333,6 +335,14 @@ void Processor::setInputParameters(
 			this->impl->updateAllBackendCurves();
 		}
 	}
+}
+
+void Processor::setBuffersPerVolume(int buffersPerVolume) {
+	this->impl->config.dataParams.buffersPerVolume = buffersPerVolume;
+}
+
+int Processor::getBuffersPerVolume() const {
+	return this->impl->config.dataParams.buffersPerVolume;
 }
 
 // ============================================

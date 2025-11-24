@@ -13,7 +13,10 @@ namespace ope {
 
 class OPE_API Processor {
 public:
-	using OutputCallback = std::function<void(const IOBuffer&)>;
+// todo: Consider redesigning public API for cross-compiler/OS binary compatibility (pure C ABI).
+// maybe keep cpp style API but don't use STL (std::function, std::vector, etc.) in public API? 
+// maybe c api and optional cpp header-only wrapper?
+	using OutputCallback = std::function<void(const IOBuffer&)>; 
 	using InputCallback = std::function<void(const IOBuffer&)>;
 	using CallbackId = int;
 
@@ -54,6 +57,12 @@ public:
 		int bscansPerBuffer,
 		DataType type
 	);
+
+	// Set buffers per volume (for volume-synchronized recording)
+	void setBuffersPerVolume(int buffersPerVolume);
+
+	// Get buffers per volume
+	int getBuffersPerVolume() const;
 
 	// Switch backend (CUDA <-> CPU)
 	// Preserves all configuration, automatically cleanup old backend
@@ -225,7 +234,7 @@ public:
 	size_t getFixedPatternNoiseProfileSize() const;
 	bool hasFixedPatternNoiseProfile() const;
 	void saveFixedPatternNoiseProfileToFile(const std::string& filepath) const;
-	void loadFixedPatternNoiseProfileFromFile(const std::string& filepath);
+	void loadFixedPatternNoiseProfileFromFile(const std::string& filepath); 
 	
 	// ============================================
 	// LOW-LEVEL API - Individual Operations (for testing)

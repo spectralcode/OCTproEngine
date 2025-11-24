@@ -36,14 +36,21 @@ public:
 		int ascansPerBscan;
 		int bscansPerBuffer;
 		DataType inputDataType;
+		DataType outputDataType;  // Data type of processed output (FLOAT, UINT16, UINT8, etc.)
+		int outputSignalLength;    // Signal length after processing (currently signalLength/2 due to truncate step)
+		int buffersPerVolume;      // Number of buffers per volume (for volume-synchronized recording)
 		bool bitshift;
-		
+
 		int getBitDepth() const {
 			return getDataTypeBitDepth(this->inputDataType);
 		}
-		
+
 		int getBytesPerSample() const {
 			return getDataTypeByteSize(this->inputDataType);
+		}
+
+		int getOutputBytesPerSample() const {
+			return getDataTypeByteSize(this->outputDataType);
 		}
 
 		DataParameters()
@@ -52,6 +59,9 @@ public:
 			, ascansPerBscan(512)
 			, bscansPerBuffer(1)
 			, inputDataType(DataType::UINT16)
+			, outputDataType(DataType::FLOAT32)  // Default to FLOAT32
+			, outputSignalLength(512)  // Default: signalLength/2 (truncate step)
+			, buffersPerVolume(1)  // Default: 1 buffer = 1 volume
 			, bitshift(false)
 		{}
 	};
