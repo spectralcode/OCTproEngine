@@ -456,9 +456,9 @@ void CudaBackend::process(IOBuffer& input) {
 	IOBuffer* currentOutputBuf = (this->impl->currentOutputBuffer == 0) ?
 		&this->impl->outputBuffer1 : &this->impl->outputBuffer2;
 
-	// Get buffer ID from input and propagate to output
+	// Get buffer ID from input to propagate to output later in the pipeline 
 	uint64_t bufferId = input.getBufferId();
-	currentOutputBuf->setBufferId(bufferId);
+	//currentOutputBuf->setBufferId(bufferId); // not here, because this output buffer may be still in use by a ProcessorTool
 
 	// Copy input to device
 	void* d_input = nullptr;
@@ -747,6 +747,7 @@ void CudaBackend::process(IOBuffer& input) {
 	}
 	
 	// Step 10: Copy result to host output buffer asynchronously
+	currentOutputBuf->setBufferId(bufferId); // propagate buffer ID from input to output to make it possible to match input and output buffers
 	size_t outputSize = (samplesPerBuffer / 2) * sizeof(float);
 	checkCudaErrors(cudaMemcpyAsync(
 		currentOutputBuf->getDataPointer(),
