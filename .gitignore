@@ -7,6 +7,9 @@ compile_commands.json
 Makefile
 install_manifest.txt
 
+# Generated source files
+src/backends/opencl/opencl_kernels_source.cpp
+
 # IDE
 .vscode/
 
