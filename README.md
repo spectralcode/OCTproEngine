@@ -3,7 +3,7 @@
 High-performance Optical Coherence Tomography (OCT) processing library with GPU acceleration.
 
 ## Performance
-Preliminary results: [Performance Benchmark 2025-11-24](PERFORMANCE.md)
+Preliminary results: [Performance Benchmark 2025-11-25](documentation/developer/PERFORMANCE.md)
 
 ## Requirements
 
