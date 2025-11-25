@@ -2,7 +2,7 @@
 #include "../include/processortool.h"
 #include <iostream>
 #include <vector>
-#include <cassert>
+#include "test_utils.h"
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -92,7 +92,7 @@ void testBufferIdPropagation() {
 	std::cout << "  Recorded " << recorder.recordedBuffers.size() << " buffers" << std::endl;
 
 	// We should have received both raw and processed for each buffer
-	assert(recorder.recordedBuffers.size() == numBuffersToProcess * 2);
+	TEST_ASSERT(recorder.recordedBuffers.size() == numBuffersToProcess * 2, "Expected both raw and processed callbacks");
 
 	// Check that each buffer ID appears exactly twice (once raw, once processed)
 	int matchedPairs = 0;
@@ -103,7 +103,7 @@ void testBufferIdPropagation() {
 		}
 	}
 
-	assert(matchedPairs >= numBuffersToProcess);
+	TEST_ASSERT(matchedPairs >= numBuffersToProcess, "Expected sufficient matched buffer pairs");
 	std::cout << "  [OK] Successfully matched " << matchedPairs << " buffer pairs" << std::endl;
 }
 
@@ -140,8 +140,8 @@ void testInputCallbacks() {
 	// Wait for callbacks
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-	assert(inputCallbackCount > 0);
-	assert(processedCallbackCount > 0);
+	TEST_ASSERT(inputCallbackCount > 0, "Input callback should have been called");
+	TEST_ASSERT(processedCallbackCount > 0, "Processed callback should have been called");
 
 	std::cout << "  [OK] Input callbacks: " << inputCallbackCount << std::endl;
 	std::cout << "  [OK] Processed callbacks: " << processedCallbackCount << std::endl;
@@ -161,8 +161,8 @@ void testInputCallbacks() {
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 	// Callbacks should not have been called
-	assert(inputCallbackCount == 0);
-	assert(processedCallbackCount == 0);
+	TEST_ASSERT(inputCallbackCount == 0, "Input callback should not have been called after removal");
+	TEST_ASSERT(processedCallbackCount == 0, "Processed callback should not have been called after removal");
 
 	std::cout << "  [OK] Callback removal works correctly" << std::endl;
 }
@@ -177,13 +177,13 @@ void testProcessorToolAttachment() {
 	TestRecorderTool tool;
 
 	// Test initial state
-	assert(!tool.isAttached());
-	assert(tool.getProcessor() == nullptr);
+	TEST_ASSERT(!tool.isAttached(), "Tool should not be attached initially");
+	TEST_ASSERT(tool.getProcessor() == nullptr, "Processor should be nullptr initially");
 
 	// Attach to processor
 	tool.attachToProcessor(&processor);
-	assert(tool.isAttached());
-	assert(tool.getProcessor() == &processor);
+	TEST_ASSERT(tool.isAttached(), "Tool should be attached after attachToProcessor");
+	TEST_ASSERT(tool.getProcessor() == &processor, "Tool should return correct processor pointer");
 
 	// Process data
 	auto& inputBuffer = processor.getNextAvailableInputBuffer();
@@ -192,12 +192,12 @@ void testProcessorToolAttachment() {
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 	size_t initialRecordCount = tool.recordedBuffers.size();
-	assert(initialRecordCount > 0);
+	TEST_ASSERT(initialRecordCount > 0, "Tool should have recorded some buffers while attached");
 
 	// Detach
 	tool.detach();
-	assert(!tool.isAttached());
-	assert(tool.getProcessor() == nullptr);
+	TEST_ASSERT(!tool.isAttached(), "Tool should not be attached after detach");
+	TEST_ASSERT(tool.getProcessor() == nullptr, "Processor should be nullptr after detach");
 
 	// Process more data. should not be recorded now!
 	auto& inputBuffer2 = processor.getNextAvailableInputBuffer();
@@ -205,7 +205,7 @@ void testProcessorToolAttachment() {
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-	assert(tool.recordedBuffers.size() == initialRecordCount);
+	TEST_ASSERT(tool.recordedBuffers.size() == initialRecordCount, "Tool should not record buffers after detach");
 
 	std::cout << "  [OK] Tool attachment/detachment works correctly" << std::endl;
 }
