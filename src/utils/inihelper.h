@@ -101,7 +101,11 @@ public:
 
 	static void field(IniMap& m, const std::string& key, float& val, bool saving) {
 		if (saving) {
-			m[key] = std::to_string(val);
+			std::ostringstream oss;
+			oss << std::fixed;
+			oss.precision(6);
+			oss << val;
+			m[key] = oss.str();
 		} else {
 			auto it = m.find(key);
 			if (it != m.end()) val = std::stof(it->second);
@@ -135,6 +139,8 @@ public:
 				return;
 			}
 			std::ostringstream oss;
+			oss << std::fixed;
+			oss.precision(6);
 			for (size_t i = 0; i < vec.size(); ++i) {
 				if (i > 0) oss << ",";
 				oss << vec[i];
