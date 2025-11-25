@@ -3,6 +3,7 @@
 
 #include <string>
 #include <map>
+#include <vector>
 #include <fstream>
 #include <sstream>
 
@@ -123,6 +124,48 @@ public:
 		} else {
 			auto it = m.find(key);
 			if (it != m.end()) val = static_cast<E>(std::stoi(it->second));
+		}
+	}
+
+	// Helper for saving/loading float vectors as comma-separated values
+	static void fieldVector(IniMap& m, const std::string& key, std::vector<float>& vec, bool saving) {
+		if (saving) {
+			if (vec.empty()) {
+				// Don't save empty vectors
+				return;
+			}
+			std::ostringstream oss;
+			for (size_t i = 0; i < vec.size(); ++i) {
+				if (i > 0) oss << ",";
+				oss << vec[i];
+			}
+			m[key] = oss.str();
+		} else {
+			auto it = m.find(key);
+			if (it != m.end() && !it->second.empty()) {
+				vec.clear();
+				std::istringstream iss(it->second);
+				std::string value;
+				while (std::getline(iss, value, ',')) {
+					// Trim whitespace
+					size_t first = value.find_first_not_of(" \t");
+					size_t last = value.find_last_not_of(" \t");
+					if (first != std::string::npos) {
+						value = value.substr(first, last - first + 1);
+					}
+					vec.push_back(std::stof(value));
+				}
+			}
+		}
+	}
+
+	// Helper for size field (to store original size)
+	static void fieldSize(IniMap& m, const std::string& key, size_t& val, bool saving) {
+		if (saving) {
+			m[key] = std::to_string(val);
+		} else {
+			auto it = m.find(key);
+			if (it != m.end()) val = std::stoull(it->second);
 		}
 	}
 };
