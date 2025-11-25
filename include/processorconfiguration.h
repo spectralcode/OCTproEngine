@@ -2,6 +2,7 @@
 #define OPE_PROCESSORCONFIGURATION_H
 
 #include <string>
+#include <map>
 #include "types.h"
 #include "export.h"
 
@@ -235,6 +236,8 @@ private:
 	void adjustCustomDispersionCurve();
 	void adjustCustomPostProcessBackgroundProfile();
 	void adjustCustomFixedPatternNoiseProfile();
+
+	void ioFields(std::map<std::string, std::string>& m, bool saving);
 	
 	template<typename T>
 	T clamp(T value, T min, T max) const {

@@ -303,9 +303,11 @@ bool Processor::isInitialized() const {
 // ============================================
 
 void Processor::loadConfigurationFromFile(const std::string& filepath) {
-	if (!this->impl->config.loadFromFile(filepath)) {
+	ProcessorConfiguration loadedConfig;
+	if (!loadedConfig.loadFromFile(filepath)) {
 		throw std::runtime_error("Failed to load configuration from: " + filepath);
 	}
+	this->setConfig(loadedConfig); //todo: right now config file does not contain any arrays like background profile etc, when loading from file all arrays will be zeroed. maybe redesign?
 }
 
 void Processor::saveConfigurationToFile(const std::string& filepath) const {

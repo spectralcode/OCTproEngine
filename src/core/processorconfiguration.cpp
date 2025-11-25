@@ -1,4 +1,5 @@
 #include "../../include/processorconfiguration.h"
+#include "../utils/inihelper.h"
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -585,17 +586,86 @@ void ProcessorConfiguration::generateWindowCurve() const {
 }
 
 // ============================================
-// File I/O (TODO: Implement)
+// File I/O - Simple INI-style format
 // ============================================
 
+void ProcessorConfiguration::ioFields(IniHelper::IniMap& m, bool saving) {
+	// Data parameters
+	IniHelper::field(m, "data.signal_length", this->dataParams.signalLength, saving);
+	IniHelper::field(m, "data.samples_per_buffer", this->dataParams.samplesPerBuffer, saving);
+	IniHelper::field(m, "data.ascans_per_bscan", this->dataParams.ascansPerBscan, saving);
+	IniHelper::field(m, "data.bscans_per_buffer", this->dataParams.bscansPerBuffer, saving);
+	IniHelper::field(m, "data.buffers_per_volume", this->dataParams.buffersPerVolume, saving);
+	IniHelper::field(m, "data.output_signal_length", this->dataParams.outputSignalLength, saving);
+	IniHelper::field(m, "data.bitshift", this->dataParams.bitshift, saving);
+	IniHelper::fieldEnum(m, "data.input_data_type", this->dataParams.inputDataType, saving);
+	IniHelper::fieldEnum(m, "data.output_data_type", this->dataParams.outputDataType, saving);
+
+	// Resampling parameters
+	IniHelper::field(m, "resampling.enabled", this->resamplingParams.enabled, saving);
+	IniHelper::fieldEnum(m, "resampling.interpolation_method", this->resamplingParams.interpolationMethod, saving);
+	IniHelper::field(m, "resampling.use_coefficients", this->resamplingParams.useCoefficients, saving);
+	IniHelper::field(m, "resampling.c0", this->resamplingParams.coefficients[0], saving);
+	IniHelper::field(m, "resampling.c1", this->resamplingParams.coefficients[1], saving);
+	IniHelper::field(m, "resampling.c2", this->resamplingParams.coefficients[2], saving);
+	IniHelper::field(m, "resampling.c3", this->resamplingParams.coefficients[3], saving);
+	IniHelper::field(m, "resampling.use_custom_curve", this->resamplingParams.useCustomCurve, saving);
+
+	// Windowing parameters
+	IniHelper::field(m, "windowing.enabled", this->windowingParams.enabled, saving);
+	IniHelper::fieldEnum(m, "windowing.window_type", this->windowingParams.windowType, saving);
+	IniHelper::field(m, "windowing.center_position", this->windowingParams.windowCenterPosition, saving);
+	IniHelper::field(m, "windowing.fill_factor", this->windowingParams.windowFillFactor, saving);
+	IniHelper::field(m, "windowing.use_custom_curve", this->windowingParams.useCustomCurve, saving);
+
+	// Dispersion parameters
+	IniHelper::field(m, "dispersion.enabled", this->dispersionParams.enabled, saving);
+	IniHelper::field(m, "dispersion.use_coefficients", this->dispersionParams.useCoefficients, saving);
+	IniHelper::field(m, "dispersion.c0", this->dispersionParams.coefficients[0], saving);
+	IniHelper::field(m, "dispersion.c1", this->dispersionParams.coefficients[1], saving);
+	IniHelper::field(m, "dispersion.c2", this->dispersionParams.coefficients[2], saving);
+	IniHelper::field(m, "dispersion.c3", this->dispersionParams.coefficients[3], saving);
+	IniHelper::field(m, "dispersion.factor", this->dispersionParams.factor, saving);
+	IniHelper::field(m, "dispersion.use_custom_curve", this->dispersionParams.useCustomCurve, saving);
+
+	// Background removal parameters (pre-FFT DC removal)
+	IniHelper::field(m, "background_removal.enabled", this->backgroundRemovalParams.enabled, saving);
+	IniHelper::field(m, "background_removal.window_size", this->backgroundRemovalParams.rollingAverageWindowSize, saving);
+
+	// Post-processing parameters
+	IniHelper::field(m, "post_processing.background_removal", this->postProcessingParams.backgroundRemoval, saving);
+	IniHelper::field(m, "post_processing.background_weight", this->postProcessingParams.backgroundWeight, saving);
+	IniHelper::field(m, "post_processing.background_offset", this->postProcessingParams.backgroundOffset, saving);
+	IniHelper::field(m, "post_processing.log_scaling", this->postProcessingParams.logScaling, saving);
+	IniHelper::field(m, "post_processing.grayscale_max", this->postProcessingParams.grayscaleMax, saving);
+	IniHelper::field(m, "post_processing.grayscale_min", this->postProcessingParams.grayscaleMin, saving);
+	IniHelper::field(m, "post_processing.addend", this->postProcessingParams.addend, saving);
+	IniHelper::field(m, "post_processing.multiplicator", this->postProcessingParams.multiplicator, saving);
+	IniHelper::field(m, "post_processing.bscan_flip", this->postProcessingParams.bscanFlip, saving);
+	IniHelper::field(m, "post_processing.sinusoidal_scan_correction", this->postProcessingParams.sinusoidalScanCorrection, saving);
+	IniHelper::field(m, "post_processing.fixed_pattern_noise_removal", this->postProcessingParams.fixedPatternNoiseRemoval, saving);
+	IniHelper::field(m, "post_processing.fpn_bscan_count", this->postProcessingParams.fixedPatternNoiseBscanCount, saving);
+	IniHelper::field(m, "post_processing.continuous_fpn_determination", this->postProcessingParams.continuousFixedPatternNoiseDetermination, saving);
+}
+
 bool ProcessorConfiguration::saveToFile(const std::string& filepath) const {
-	// TODO: Implement INI-style file format with custom curves
-	return false;
+	IniHelper::IniMap m;
+	const_cast<ProcessorConfiguration*>(this)->ioFields(m, true);
+	return IniHelper::saveToFile(filepath, m);
 }
 
 bool ProcessorConfiguration::loadFromFile(const std::string& filepath) {
-	// TODO: Implement INI-style file format with custom curves
-	return false;
+	IniHelper::IniMap m;
+	if (!IniHelper::loadFromFile(filepath, m)) {
+		return false;
+	}
+
+	this->ioFields(m, false);
+
+	// Adjust custom curves to new signalLength
+	this->adjustAllCustomCurves();
+
+	return true;
 }
 
 // ============================================

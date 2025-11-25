@@ -2,6 +2,8 @@
 #include "../include/processorconfiguration.h"
 #include <iostream>
 #include <cstring>
+#include <cmath>
+#include <cstdio>
 
 int main() {
 	std::cout << "Testing setConfig() functionality..." << std::endl;
@@ -179,9 +181,59 @@ int main() {
 	std::cout << std::endl;
 	
 	// ============================================
+	// Test 6: Save and load config from file
+	// ============================================
+	std::cout << "Test 6: Save and load config from file" << std::endl;
+	
+	ope::Processor processor6(ope::Backend::CPU);
+	
+	// Set up a config with specific values
+	ope::ProcessorConfiguration config6;
+	config6.dataParams.signalLength = 2048;
+	config6.dataParams.ascansPerBscan = 256;
+	config6.dataParams.bscansPerBuffer = 2;
+	config6.dataParams.samplesPerBuffer = 2048 * 256 * 2;
+	config6.resamplingParams.enabled = true;
+	config6.resamplingParams.coefficients[0] = 1.5f;
+	config6.resamplingParams.coefficients[1] = 500.0f;
+	config6.windowingParams.enabled = true;
+	config6.windowingParams.windowFillFactor = 0.85f;
+	config6.postProcessingParams.grayscaleMin = 25.0f;
+	config6.postProcessingParams.grayscaleMax = 95.0f;
+	
+	processor6.setConfig(config6);
+	
+	// Save to file
+	const std::string testFilePath = "test_config_temp.ini";
+	processor6.saveConfigurationToFile(testFilePath);
+	
+	// Create a new processor and load the config
+	ope::Processor processor6b(ope::Backend::CPU);
+	processor6b.loadConfigurationFromFile(testFilePath);
+	
+	// Verify loaded config matches
+	const ope::ProcessorConfiguration& loaded6 = processor6b.getConfig();
+	bool test6Pass = 
+		loaded6.dataParams.signalLength == 2048 &&
+		loaded6.dataParams.ascansPerBscan == 256 &&
+		loaded6.dataParams.bscansPerBuffer == 2 &&
+		loaded6.resamplingParams.enabled == true &&
+		loaded6.resamplingParams.coefficients[0] == 1.5f &&
+		loaded6.windowingParams.enabled == true &&
+		std::abs(loaded6.windowingParams.windowFillFactor - 0.85f) < 0.001f &&
+		std::abs(loaded6.postProcessingParams.grayscaleMin - 25.0f) < 0.001f &&
+		std::abs(loaded6.postProcessingParams.grayscaleMax - 95.0f) < 0.001f;
+	
+	// Clean up temp file
+	std::remove(testFilePath.c_str());
+	
+	std::cout << "  Result: " << (test6Pass ? "PASS" : "FAIL") << std::endl;
+	std::cout << std::endl;
+	
+	// ============================================
 	// Summary
 	// ============================================
-	bool allPass = test1Pass && test2Pass && test3Pass && test4Pass && test5Pass;
+	bool allPass = test1Pass && test2Pass && test3Pass && test4Pass && test5Pass && test6Pass;
 	
 	std::cout << "========================================" << std::endl;
 	std::cout << "SUMMARY: " << (allPass ? "ALL TESTS PASSED" : "SOME TESTS FAILED") << std::endl;
