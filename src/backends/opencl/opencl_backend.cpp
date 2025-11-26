@@ -189,10 +189,6 @@ struct OpenClBackend::Impl {
 	std::vector<CallbackData> callbackDataPool;
 	std::atomic<int> nextCallbackIndex{0};
 
-	//	Track heap-allocated callbacks for async operations
-	std::vector<CallbackData*> pendingCallbacks;
-	std::mutex pendingCallbacksMutex;
-
 	Impl() = default;
 
 	~Impl() {
@@ -846,18 +842,6 @@ void OpenClBackend::cleanup() {
 		}
 	}
 
-	//	Cleanup any remaining pending callbacks (should be none after clFinish)
-	{
-		std::lock_guard<std::mutex> lock(this->impl->pendingCallbacksMutex);
-		for (auto* cbData : this->impl->pendingCallbacks) {
-			if (cbData) {
-				clReleaseEvent(cbData->event);
-				delete cbData;
-			}
-		}
-		this->impl->pendingCallbacks.clear();
-	}
-
 	//	Release device buffers
 	this->releaseDeviceBuffers();
 
@@ -930,17 +914,13 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 #endif
 
-	//	Return input buffer as soon as transfer completes (like CUDA does)
-	Impl::CallbackData* inputCbData = new Impl::CallbackData();
-	inputCbData->impl = this->impl.get();
+	//	Return input buffer as soon as transfer completes (using pre-allocated pool)
+	int inputCbIdx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
+	                 static_cast<int>(this->impl->callbackDataPool.size());
+	Impl::CallbackData* inputCbData = &this->impl->callbackDataPool[inputCbIdx];
 	inputCbData->inputBuffer = &input;
 	inputCbData->outputBuffer = nullptr;
 	inputCbData->event = inputEvent;
-
-	{
-		std::lock_guard<std::mutex> lock(this->impl->pendingCallbacksMutex);
-		this->impl->pendingCallbacks.push_back(inputCbData);
-	}
 
 	checkOpenClErrors(clSetEventCallback(inputEvent, CL_COMPLETE, returnBufferCallback, inputCbData));
 
@@ -1388,18 +1368,13 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 #endif
 
-	//	Create callback data for user output callback
-	Impl::CallbackData* outputCbData = new Impl::CallbackData();
-	outputCbData->impl = this->impl.get();
+	//	Create callback data for user output callback (using pre-allocated pool)
+	int outputCbIdx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
+	                  static_cast<int>(this->impl->callbackDataPool.size());
+	Impl::CallbackData* outputCbData = &this->impl->callbackDataPool[outputCbIdx];
 	outputCbData->inputBuffer = nullptr;
 	outputCbData->outputBuffer = currentOutputBuf;
 	outputCbData->event = outputEvent;
-
-	//	Track pending callback for cleanup
-	{
-		std::lock_guard<std::mutex> lock(this->impl->pendingCallbacksMutex);
-		this->impl->pendingCallbacks.push_back(outputCbData);
-	}
 
 	//	Register callback to trigger user callback when output transfer completes
 	checkOpenClErrors(clSetEventCallback(outputEvent, CL_COMPLETE, outputCallback, outputCbData));
@@ -1584,19 +1559,8 @@ void CL_CALLBACK OpenClBackend::returnBufferCallback(cl_event event, cl_int stat
 		data->impl->freeQueueCV.notify_one();
 	}
 
-	//	Remove from pending callbacks list
-	{
-		std::lock_guard<std::mutex> lock(data->impl->pendingCallbacksMutex);
-		auto it = std::find(data->impl->pendingCallbacks.begin(),
-		                    data->impl->pendingCallbacks.end(), data);
-		if (it != data->impl->pendingCallbacks.end()) {
-			data->impl->pendingCallbacks.erase(it);
-		}
-	}
-
-	//	Release the event and cleanup
+	//	Release the event (no delete needed - using pool)
 	clReleaseEvent(event);
-	delete data;
 }
 
 void CL_CALLBACK OpenClBackend::outputCallback(cl_event event, cl_int status, void* userData) {
@@ -1614,19 +1578,8 @@ void CL_CALLBACK OpenClBackend::outputCallback(cl_event event, cl_int status, vo
 		data->impl->callback(*data->outputBuffer);
 	}
 
-	//	Remove from pending callbacks list
-	{
-		std::lock_guard<std::mutex> lock(data->impl->pendingCallbacksMutex);
-		auto it = std::find(data->impl->pendingCallbacks.begin(),
-		                    data->impl->pendingCallbacks.end(), data);
-		if (it != data->impl->pendingCallbacks.end()) {
-			data->impl->pendingCallbacks.erase(it);
-		}
-	}
-
-	//	Release the event and cleanup
+	//	Release the event
 	clReleaseEvent(event);
-	delete data;
 }
 
 } // namespace ope
