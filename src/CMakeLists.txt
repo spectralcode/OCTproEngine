@@ -86,7 +86,7 @@ if(BUILD_CUDA)
 endif()
 
 if(BUILD_OPENCL)
-	list(APPEND LINK_LIBRARIES OpenCL::OpenCL clFFT::clFFT)
+	list(APPEND LINK_LIBRARIES OpenCL::OpenCL VkFFT::VkFFT)
 endif()
 
 target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES})

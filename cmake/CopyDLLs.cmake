@@ -56,7 +56,7 @@ function(copy_required_dlls_to_dir TARGET_NAME DEST_DIR)
 		endif()
 	endif()
 
-	# Copy OpenCL DLLs if OpenCL is enabled
+	# Copy OpenCL DLL if OpenCL is enabled
 	if(BUILD_OPENCL)
 		# Find OpenCL DLL (cached, so only searched once)
 		find_file(OPENCL_DLL
@@ -67,13 +67,6 @@ function(copy_required_dlls_to_dir TARGET_NAME DEST_DIR)
 				"C:/Windows/System32"
 		)
 
-		# Find clFFT DLL (cached, so only searched once)
-		find_file(CLFFT_DLL
-			NAMES clFFT.dll
-			PATHS "${CMAKE_SOURCE_DIR}/thirdparty/clfft/bin"
-			NO_DEFAULT_PATH
-		)
-
 		if(OPENCL_DLL)
 			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
 				COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -82,15 +75,7 @@ function(copy_required_dlls_to_dir TARGET_NAME DEST_DIR)
 				COMMENT "Copying OpenCL DLL"
 			)
 		endif()
-
-		if(CLFFT_DLL)
-			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-				COMMAND ${CMAKE_COMMAND} -E copy_if_different
-					"${CLFFT_DLL}"
-					${DEST_DIR}
-				COMMENT "Copying clFFT DLL"
-			)
-		endif()
+		# VkFFT is header-only, no DLL needed
 	endif()
 endfunction()
 
@@ -152,7 +137,7 @@ function(copy_required_dlls TARGET_NAME)
 		endif()
 	endif()
 
-	# Copy OpenCL DLLs if OpenCL is enabled
+	# Copy OpenCL DLL if OpenCL is enabled
 	if(BUILD_OPENCL)
 		# Find OpenCL DLL (cached, so only searched once)
 		find_file(OPENCL_DLL
@@ -163,28 +148,12 @@ function(copy_required_dlls TARGET_NAME)
 				"C:/Windows/System32"
 		)
 
-		# Find clFFT DLL (cached, so only searched once)
-		find_file(CLFFT_DLL
-			NAMES clFFT.dll
-			PATHS "${CMAKE_SOURCE_DIR}/thirdparty/clfft/bin"
-			NO_DEFAULT_PATH
-		)
-
 		if(OPENCL_DLL)
 			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
 				COMMAND ${CMAKE_COMMAND} -E copy_if_different
 					"${OPENCL_DLL}"
 					$<TARGET_FILE_DIR:${TARGET_NAME}>
 				COMMENT "Copying OpenCL DLL to ${TARGET_NAME} directory"
-			)
-		endif()
-
-		if(CLFFT_DLL)
-			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-				COMMAND ${CMAKE_COMMAND} -E copy_if_different
-					"${CLFFT_DLL}"
-					$<TARGET_FILE_DIR:${TARGET_NAME}>
-				COMMENT "Copying clFFT DLL to ${TARGET_NAME} directory"
 			)
 		endif()
 	endif()

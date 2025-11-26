@@ -21,7 +21,7 @@ option(BUILD_TESTS "Build tests" ON)
 option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TOOLS "Build optional ProcessorTools (Recorder, etc.)" ON)
 option(FFTW3_AUTO_DOWNLOAD "Automatically download FFTW3 to thirdparty/fftw if not found (Windows only)" ON)
-option(CLFFT_AUTO_DOWNLOAD "Automatically download clFFT to thirdparty/clfft if not found (Windows only)" ON)
+option(VKFFT_AUTO_DOWNLOAD "Automatically download VkFFT to thirdparty/vkfft if not found" ON)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 14)
@@ -44,8 +44,15 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # Find dependencies
 if(BUILD_CUDA)
 	include(cmake/CudaConfig.cmake)
-else()
-	message(STATUS "Building without CUDA")
+
+	if(NOT CUDA_AVAILABLE)
+		message(WARNING "CUDA not available - disabling CUDA backend")
+		set(BUILD_CUDA OFF)
+	endif()
+endif()
+
+if(NOT BUILD_CUDA)
+	message(STATUS "Building without CUDA backend")
 endif()
 
 # Find FFTW3 (only needed for CPU backend)
@@ -55,21 +62,29 @@ else()
 	message(STATUS "Building without CPU backend - FFTW3 not required")
 endif()
 
-# Find OpenCL and clFFT (only needed for OpenCL backend)
+# Find OpenCL and VkFFT (only needed for OpenCL backend)
 if(BUILD_OPENCL)
 	include(cmake/OpenCLHelper.cmake)
-	find_package(OpenCL REQUIRED)
-	message(STATUS "Found OpenCL: ${OpenCL_LIBRARIES}")
-	
-	find_package(clFFT)
-	if(clFFT_FOUND)
-		message(STATUS "clFFT found - OpenCL backend enabled")
+	find_package(OpenCL QUIET)
+
+	if(OpenCL_FOUND)
+		message(STATUS "Found OpenCL: ${OpenCL_LIBRARIES}")
+
+		# Find VkFFT (header-only library with auto-download support)
+		find_package(VkFFT QUIET)
+
+		if(NOT VkFFT_FOUND)
+			message(WARNING "VkFFT not found - disabling OpenCL backend")
+			message(WARNING "To enable OpenCL backend, ensure VkFFT is available or enable VKFFT_AUTO_DOWNLOAD")
+			set(BUILD_OPENCL OFF)
+		endif()
 	else()
-		message(WARNING "clFFT not found - disabling OpenCL backend")
-		message(STATUS "Note: Auto-download is ${CLFFT_AUTO_DOWNLOAD}")
-		set(BUILD_OPENCL OFF CACHE BOOL "Build with OpenCL backend" FORCE)
+		message(WARNING "OpenCL not found - disabling OpenCL backend")
+		set(BUILD_OPENCL OFF)
 	endif()
-else()
+endif()
+
+if(NOT BUILD_OPENCL)
 	message(STATUS "Building without OpenCL backend")
 endif()
 

@@ -1,6 +1,9 @@
 #include "opencl_backend.h"
 #include "opencl_kernels.h"
-#include <clFFT.h>
+
+//	VkFFT backend selection: 3 = OpenCL
+#define VKFFT_BACKEND 3
+#include <vkFFT/vkFFT.h>
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
@@ -52,13 +55,13 @@ static double getEventDurationMs(cl_event event) {
 		} \
 	} while(0)
 
-// Helper macro for checking clFFT errors
-#define checkClFFTErrors(call) \
+// Helper macro for checking VkFFT errors
+#define checkVkFFTErrors(call) \
 	do { \
-		clfftStatus err = call; \
-		if (err != CLFFT_SUCCESS) { \
+		VkFFTResult err = call; \
+		if (err != VKFFT_SUCCESS) { \
 			std::stringstream ss; \
-			ss << "clFFT error at " << __FILE__ << ":" << __LINE__ << " - code: " << err; \
+			ss << "VkFFT error at " << __FILE__ << ":" << __LINE__ << " - code: " << err; \
 			throw std::runtime_error(ss.str()); \
 		} \
 	} while(0)
@@ -163,9 +166,10 @@ struct OpenClBackend::Impl {
 	bool postProcessBackgroundUpdated = false;
 	std::vector<float> recordedPostProcessBackground;
 
-	//	clFFT
-	clfftPlanHandle fftPlan = 0;
-	clfftSetupData fftSetup;
+	//	VkFFT
+	VkFFTConfiguration fftConfig;
+	VkFFTApplication fftApp;
+	bool fftDebugPrinted = false;
 
 	//	Output buffers (ping-pong)
 	IOBuffer outputBuffer1;
@@ -708,31 +712,69 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 	//	Load and build kernels
 	this->loadAndBuildKernels();
 
-	//	Initialize clFFT library
-	checkClFFTErrors(clfftSetup(&this->impl->fftSetup));
+	//	Initialize VkFFT library
+	memset(&this->impl->fftConfig, 0, sizeof(VkFFTConfiguration));
+	memset(&this->impl->fftApp, 0, sizeof(VkFFTApplication));
 
-	//	Create clFFT plan for 1D IFFT
-	size_t fftSize = this->impl->signalLength;
-	checkClFFTErrors(clfftCreateDefaultPlan(&this->impl->fftPlan, this->impl->context, CLFFT_1D, &fftSize));
-	checkClFFTErrors(clfftSetPlanPrecision(this->impl->fftPlan, CLFFT_SINGLE));
-	checkClFFTErrors(clfftSetLayout(this->impl->fftPlan, CLFFT_COMPLEX_INTERLEAVED, CLFFT_COMPLEX_INTERLEAVED));
-	checkClFFTErrors(clfftSetResultLocation(this->impl->fftPlan, CLFFT_INPLACE));
-	checkClFFTErrors(clfftSetPlanBatchSize(this->impl->fftPlan, this->impl->ascansPerBscan * this->impl->bscansPerBuffer));
+	//	Configure VkFFT for 1D IFFT
+	this->impl->fftConfig.FFTdim = 1;  //	1D FFT
+	this->impl->fftConfig.size[0] = this->impl->signalLength;
+	this->impl->fftConfig.size[1] = 1;
+	this->impl->fftConfig.size[2] = 1;
 
-	//	Disable backward FFT scaling to match cuFFT behavior (cuFFT doesn't scale)
-	//	By default, clFFT applies 1/N scaling to backward transform, but we handle normalization in post-processing
-	checkClFFTErrors(clfftSetPlanScale(this->impl->fftPlan, CLFFT_BACKWARD, 1.0f));
-	size_t fftStride = 1;
-	size_t fftDistance = this->impl->signalLength;
-	checkClFFTErrors(clfftSetPlanDistance(this->impl->fftPlan, fftDistance, fftDistance));
-	checkClFFTErrors(clfftSetPlanInStride(this->impl->fftPlan, CLFFT_1D, &fftStride));
-	checkClFFTErrors(clfftSetPlanOutStride(this->impl->fftPlan, CLFFT_1D, &fftStride));
+	//	OpenCL backend specific configuration
+	this->impl->fftConfig.platform = &this->impl->platform;
+	this->impl->fftConfig.device = &this->impl->device;
+	this->impl->fftConfig.context = &this->impl->context;
+	this->impl->fftConfig.commandQueue = &this->impl->commandQueues[0];
 
-	//	Bake the plan with the first command queue
-	checkClFFTErrors(clfftBakePlan(this->impl->fftPlan, 1, &this->impl->commandQueues[0], nullptr, nullptr));
+	//	Verify OpenCL objects are valid
+	if (!this->impl->platform || !this->impl->device || !this->impl->context || this->impl->commandQueues.empty()) {
+		throw std::runtime_error("VkFFT: Invalid OpenCL objects (platform, device, context, or queue not initialized)");
+	}
+
+	//	Precision (single precision float)
+	this->impl->fftConfig.doublePrecision = 0;
+
+	//	Set number of batches
+	this->impl->fftConfig.numberBatches = this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
+
+	//	Disable normalization to match cuFFT behavior (we handle it in post-processing) //todo: use this normalization and remove it from post-processing?
+	this->impl->fftConfig.normalize = 0;
+
+	//	Performance optimizations - set coalescedMemory based on vendor
+	//	Get device vendor for vendor-specific optimizations
+	char vendorName[256] = {0};
+	checkOpenClErrors(clGetDeviceInfo(this->impl->device, CL_DEVICE_VENDOR, sizeof(vendorName), vendorName, nullptr));
+	std::string vendor(vendorName);
+
+	//	For Nvidia and AMD: 32 bytes, for Intel: 64 bytes (per VkFFT documentation)
+	if (vendor.find("Intel") != std::string::npos) {
+		this->impl->fftConfig.coalescedMemory = 64;
+	} else {
+		//	Nvidia, AMD, and others
+		this->impl->fftConfig.coalescedMemory = 32;
+	}
+
+	//	Use automatic LUT selection (let VkFFT decide based on FFT size)
+	//	-1 = off, 0 = auto, 1 = on
+	this->impl->fftConfig.useLUT = 0;
+
+	//	Target threads per block to match our kernel work group size
+	this->impl->fftConfig.aimThreads = 128;
+
+	//	Number of shared memory banks (NVIDIA has 32)
+	this->impl->fftConfig.numSharedBanks = 32;
+
+	//	Try bandwidth boost optimization for better memory coalescing
+	//	This reduces coalesced number to get bigger sequences in one upload
+	this->impl->fftConfig.performBandwidthBoost = 2;
 
 	//	Allocate device buffers
 	this->allocateDeviceBuffers();
+
+	//	Initialize VkFFT application
+	checkVkFFTErrors(initializeVkFFT(&this->impl->fftApp, this->impl->fftConfig));
 
 	//	Allocate host input buffers
 	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
@@ -825,14 +867,8 @@ void OpenClBackend::cleanup() {
 	//	Release kernels
 	this->releaseKernels();
 
-	//	Destroy clFFT plan
-	if (this->impl->fftPlan) {
-		clfftDestroyPlan(&this->impl->fftPlan);
-		this->impl->fftPlan = 0;
-	}
-
-	//	Teardown clFFT library
-	clfftTeardown();
+	//	Destroy VkFFT application
+	deleteVkFFT(&this->impl->fftApp);
 
 	//	Destroy command queues
 	this->destroyCommandQueues();
@@ -1088,21 +1124,28 @@ void OpenClBackend::process(IOBuffer& input) {
 		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelDispersionCompensation, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
 	}
 
-	//	Step 4: IFFT using clFFT
+	//	Step 4: IFFT using VkFFT
+	VkFFTLaunchParams launchParams = {};
+	launchParams.commandQueue = &queue;
+	launchParams.buffer = &d_fftBuffer2;  //	Specify buffer dynamically for this FFT operation
+
+
 #ifdef OPENCL_PROFILE_TIMING
-	cl_event fftEvent;
-	checkClFFTErrors(clfftEnqueueTransform(this->impl->fftPlan, CLFFT_BACKWARD, 1, &queue,
-		0, nullptr, &fftEvent, &d_fftBuffer2, nullptr, nullptr));
-	clWaitForEvents(1, &fftEvent);
-	double fftMs = getEventDurationMs(fftEvent);
-	clReleaseEvent(fftEvent);
+	//	VkFFT doesn't directly provide events, so we enqueue a marker after the FFT
+	cl_event fftStartEvent, fftEndEvent;
+	checkOpenClErrors(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &fftStartEvent));
+	checkVkFFTErrors(VkFFTAppend(&this->impl->fftApp, 1, &launchParams));  //	+1 = inverse/backward FFT (VkFFT sign convention)
+	checkOpenClErrors(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &fftEndEvent));
+	clWaitForEvents(1, &fftEndEvent);
+	double fftMs = getEventDurationMs(fftEndEvent) - getEventDurationMs(fftStartEvent);
+	clReleaseEvent(fftStartEvent);
+	clReleaseEvent(fftEndEvent);
 	{
 		std::lock_guard<std::mutex> lock(g_profilingMutex);
 		g_profiling.fftMs += fftMs;
 	}
 #else
-	checkClFFTErrors(clfftEnqueueTransform(this->impl->fftPlan, CLFFT_BACKWARD, 1, &queue,
-		0, nullptr, nullptr, &d_fftBuffer2, nullptr, nullptr));
+	checkVkFFTErrors(VkFFTAppend(&this->impl->fftApp, 1, &launchParams));
 #endif
 
 	//	Step 5: Fixed-pattern noise removal
