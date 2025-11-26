@@ -1439,7 +1439,7 @@ const std::vector<float>& OpenClBackend::getPostProcessBackgroundProfile() const
 }
 
 void OpenClBackend::requestFixedPatternNoiseDetermination() {
-	//	todo
+	this->impl->fixedPatternNoiseDetermined = false;
 }
 
 void OpenClBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
