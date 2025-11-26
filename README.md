@@ -35,31 +35,37 @@ build_windows.bat
 The bat script builds the C++ library as well as the Python bindings.
 
 
-**Alternative - C++ library only (skip Python bindings):**
+**Alternative: build manually**  
+For default build wihtout python bindings, run:
 ```bash
 cd path\to\octproengine  # Replace with your actual path
 mkdir build
 cd build
-cmake .. -DBUILD_PYTHON=OFF -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake .. 
 cmake --build . --config Release
 ```
+or you can enable python bindings with:  
+```bash
+cmake .. -DBUILD_PYTHON=ON
+cmake --build . --config Release
+```
+Here is a list of all available build options:  
 
 **Build Options:**
-```bash
-# CUDA-only (no CPU backend, no FFTW3 required)
-cmake .. -DBUILD_CPU=OFF -DBUILD_CUDA=ON
 
-# CPU-only (no CUDA required, auto-download FFTW3 on Windows)
-cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=OFF -DFFTW3_AUTO_DOWNLOAD=ON
+| Option | Default | Description |
+|--------|---------|-------------|
+| `BUILD_CUDA` | `ON` | Build with CUDA backend support |
+| `BUILD_CPU` | `ON` | Build with CPU backend (requires FFTW3) |
+| `BUILD_OPENCL` | `ON` | Build with OpenCL backend |
+| `BUILD_PYTHON` | `OFF` | Build Python bindings (requires pybind11, NumPy) |
+| `BUILD_TESTS` | `ON` | Build test suite |
+| `BUILD_EXAMPLES` | `ON` | Build example applications |
+| `BUILD_TOOLS` | `ON` | Build optional ProcessorTools (Recorder, etc.) |
+| `BUILD_OCT_VIEWER` | `OFF` | Build interactive OCTproViewer with ImGui (auto-downloads GLFW & ImGui) |
+| `FFTW3_AUTO_DOWNLOAD` | `ON` | Auto-download FFTW3 if not found (Windows only) |
 
-# Both backends (default) and auto-download FFTW3
-cmake .. -DBUILD_CPU=ON -DBUILD_CUDA=ON -DFFTW3_AUTO_DOWNLOAD=ON
-
-# Build with interactive OCTproViewer (GUI application to manually test OCT output)
-cmake .. -DBUILD_EXAMPLES=ON -DBUILD_OCT_VIEWER=ON -DFFTW3_AUTO_DOWNLOAD=ON
-```
-
-
+**Note:** At least one backend (`BUILD_CUDA`, `BUILD_CPU`, or `BUILD_OPENCL`) must be enabled.
 
 ### Linux
 
