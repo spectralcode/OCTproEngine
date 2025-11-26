@@ -7,15 +7,14 @@ Preliminary results: [Performance Benchmark 2025-11-25](documentation/developer/
 
 ## Requirements
 
-- **CUDA Toolkit** ≥ 11.0  
-	https://developer.nvidia.com/cuda-downloads
-- **CMake** ≥ 3.18  
-- **FFTW3**
-	- Win: https://fftw.org/download.html or use `build_windows.bat`  
-	- Linux: `sudo apt-get install libfftw3-dev`
-- **Python** ≥ 3.8 (optional)
+- **CMake** ≥ 3.18
+- **CUDA Toolkit** ≥ 11.0 (optional, for CUDA backend)
+- **FFTW3** (optional, for CPU backend)
+- **OpenCL** (optional, for OpenCL backend)
+	- VkFFT
+- **Python** ≥ 3.8 (optional, for Python bindings)
 	- pybind11, NumPy
-- **C++ Compiler**  
+- **C++ Compiler**
 	- Win: VS 2019+ (C++14, must be compatible with your cuda version)  
 
 ## Build
@@ -57,13 +56,14 @@ Here is a list of all available build options:
 |--------|---------|-------------|
 | `BUILD_CUDA` | `ON` | Build with CUDA backend support |
 | `BUILD_CPU` | `ON` | Build with CPU backend (requires FFTW3) |
-| `BUILD_OPENCL` | `ON` | Build with OpenCL backend |
+| `BUILD_OPENCL` | `ON` | Build with OpenCL backend (requires VkFFT) |
 | `BUILD_PYTHON` | `OFF` | Build Python bindings (requires pybind11, NumPy) |
 | `BUILD_TESTS` | `ON` | Build test suite |
 | `BUILD_EXAMPLES` | `ON` | Build example applications |
 | `BUILD_TOOLS` | `ON` | Build optional ProcessorTools (Recorder, etc.) |
 | `BUILD_OCT_VIEWER` | `OFF` | Build interactive OCTproViewer with ImGui (auto-downloads GLFW & ImGui) |
 | `FFTW3_AUTO_DOWNLOAD` | `ON` | Auto-download FFTW3 if not found (Windows only) |
+| `VKFFT_AUTO_DOWNLOAD` | `ON` | Auto-download VkFFT if not found |
 
 **Note:** At least one backend (`BUILD_CUDA`, `BUILD_CPU`, or `BUILD_OPENCL`) must be enabled.
 
