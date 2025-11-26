@@ -21,6 +21,7 @@ option(BUILD_TESTS "Build tests" ON)
 option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TOOLS "Build optional ProcessorTools (Recorder, etc.)" ON)
 option(FFTW3_AUTO_DOWNLOAD "Automatically download FFTW3 to thirdparty/fftw if not found (Windows only)" ON)
+option(CLFFT_AUTO_DOWNLOAD "Automatically download clFFT to thirdparty/clfft if not found (Windows only)" ON)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 14)
@@ -56,9 +57,61 @@ endif()
 
 # Find OpenCL and clFFT (only needed for OpenCL backend)
 if(BUILD_OPENCL)
+	# Help CMake find OpenCL in CUDA installation
+	if(WIN32 AND NOT DEFINED OpenCL_ROOT AND NOT DEFINED ENV{OpenCL_ROOT})
+		# Check common CUDA installation locations
+		set(CUDA_SEARCH_PATHS
+			"$ENV{CUDA_PATH}"
+			"$ENV{CUDA_HOME}"
+			"$ENV{ProgramFiles}/NVIDIA GPU Computing Toolkit/CUDA"
+			"$ENV{ProgramW6432}/NVIDIA GPU Computing Toolkit/CUDA"
+		)
+		
+		foreach(SEARCH_PATH ${CUDA_SEARCH_PATHS})
+			if(EXISTS "${SEARCH_PATH}")
+				file(GLOB CUDA_VERSIONS "${SEARCH_PATH}/v*")
+				if(CUDA_VERSIONS)
+					list(SORT CUDA_VERSIONS)
+					list(REVERSE CUDA_VERSIONS)
+					
+					# Find first version with valid OpenCL files
+					foreach(CUDA_VER_PATH ${CUDA_VERSIONS})
+						# Normalize path to use forward slashes
+						file(TO_CMAKE_PATH "${CUDA_VER_PATH}" CUDA_VER_PATH_NORMALIZED)
+						
+						if(EXISTS "${CUDA_VER_PATH_NORMALIZED}/include/CL/opencl.h")
+							if(EXISTS "${CUDA_VER_PATH_NORMALIZED}/lib/x64/OpenCL.lib" OR EXISTS "${CUDA_VER_PATH_NORMALIZED}/lib/OpenCL.lib")
+								set(OpenCL_INCLUDE_DIR "${CUDA_VER_PATH_NORMALIZED}/include")
+								if(EXISTS "${CUDA_VER_PATH_NORMALIZED}/lib/x64/OpenCL.lib")
+									set(OpenCL_LIBRARY "${CUDA_VER_PATH_NORMALIZED}/lib/x64/OpenCL.lib")
+								else()
+									set(OpenCL_LIBRARY "${CUDA_VER_PATH_NORMALIZED}/lib/OpenCL.lib")
+								endif()
+								message(STATUS "Found OpenCL in CUDA: ${CUDA_VER_PATH_NORMALIZED}")
+								break()
+							endif()
+						endif()
+					endforeach()
+					
+					if(DEFINED OpenCL_INCLUDE_DIR)
+						break()
+					endif()
+				endif()
+			endif()
+		endforeach()
+	endif()
+	
 	find_package(OpenCL REQUIRED)
 	message(STATUS "Found OpenCL: ${OpenCL_LIBRARIES}")
-	find_package(clFFT REQUIRED)
+	
+	find_package(clFFT)
+	if(clFFT_FOUND)
+		message(STATUS "clFFT found - OpenCL backend enabled")
+	else()
+		message(WARNING "clFFT not found - disabling OpenCL backend")
+		message(STATUS "Note: Auto-download is ${CLFFT_AUTO_DOWNLOAD}")
+		set(BUILD_OPENCL OFF CACHE BOOL "Build with OpenCL backend" FORCE)
+	endif()
 else()
 	message(STATUS "Building without OpenCL backend")
 endif()
