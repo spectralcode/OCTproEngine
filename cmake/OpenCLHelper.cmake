@@ -2,8 +2,9 @@
 # Helper to find OpenCL in CUDA installations on Windows
 # This allows CMake's FindOpenCL to locate OpenCL headers and libraries
 # that are bundled with NVIDIA CUDA Toolkit
+# see: https://cmake.org/cmake/help/latest/module/FindOpenCL.html
 
-if(WIN32 AND NOT DEFINED OpenCL_ROOT AND NOT DEFINED ENV{OpenCL_ROOT})
+if(WIN32 AND NOT OpenCL_INCLUDE_DIR AND NOT OpenCL_LIBRARY)
 	# Common CUDA installation locations
 	set(CUDA_SEARCH_PATHS
 		"$ENV{CUDA_PATH}"
