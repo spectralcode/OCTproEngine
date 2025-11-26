@@ -14,16 +14,34 @@
 #   cmake .. -DCUDA_EXTRA_NVCC_FLAGS="--expt-relaxed-constexpr;-lineinfo"
 
 
+include(CheckLanguage)
+check_language(CUDA)
+
+if(CMAKE_CUDA_COMPILER)
+	enable_language(CUDA)
+	set(CMAKE_CUDA_STANDARD 14)
+	find_package(CUDAToolkit QUIET)
+
+	if(CUDAToolkit_FOUND)
+		message(STATUS "Found CUDA Toolkit: ${CUDAToolkit_VERSION}")
+		set(CUDA_AVAILABLE TRUE)
+	else()
+		message(WARNING "CUDA Toolkit not found - CUDA backend will be disabled")
+		set(CUDA_AVAILABLE FALSE)
+		return()
+	endif()
+else()
+	message(WARNING "CUDA compiler not found - CUDA backend will be disabled")
+	set(CUDA_AVAILABLE FALSE)
+	return()
+endif()
+
 # Detect whether the user already provided a value (via -D / presets / toolchain)
 get_property(_user_set CACHE CMAKE_CUDA_ARCHITECTURES PROPERTY TYPE)
 set(_user_provided FALSE)
 if(_user_set)
 	set(_user_provided TRUE)
 endif()
-
-enable_language(CUDA)
-set(CMAKE_CUDA_STANDARD 14)
-find_package(CUDAToolkit 11.0 REQUIRED)
 
 # If the user did not provide cuda architecture, apply defaults
 # todo: maybe limit default archs for faster dev builds; full list only needed for release wheels
