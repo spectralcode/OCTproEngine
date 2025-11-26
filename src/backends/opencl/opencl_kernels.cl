@@ -247,7 +247,7 @@ __kernel void klinearizationLanczos(
 
 	float x = resampleCurve[j];
 	int center = (int)floor(x);
-	const int a = 3;
+	const int a = 8;
 
 	float sum = 0.0f;
 	for (int k = center - a + 1; k <= center + a; k++) {
@@ -356,7 +356,7 @@ __kernel void klinearizationLanczosAndWindowing(
 
 	float x = resampleCurve[j];
 	int center = (int)floor(x);
-	const int a = 3;
+	const int a = 8;
 
 	float sum = 0.0f;
 	for (int k = center - a + 1; k <= center + a; k++) {
@@ -504,7 +504,7 @@ __kernel void klinearizationLanczosAndWindowingAndDispersionCompensation(
 
 	float x = resampleCurve[j];
 	int center = (int)floor(x);
-	const int a = 3;
+	const int a = 8;
 
 	float sum = 0.0f;
 	for (int k = center - a + 1; k <= center + a; k++) {
