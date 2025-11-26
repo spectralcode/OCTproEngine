@@ -614,127 +614,196 @@ PYBIND11_MODULE(octproengine, m) {
 		"    int: Current device ID, or -1 if no CUDA");
 
 	// ============================================
-	// CONFIGURATION STRUCTS
+	// CONFIGURATION STRUCTS AND ENUMS
 	// ============================================
-	
+
+	// Enums for ProcessorConfiguration
+	py::enum_<ope::ProcessorConfiguration::LoadMode>(m, "LoadMode")
+		.value("OVERWRITE_ALL", ope::ProcessorConfiguration::LoadMode::OVERWRITE_ALL)
+		.value("PARAMETERS_ONLY", ope::ProcessorConfiguration::LoadMode::PARAMETERS_ONLY)
+		.value("MERGE_IF_MISSING", ope::ProcessorConfiguration::LoadMode::MERGE_IF_MISSING);
+
+	py::enum_<ope::ProcessorConfiguration::SaveMode>(m, "SaveMode")
+		.value("PARAMETERS_ONLY", ope::ProcessorConfiguration::SaveMode::PARAMETERS_ONLY)
+		.value("COMPLETE", ope::ProcessorConfiguration::SaveMode::COMPLETE);
+
+	// DataParameters
 	py::class_<ope::ProcessorConfiguration::DataParameters>(m, "DataParameters")
 		.def(py::init<>())
-		.def_readwrite("signal_length", &ope::ProcessorConfiguration::DataParameters::signalLength)
-		.def_readwrite("samples_per_buffer", &ope::ProcessorConfiguration::DataParameters::samplesPerBuffer)
-		.def_readwrite("ascans_per_bscan", &ope::ProcessorConfiguration::DataParameters::ascansPerBscan)
-		.def_readwrite("bscans_per_buffer", &ope::ProcessorConfiguration::DataParameters::bscansPerBuffer)
-		.def_readwrite("input_data_type", &ope::ProcessorConfiguration::DataParameters::inputDataType)
-		.def_readwrite("bitshift", &ope::ProcessorConfiguration::DataParameters::bitshift)
-		.def("get_bit_depth", &ope::ProcessorConfiguration::DataParameters::getBitDepth)
-		.def("get_bytes_per_sample", &ope::ProcessorConfiguration::DataParameters::getBytesPerSample);
-	
-	py::class_<ope::ProcessorConfiguration::ResamplingParameters>(m, "ResamplingParameters")
+		.def_readwrite("signalLength", &ope::ProcessorConfiguration::DataParameters::signalLength)
+		.def_readwrite("ascansPerBscan", &ope::ProcessorConfiguration::DataParameters::ascansPerBscan)
+		.def_readwrite("bscansPerBuffer", &ope::ProcessorConfiguration::DataParameters::bscansPerBuffer)
+		.def_readwrite("buffersPerVolume", &ope::ProcessorConfiguration::DataParameters::buffersPerVolume)
+		.def_readwrite("inputDataType", &ope::ProcessorConfiguration::DataParameters::inputDataType)
+		.def_readwrite("outputDataType", &ope::ProcessorConfiguration::DataParameters::outputDataType)
+		.def("samplesPerBuffer", &ope::ProcessorConfiguration::DataParameters::samplesPerBuffer)
+		.def("outputSignalLength", &ope::ProcessorConfiguration::DataParameters::outputSignalLength)
+		.def("getBitDepth", &ope::ProcessorConfiguration::DataParameters::getBitDepth)
+		.def("getBytesPerSample", &ope::ProcessorConfiguration::DataParameters::getBytesPerSample)
+		.def("getOutputBytesPerSample", &ope::ProcessorConfiguration::DataParameters::getOutputBytesPerSample);
+
+	// ProcessingParameters sub-structs
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Input>(m, "ProcessingInput")
 		.def(py::init<>())
-		.def_readwrite("enabled", &ope::ProcessorConfiguration::ResamplingParameters::enabled)
-		.def_readwrite("interpolation_method", &ope::ProcessorConfiguration::ResamplingParameters::interpolationMethod)
-		.def_readwrite("use_coefficients", &ope::ProcessorConfiguration::ResamplingParameters::useCoefficients)
+		.def_readwrite("bitshift", &ope::ProcessorConfiguration::ProcessingParameters::Input::bitshift);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::DCRemoval>(m, "ProcessingDCRemoval")
+		.def(py::init<>())
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::DCRemoval::enabled)
+		.def_readwrite("windowSize", &ope::ProcessorConfiguration::ProcessingParameters::DCRemoval::windowSize);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Resampling>(m, "ProcessingResampling")
+		.def(py::init<>())
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::Resampling::enabled)
+		.def_readwrite("method", &ope::ProcessorConfiguration::ProcessingParameters::Resampling::method)
 		.def_property("coefficients",
-			[](const ope::ProcessorConfiguration::ResamplingParameters& self) {
+			[](const ope::ProcessorConfiguration::ProcessingParameters::Resampling& self) {
 				return std::vector<float>(self.coefficients, self.coefficients + 4);
 			},
-			[](ope::ProcessorConfiguration::ResamplingParameters& self, const std::vector<float>& coeffs) {
+			[](ope::ProcessorConfiguration::ProcessingParameters::Resampling& self, const std::vector<float>& coeffs) {
 				if (coeffs.size() != 4) throw std::runtime_error("Coefficients must have exactly 4 elements");
 				std::copy(coeffs.begin(), coeffs.end(), self.coefficients);
 			})
-		.def_readwrite("use_custom_curve", &ope::ProcessorConfiguration::ResamplingParameters::useCustomCurve);
-	
-	py::class_<ope::ProcessorConfiguration::WindowingParameters>(m, "WindowingParameters")
+		.def_readwrite("useCustomLut", &ope::ProcessorConfiguration::ProcessingParameters::Resampling::useCustomLut);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Windowing>(m, "ProcessingWindowing")
 		.def(py::init<>())
-		.def_readwrite("enabled", &ope::ProcessorConfiguration::WindowingParameters::enabled)
-		.def_readwrite("window_type", &ope::ProcessorConfiguration::WindowingParameters::windowType)
-		.def_readwrite("window_center_position", &ope::ProcessorConfiguration::WindowingParameters::windowCenterPosition)
-		.def_readwrite("window_fill_factor", &ope::ProcessorConfiguration::WindowingParameters::windowFillFactor)
-		.def_readwrite("use_custom_curve", &ope::ProcessorConfiguration::WindowingParameters::useCustomCurve);
-	
-	py::class_<ope::ProcessorConfiguration::DispersionCompensationParameters>(m, "DispersionCompensationParameters")
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::Windowing::enabled)
+		.def_readwrite("type", &ope::ProcessorConfiguration::ProcessingParameters::Windowing::type)
+		.def_readwrite("centerPosition", &ope::ProcessorConfiguration::ProcessingParameters::Windowing::centerPosition)
+		.def_readwrite("fillFactor", &ope::ProcessorConfiguration::ProcessingParameters::Windowing::fillFactor)
+		.def_readwrite("useCustomFunction", &ope::ProcessorConfiguration::ProcessingParameters::Windowing::useCustomFunction);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Dispersion>(m, "ProcessingDispersion")
 		.def(py::init<>())
-		.def_readwrite("enabled", &ope::ProcessorConfiguration::DispersionCompensationParameters::enabled)
-		.def_readwrite("use_coefficients", &ope::ProcessorConfiguration::DispersionCompensationParameters::useCoefficients)
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::Dispersion::enabled)
 		.def_property("coefficients",
-			[](const ope::ProcessorConfiguration::DispersionCompensationParameters& self) {
+			[](const ope::ProcessorConfiguration::ProcessingParameters::Dispersion& self) {
 				return std::vector<float>(self.coefficients, self.coefficients + 4);
 			},
-			[](ope::ProcessorConfiguration::DispersionCompensationParameters& self, const std::vector<float>& coeffs) {
+			[](ope::ProcessorConfiguration::ProcessingParameters::Dispersion& self, const std::vector<float>& coeffs) {
 				if (coeffs.size() != 4) throw std::runtime_error("Coefficients must have exactly 4 elements");
 				std::copy(coeffs.begin(), coeffs.end(), self.coefficients);
 			})
-		.def_readwrite("factor", &ope::ProcessorConfiguration::DispersionCompensationParameters::factor)
-		.def_readwrite("use_custom_curve", &ope::ProcessorConfiguration::DispersionCompensationParameters::useCustomCurve);
-	
-	py::class_<ope::ProcessorConfiguration::BackgroundRemovalParameters>(m, "BackgroundRemovalParameters")
+		.def_readwrite("factor", &ope::ProcessorConfiguration::ProcessingParameters::Dispersion::factor)
+		.def_readwrite("useCustomPhase", &ope::ProcessorConfiguration::ProcessingParameters::Dispersion::useCustomPhase);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::FixedPatternNoise>(m, "ProcessingFixedPatternNoise")
 		.def(py::init<>())
-		.def_readwrite("enabled", &ope::ProcessorConfiguration::BackgroundRemovalParameters::enabled)
-		.def_readwrite("rolling_average_window_size", &ope::ProcessorConfiguration::BackgroundRemovalParameters::rollingAverageWindowSize);
-	
-	py::class_<ope::ProcessorConfiguration::PostProcessingParameters>(m, "PostProcessingParameters")
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::FixedPatternNoise::enabled)
+		.def_readwrite("bscanAverageCount", &ope::ProcessorConfiguration::ProcessingParameters::FixedPatternNoise::bscanAverageCount)
+		.def_readwrite("continuous", &ope::ProcessorConfiguration::ProcessingParameters::FixedPatternNoise::continuous)
+		.def_readwrite("useCustomProfile", &ope::ProcessorConfiguration::ProcessingParameters::FixedPatternNoise::useCustomProfile);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Background>(m, "ProcessingBackground")
 		.def(py::init<>())
-		.def_readwrite("background_removal", &ope::ProcessorConfiguration::PostProcessingParameters::backgroundRemoval)
-		.def_readwrite("background_weight", &ope::ProcessorConfiguration::PostProcessingParameters::backgroundWeight)
-		.def_readwrite("background_offset", &ope::ProcessorConfiguration::PostProcessingParameters::backgroundOffset)
-		.def_readwrite("log_scaling", &ope::ProcessorConfiguration::PostProcessingParameters::logScaling)
-		.def_readwrite("grayscale_max", &ope::ProcessorConfiguration::PostProcessingParameters::grayscaleMax)
-		.def_readwrite("grayscale_min", &ope::ProcessorConfiguration::PostProcessingParameters::grayscaleMin)
-		.def_readwrite("addend", &ope::ProcessorConfiguration::PostProcessingParameters::addend)
-		.def_readwrite("multiplicator", &ope::ProcessorConfiguration::PostProcessingParameters::multiplicator)
-		.def_readwrite("bscan_flip", &ope::ProcessorConfiguration::PostProcessingParameters::bscanFlip)
-		.def_readwrite("sinusoidal_scan_correction", &ope::ProcessorConfiguration::PostProcessingParameters::sinusoidalScanCorrection)
-		.def_readwrite("fixed_pattern_noise_removal", &ope::ProcessorConfiguration::PostProcessingParameters::fixedPatternNoiseRemoval)
-		.def_readwrite("fixed_pattern_noise_bscan_count", &ope::ProcessorConfiguration::PostProcessingParameters::fixedPatternNoiseBscanCount)
-		.def_readwrite("continuous_fixed_pattern_noise_determination", &ope::ProcessorConfiguration::PostProcessingParameters::continuousFixedPatternNoiseDetermination);
-	
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::Background::enabled)
+		.def_readwrite("weight", &ope::ProcessorConfiguration::ProcessingParameters::Background::weight)
+		.def_readwrite("offset", &ope::ProcessorConfiguration::ProcessingParameters::Background::offset)
+		.def_readwrite("useCustomProfile", &ope::ProcessorConfiguration::ProcessingParameters::Background::useCustomProfile);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Intensity>(m, "ProcessingIntensity")
+		.def(py::init<>())
+		.def_readwrite("logScale", &ope::ProcessorConfiguration::ProcessingParameters::Intensity::logScale)
+		.def_readwrite("rangeMin", &ope::ProcessorConfiguration::ProcessingParameters::Intensity::rangeMin)
+		.def_readwrite("rangeMax", &ope::ProcessorConfiguration::ProcessingParameters::Intensity::rangeMax)
+		.def_readwrite("preScale", &ope::ProcessorConfiguration::ProcessingParameters::Intensity::preScale)
+		.def_readwrite("postOffset", &ope::ProcessorConfiguration::ProcessingParameters::Intensity::postOffset);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Geometry>(m, "ProcessingGeometry")
+		.def(py::init<>())
+		.def_readwrite("alternatingBscanFlip", &ope::ProcessorConfiguration::ProcessingParameters::Geometry::alternatingBscanFlip)
+		.def_readwrite("sinusoidalCorrection", &ope::ProcessorConfiguration::ProcessingParameters::Geometry::sinusoidalCorrection);
+
+	// ProcessingParameters main struct
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters>(m, "ProcessingParameters")
+		.def(py::init<>())
+		.def_readwrite("input", &ope::ProcessorConfiguration::ProcessingParameters::input)
+		.def_readwrite("dcRemoval", &ope::ProcessorConfiguration::ProcessingParameters::dcRemoval)
+		.def_readwrite("resampling", &ope::ProcessorConfiguration::ProcessingParameters::resampling)
+		.def_readwrite("windowing", &ope::ProcessorConfiguration::ProcessingParameters::windowing)
+		.def_readwrite("dispersion", &ope::ProcessorConfiguration::ProcessingParameters::dispersion)
+		.def_readwrite("fixedPatternNoise", &ope::ProcessorConfiguration::ProcessingParameters::fixedPatternNoise)
+		.def_readwrite("background", &ope::ProcessorConfiguration::ProcessingParameters::background)
+		.def_readwrite("intensity", &ope::ProcessorConfiguration::ProcessingParameters::intensity)
+		.def_readwrite("geometry", &ope::ProcessorConfiguration::ProcessingParameters::geometry);
+
 	// ============================================
 	// CONFIGURATION CLASS
 	// ============================================
 	
 	py::class_<ope::ProcessorConfiguration>(m, "ProcessorConfiguration")
 		.def(py::init<>())
-		.def_readwrite("data", &ope::ProcessorConfiguration::dataParams)
-		.def_readwrite("resampling", &ope::ProcessorConfiguration::resamplingParams)
-		.def_readwrite("windowing", &ope::ProcessorConfiguration::windowingParams)
-		.def_readwrite("dispersion", &ope::ProcessorConfiguration::dispersionParams)
-		.def_readwrite("background_removal", &ope::ProcessorConfiguration::backgroundRemovalParams)
-		.def_readwrite("post_processing", &ope::ProcessorConfiguration::postProcessingParams)
-		// Custom curve methods
-		.def("set_custom_resampling_curve", [](ope::ProcessorConfiguration& self, py::array_t<float> curve) {
-			py::buffer_info buf = curve.request();
-			self.setCustomResamplingCurve(static_cast<float*>(buf.ptr), buf.size);
+		// Nested structure API
+		.def_readwrite("dataParams", &ope::ProcessorConfiguration::dataParams)
+		.def_readwrite("processingParams", &ope::ProcessorConfiguration::processingParams)
+
+		// Vector-based curve methods
+		.def("setResamplingLut", [](ope::ProcessorConfiguration& self, const std::vector<float>& data) {
+			self.setResamplingLut(data);
 		})
-		.def("set_custom_window_curve", [](ope::ProcessorConfiguration& self, py::array_t<float> curve) {
-			py::buffer_info buf = curve.request();
-			self.setCustomWindowCurve(static_cast<float*>(buf.ptr), buf.size);
+		.def("setWindowFunction", [](ope::ProcessorConfiguration& self, const std::vector<float>& data) {
+			self.setWindowFunction(data);
 		})
-		.def("set_custom_dispersion_curve", [](ope::ProcessorConfiguration& self, py::array_t<float> curve) {
-			py::buffer_info buf = curve.request();
-			self.setCustomDispersionCurve(static_cast<float*>(buf.ptr), buf.size);
+		.def("setDispersionPhase", [](ope::ProcessorConfiguration& self, const std::vector<float>& data) {
+			self.setDispersionPhase(data);
 		})
-		.def("get_custom_resampling_curve", [](const ope::ProcessorConfiguration& self) -> py::array_t<float> {
-			if (!self.hasCustomResamplingCurve()) return py::array_t<float>(0);
-			size_t size = self.getCustomResamplingCurveSize();
-			const float* data = self.getCustomResamplingCurve();
-			return py::array_t<float>(size, data);
+		.def("setBackgroundProfile", [](ope::ProcessorConfiguration& self, const std::vector<float>& data) {
+			self.setBackgroundProfile(data);
 		})
-		.def("get_custom_window_curve", [](const ope::ProcessorConfiguration& self) -> py::array_t<float> {
-			if (!self.hasCustomWindowCurve()) return py::array_t<float>(0);
-			size_t size = self.getCustomWindowCurveSize();
-			const float* data = self.getCustomWindowCurve();
-			return py::array_t<float>(size, data);
+		.def("setFixedPatternNoiseProfile", [](ope::ProcessorConfiguration& self, const std::vector<float>& data) {
+			self.setFixedPatternNoiseProfile(data);
 		})
-		.def("get_custom_dispersion_curve", [](const ope::ProcessorConfiguration& self) -> py::array_t<float> {
-			if (!self.hasCustomDispersionCurve()) return py::array_t<float>(0);
-			size_t size = self.getCustomDispersionCurveSize();
-			const float* data = self.getCustomDispersionCurve();
-			return py::array_t<float>(size, data);
-		})
-		.def("has_custom_resampling_curve", &ope::ProcessorConfiguration::hasCustomResamplingCurve)
-		.def("has_custom_window_curve", &ope::ProcessorConfiguration::hasCustomWindowCurve)
-		.def("has_custom_dispersion_curve", &ope::ProcessorConfiguration::hasCustomDispersionCurve)
-		.def("save_to_file", &ope::ProcessorConfiguration::saveToFile)
-		.def("load_from_file", &ope::ProcessorConfiguration::loadFromFile)
+
+		.def("getResamplingLut", &ope::ProcessorConfiguration::getResamplingLut)
+		.def("getWindowFunction", &ope::ProcessorConfiguration::getWindowFunction)
+		.def("getDispersionPhase", &ope::ProcessorConfiguration::getDispersionPhase)
+		.def("getBackgroundProfile", &ope::ProcessorConfiguration::getBackgroundProfile)
+		.def("getFixedPatternNoiseProfile", &ope::ProcessorConfiguration::getFixedPatternNoiseProfile)
+
+		// Generate curves
+		.def("generateResamplingLut", &ope::ProcessorConfiguration::generateResamplingLut)
+		.def("generateWindowFunction", &ope::ProcessorConfiguration::generateWindowFunction)
+		.def("generateDispersionPhase", &ope::ProcessorConfiguration::generateDispersionPhase)
+
+		// Clear curves
+		.def("clearResamplingLut", &ope::ProcessorConfiguration::clearResamplingLut)
+		.def("clearWindowFunction", &ope::ProcessorConfiguration::clearWindowFunction)
+		.def("clearDispersionPhase", &ope::ProcessorConfiguration::clearDispersionPhase)
+		.def("clearBackgroundProfile", &ope::ProcessorConfiguration::clearBackgroundProfile)
+		.def("clearFixedPatternNoiseProfile", &ope::ProcessorConfiguration::clearFixedPatternNoiseProfile)
+
+		// Adjust curves when dimensions change
+		.def("adjustAllCustomCurves", &ope::ProcessorConfiguration::adjustAllCustomCurves)
+
+		// Check if custom curves are set
+		.def("hasCustomResamplingCurve", &ope::ProcessorConfiguration::hasCustomResamplingCurve)
+		.def("hasCustomWindowCurve", &ope::ProcessorConfiguration::hasCustomWindowCurve)
+		.def("hasCustomDispersionCurve", &ope::ProcessorConfiguration::hasCustomDispersionCurve)
+		.def("hasCustomPostProcessBackgroundProfile", &ope::ProcessorConfiguration::hasCustomPostProcessBackgroundProfile)
+		.def("hasCustomFixedPatternNoiseProfile", &ope::ProcessorConfiguration::hasCustomFixedPatternNoiseProfile)
+
+		// File I/O with modes
+		.def("saveToFile", &ope::ProcessorConfiguration::saveToFile,
+			py::arg("filepath"),
+			py::arg("mode") = ope::ProcessorConfiguration::SaveMode::COMPLETE)
+		.def("loadFromFile", &ope::ProcessorConfiguration::loadFromFile,
+			py::arg("filepath"),
+			py::arg("mode") = ope::ProcessorConfiguration::LoadMode::OVERWRITE_ALL)
+
+		// CSV export/import for curves
+		.def("saveResamplingLutToFile", &ope::ProcessorConfiguration::saveResamplingLutToFile)
+		.def("loadResamplingLutFromFile", &ope::ProcessorConfiguration::loadResamplingLutFromFile)
+		.def("saveWindowFunctionToFile", &ope::ProcessorConfiguration::saveWindowFunctionToFile)
+		.def("loadWindowFunctionFromFile", &ope::ProcessorConfiguration::loadWindowFunctionFromFile)
+		.def("saveDispersionPhaseToFile", &ope::ProcessorConfiguration::saveDispersionPhaseToFile)
+		.def("loadDispersionPhaseFromFile", &ope::ProcessorConfiguration::loadDispersionPhaseFromFile)
+		.def("saveBackgroundProfileToFile", &ope::ProcessorConfiguration::saveBackgroundProfileToFile)
+		.def("loadBackgroundProfileFromFile", &ope::ProcessorConfiguration::loadBackgroundProfileFromFile)
+		.def("saveFixedPatternNoiseProfileToFile", &ope::ProcessorConfiguration::saveFixedPatternNoiseProfileToFile)
+		.def("loadFixedPatternNoiseProfileFromFile", &ope::ProcessorConfiguration::loadFixedPatternNoiseProfileFromFile)
+
+		// Validation
 		.def("validate", &ope::ProcessorConfiguration::validate);
 	
 	// ============================================

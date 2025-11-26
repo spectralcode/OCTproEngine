@@ -2,6 +2,7 @@
 #define OPE_PROCESSORCONFIGURATION_H
 
 #include <string>
+#include <vector>
 #include <map>
 #include "types.h"
 #include "export.h"
@@ -32,150 +33,106 @@ enum class WindowType {
 
 class OPE_API ProcessorConfiguration {
 public:
+	// === DATA PARAMETERS ===
 	struct OPE_API DataParameters {
-		int signalLength;
-		int samplesPerBuffer;
-		int ascansPerBscan;
-		int bscansPerBuffer;
-		DataType inputDataType;
-		DataType outputDataType;  // Data type of processed output (FLOAT, UINT16, UINT8, etc.)
-		int outputSignalLength;    // Signal length after processing (currently signalLength/2 due to truncate step)
-		int buffersPerVolume;      // Number of buffers per volume (for volume-synchronized recording)
-		bool bitshift;
+		int signalLength = 1024;
+		int ascansPerBscan = 512;
+		int bscansPerBuffer = 1;
+		int buffersPerVolume = 1;
+		DataType inputDataType = DataType::UINT16;
+		DataType outputDataType = DataType::FLOAT32;
 
+		// Computed properties
+		int samplesPerBuffer() const {
+			return signalLength * ascansPerBscan * bscansPerBuffer;
+		}
+		int outputSignalLength() const {
+			return signalLength / 2;
+		}
 		int getBitDepth() const {
-			return getDataTypeBitDepth(this->inputDataType);
+			return getDataTypeBitDepth(inputDataType);
 		}
-
 		int getBytesPerSample() const {
-			return getDataTypeByteSize(this->inputDataType);
+			return getDataTypeByteSize(inputDataType);
 		}
-
 		int getOutputBytesPerSample() const {
-			return getDataTypeByteSize(this->outputDataType);
+			return getDataTypeByteSize(outputDataType);
 		}
+	} dataParams;
 
-		DataParameters()
-			: signalLength(1024)
-			, samplesPerBuffer(1024 * 512)
-			, ascansPerBscan(512)
-			, bscansPerBuffer(1)
-			, inputDataType(DataType::UINT16)
-			, outputDataType(DataType::FLOAT32)  // Default to FLOAT32
-			, outputSignalLength(512)  // Default: signalLength/2 (truncate step)
-			, buffersPerVolume(1)  // Default: 1 buffer = 1 volume
-			, bitshift(false)
-		{}
-	};
-	
-	struct OPE_API ResamplingParameters {
-		bool enabled;
-		InterpolationMethod interpolationMethod;
-		bool useCoefficients;
-		float coefficients[4];  // c0, c1, c2, c3
-		bool useCustomCurve;
-		
-		ResamplingParameters()
-			: enabled(false)
-			, interpolationMethod(InterpolationMethod::LINEAR)
-			, useCoefficients(true)
-			, useCustomCurve(false)
-		{
-			coefficients[0] = 0.0f;
-			coefficients[1] = 1.0f;
-			coefficients[2] = 0.0f;
-			coefficients[3] = 0.0f;
-		}
-	};
-	
-	struct OPE_API WindowingParameters {
-		bool enabled;
-		WindowType windowType;
-		float windowCenterPosition;
-		float windowFillFactor;
-		bool useCustomCurve;
-	
-		WindowingParameters()
-			: enabled(false)
-			, windowType(WindowType::HANN)
-			, windowCenterPosition(0.5f)
-			, windowFillFactor(0.95f)
-			, useCustomCurve(false)
-		{}
-	};
-	
-	struct OPE_API DispersionCompensationParameters {
-		bool enabled;
-		bool useCoefficients;
-		float coefficients[4];  // d0, d1, d2, d3
-		float factor;
-		bool useCustomCurve;
-		
-		DispersionCompensationParameters()
-			: enabled(false)
-			, useCoefficients(true)
-			, factor(1.0f)
-			, useCustomCurve(false)
-		{
-			coefficients[0] = 0.0f;
-			coefficients[1] = 0.0f;
-			coefficients[2] = 0.0f;
-			coefficients[3] = 0.0f;
-		}
-	};
-	
-	struct OPE_API BackgroundRemovalParameters {
-		bool enabled;
-		int rollingAverageWindowSize;
-		
-		BackgroundRemovalParameters()
-			: enabled(false)
-			, rollingAverageWindowSize(64)
-		{}
-	};
-	
-	struct OPE_API PostProcessingParameters {
-		bool backgroundRemoval;
-		float backgroundWeight;
-		float backgroundOffset;
-		
-		bool logScaling;
-		float grayscaleMax;
-		float grayscaleMin;
-		float addend;
-		float multiplicator;
-		
-		bool bscanFlip;
-		bool sinusoidalScanCorrection;
-		
-		bool fixedPatternNoiseRemoval;
-		int fixedPatternNoiseBscanCount;
-		bool continuousFixedPatternNoiseDetermination;
-		
-		PostProcessingParameters()
-			: backgroundRemoval(false)
-			, backgroundWeight(1.0f)
-			, backgroundOffset(0.0f)
-			, logScaling(true)
-			, grayscaleMax(100.0f)
-			, grayscaleMin(30.0f)
-			, addend(0.0f)
-			, multiplicator(1.0f)
-			, bscanFlip(false)
-			, sinusoidalScanCorrection(false)
-			, fixedPatternNoiseRemoval(false)
-			, fixedPatternNoiseBscanCount(1)
-			, continuousFixedPatternNoiseDetermination(false)
-		{}
-	};
-	
-	DataParameters dataParams;
-	ResamplingParameters resamplingParams;
-	WindowingParameters windowingParams;
-	DispersionCompensationParameters dispersionParams;
-	BackgroundRemovalParameters backgroundRemovalParams;
-	PostProcessingParameters postProcessingParams;
-	
+	// === PROCESSING PARAMETERS ===
+	struct OPE_API ProcessingParameters {
+
+		// Input preprocessing
+		struct OPE_API Input {
+			bool bitshift = false;
+			// todo: maybe add zero-padding and/or upsampling options 
+		} input;
+
+		// DC removal (ues rolling average with specified window size)
+		struct OPE_API DCRemoval {
+			bool enabled = false;
+			int windowSize = 64;
+		} dcRemoval;
+
+		// k-linearization / resampling
+		struct OPE_API Resampling {
+			bool enabled = false;
+			InterpolationMethod method = InterpolationMethod::LINEAR;
+			float coefficients[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+			bool useCustomLut = false;
+		} resampling;
+
+		// Windowing / apodization
+		struct OPE_API Windowing {
+			bool enabled = false;
+			WindowType type = WindowType::HANN;
+			float centerPosition = 0.5f;
+			float fillFactor = 0.95f;
+			bool useCustomFunction = false;
+		} windowing;
+
+		// Dispersion compensation
+		struct OPE_API Dispersion {
+			bool enabled = false;
+			float coefficients[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			float factor = 1.0f; //todo: remove? this was initially intended to easily switch dispersion correction between positive +1.0 and negative -1.0 side (complex conjugate artifact). but with the non-optional truncation step this seems unnecessary.
+			bool useCustomPhase = false;
+		} dispersion;
+
+		// Fixed pattern noise removal
+		struct OPE_API FixedPatternNoise {
+			bool enabled = false;
+			int bscanAverageCount = 1;
+			bool continuous = false;
+			bool useCustomProfile = false;
+		} fixedPatternNoise;
+
+		// Background subtraction (post-FFT)
+		struct OPE_API Background {
+			bool enabled = false;
+			float weight = 1.0f;
+			float offset = 0.0f;
+			bool useCustomProfile = false;
+		} background;
+
+		// Intensity mapping
+		struct OPE_API Intensity {
+			bool logScale = true;
+			float rangeMin = 30.0f;     // Min dB value
+			float rangeMax = 100.0f;     // Max dB value
+			float preScale = 1.0f;       // Applied before log //todo: remove? rangeMin and rangeMax should be enough
+			float postOffset = 0.0f;     // Added after scaling //todo: remove? rangeMin and rangeMax should be enough
+		} intensity;
+
+		// Geometry corrections
+		struct OPE_API Geometry {
+			bool alternatingBscanFlip = false;  // Flip every second B-scan (for bidirectional scanning)
+			bool sinusoidalCorrection = false;  // Correct for sinusoidal scan pattern
+		} geometry;
+
+	} processingParams;
+
 	// Constructor and Rule of 5
 	ProcessorConfiguration();
 	~ProcessorConfiguration();
@@ -183,66 +140,79 @@ public:
 	ProcessorConfiguration(ProcessorConfiguration&& other) noexcept;
 	ProcessorConfiguration& operator=(const ProcessorConfiguration& other);
 	ProcessorConfiguration& operator=(ProcessorConfiguration&& other) noexcept;
-	
-	void setCustomResamplingCurve(const float* data, size_t size);
-	void setCustomWindowCurve(const float* data, size_t size);
-	void setCustomDispersionCurve(const float* data, size_t size);
-	void setCustomPostProcessBackgroundProfile(const float* data, size_t size); //todo: think about removing "custom" from background subtraction methods.  
-	void setCustomFixedPatternNoiseProfile(const float* data, size_t complexPairs);
 
-	const float* getCustomResamplingCurve() const;
-	const float* getCustomWindowCurve() const;
-	const float* getCustomDispersionCurve() const;
-	const float* getCustomPostProcessBackgroundProfile() const;
-	const float* getCustomFixedPatternNoiseProfile() const;
-	
-	size_t getCustomResamplingCurveSize() const;
-	size_t getCustomWindowCurveSize() const;
-	size_t getCustomDispersionCurveSize() const;
-	size_t getCustomPostProcessBackgroundProfileSize() const;
-	size_t getCustomFixedPatternNoiseProfileSize() const;
+	// === CUSTOM DATA MANAGEMENT ===
+	// Set custom curves (automatically adjusts to signalLength)
+	void setResamplingLut(const std::vector<float>& data);
+	void setWindowFunction(const std::vector<float>& data);
+	void setDispersionPhase(const std::vector<float>& data);
+	void setBackgroundProfile(const std::vector<float>& data);
+	void setFixedPatternNoiseProfile(const std::vector<float>& complexPairs);
 
+	// Get custom curves (returns adjusted data, empty if not set)
+	std::vector<float> getResamplingLut() const;
+	std::vector<float> getWindowFunction() const;
+	std::vector<float> getDispersionPhase() const;
+	std::vector<float> getBackgroundProfile() const;
+	std::vector<float> getFixedPatternNoiseProfile() const;
+
+	// Generate curves from parameters
+	std::vector<float> generateResamplingLut() const;
+	std::vector<float> generateWindowFunction() const;
+	std::vector<float> generateDispersionPhase() const;
+
+	// Clear custom data
+	void clearResamplingLut();
+	void clearWindowFunction();
+	void clearDispersionPhase();
+	void clearBackgroundProfile();
+	void clearFixedPatternNoiseProfile();
+
+	// === FILE I/O ===
+	enum class LoadMode {
+		OVERWRITE_ALL,       // Replace everything including custom data
+		PARAMETERS_ONLY,     // Keep current custom data, load only parameters
+		MERGE_IF_MISSING     // Load custom data only if current is empty
+	};
+
+	enum class SaveMode {
+		PARAMETERS_ONLY,     // Save only parameters to INI
+		COMPLETE            // Save parameters + custom data in INI
+	};
+
+	bool saveToFile(const std::string& filepath, SaveMode mode = SaveMode::COMPLETE) const;
+	bool loadFromFile(const std::string& filepath, LoadMode mode = LoadMode::OVERWRITE_ALL);
+
+	// CSV export/import for individual curves
+	bool saveResamplingLutToFile(const std::string& filepath) const;
+	bool loadResamplingLutFromFile(const std::string& filepath);
+	bool saveWindowFunctionToFile(const std::string& filepath) const;
+	bool loadWindowFunctionFromFile(const std::string& filepath);
+	bool saveDispersionPhaseToFile(const std::string& filepath) const;
+	bool loadDispersionPhaseFromFile(const std::string& filepath);
+	bool saveBackgroundProfileToFile(const std::string& filepath) const;
+	bool loadBackgroundProfileFromFile(const std::string& filepath);
+	bool saveFixedPatternNoiseProfileToFile(const std::string& filepath) const;
+	bool loadFixedPatternNoiseProfileFromFile(const std::string& filepath);
+
+	// Validation
+	bool validate() const;
+
+	// === UTILITY METHODS ===
+	// Check if custom curves are set
 	bool hasCustomResamplingCurve() const;
 	bool hasCustomWindowCurve() const;
 	bool hasCustomDispersionCurve() const;
 	bool hasCustomPostProcessBackgroundProfile() const;
 	bool hasCustomFixedPatternNoiseProfile() const;
 
-	const float* getGeneratedResamplingCurve() const;
-	const float* getGeneratedWindowCurve() const;
-	const float* getGeneratedDispersionCurve() const;
-	
-	size_t getGeneratedResamplingCurveSize() const;
-	size_t getGeneratedWindowCurveSize() const;
-	size_t getGeneratedDispersionCurveSize() const;
-	
-	
-	void adjustAllCustomCurves(); // call after changing signalLength
-	
-	bool saveToFile(const std::string& filepath) const;
-	bool loadFromFile(const std::string& filepath);
-	bool validate() const;
+	void adjustAllCustomCurves();
 
 private:
+	void ioFields(std::map<std::string, std::string>& m, bool saving, SaveMode saveMode, LoadMode loadMode);
+
 	struct Impl;
 	Impl* impl;
-	
-	void generateResamplingCurve() const;
-	void generateWindowCurve() const;
-	void generateDispersionCurve() const;
-	
-	void adjustCustomResamplingCurve();
-	void adjustCustomWindowCurve();
-	void adjustCustomDispersionCurve();
-	void adjustCustomPostProcessBackgroundProfile();
-	void adjustCustomFixedPatternNoiseProfile();
-
-	void ioFields(std::map<std::string, std::string>& m, bool saving);
-	
-	template<typename T>
-	T clamp(T value, T min, T max) const {
-		return (value < min) ? min : ((value > max) ? max : value);
-	}
 };
 
 } // namespace ope

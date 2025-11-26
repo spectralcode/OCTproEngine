@@ -32,7 +32,7 @@ const float WINDOW_FILL_FACTOR = 0.85f;
 bool allTestsPassed = true;
 int testCounter = 0;
 
-// Helper macros
+// Helper macros //todo: move to test_utils.h and standardize all cpp tests. maybe a "continue on failure" style (like the tests in this file) is better than immediate exit through exceptions thrown by TEST_ASSERT macros (like in most other tests)?
 #define TEST_SECTION(name) \
 	std::cout << "\n========================================" << std::endl; \
 	std::cout << "TEST SECTION " << (++testCounter) << ": " << name << std::endl; \
@@ -236,18 +236,18 @@ int main() {
 	ASSERT_TRUE(config.hasCustomDispersionCurve(), "Custom dispersion curve is stored");
 	
 	// Verify sizes
-	ASSERT_EQUAL(config.getCustomResamplingCurveSize(), (size_t)SIGNAL_LENGTH, "Resampling curve size correct");
-	ASSERT_EQUAL(config.getCustomWindowCurveSize(), (size_t)SIGNAL_LENGTH, "Window curve size correct");
-	ASSERT_EQUAL(config.getCustomDispersionCurveSize(), (size_t)SIGNAL_LENGTH, "Dispersion curve size correct");
-	
+	ASSERT_EQUAL(config.getResamplingLut().size(), (size_t)SIGNAL_LENGTH, "Resampling curve size correct");
+	ASSERT_EQUAL(config.getWindowFunction().size(), (size_t)SIGNAL_LENGTH, "Window curve size correct");
+	ASSERT_EQUAL(config.getDispersionPhase().size(), (size_t)SIGNAL_LENGTH, "Dispersion curve size correct");
+
 	// Verify data matches
-	const float* retrievedResampling = config.getCustomResamplingCurve();
-	const float* retrievedWindow = config.getCustomWindowCurve();
-	const float* retrievedDispersion = config.getCustomDispersionCurve();
-	
-	bool resamplingMatch = std::equal(customResamplingCurve.begin(), customResamplingCurve.end(), retrievedResampling);
-	bool windowMatch = std::equal(customWindowCurve.begin(), customWindowCurve.end(), retrievedWindow);
-	bool dispersionMatch = std::equal(customDispersionCurve.begin(), customDispersionCurve.end(), retrievedDispersion);
+	const std::vector<float>& retrievedResampling = config.getResamplingLut();
+	const std::vector<float>& retrievedWindow = config.getWindowFunction();
+	const std::vector<float>& retrievedDispersion = config.getDispersionPhase();
+
+	bool resamplingMatch = std::equal(customResamplingCurve.begin(), customResamplingCurve.end(), retrievedResampling.begin());
+	bool windowMatch = std::equal(customWindowCurve.begin(), customWindowCurve.end(), retrievedWindow.begin());
+	bool dispersionMatch = std::equal(customDispersionCurve.begin(), customDispersionCurve.end(), retrievedDispersion.begin());
 	
 	ASSERT_TRUE(resamplingMatch, "Resampling curve data matches");
 	ASSERT_TRUE(windowMatch, "Window curve data matches");
@@ -282,14 +282,14 @@ int main() {
 	}
 	
 	processor2.setCustomResamplingCurve(tooSmallCurve.data(), tooSmallCurve.size());
-	
+
 	const ope::ProcessorConfiguration& config2 = processor2.getConfig();
-	size_t adjustedSize = config2.getCustomResamplingCurveSize();
-	
+	size_t adjustedSize = config2.getResamplingLut().size();
+
 	ASSERT_EQUAL(adjustedSize, (size_t)SIGNAL_LENGTH, "Too-small curve zero-padded to signalLength");
-	
-	const float* adjustedCurve = config2.getCustomResamplingCurve();
-	bool firstHalfMatches = std::equal(tooSmallCurve.begin(), tooSmallCurve.end(), adjustedCurve);
+
+	const std::vector<float>& adjustedCurve = config2.getResamplingLut();
+	bool firstHalfMatches = std::equal(tooSmallCurve.begin(), tooSmallCurve.end(), adjustedCurve.begin());
 	bool secondHalfZeros = true;
 	for (size_t i = tooSmallCurve.size(); i < SIGNAL_LENGTH; ++i) {
 		if (adjustedCurve[i] != 0.0f) {
@@ -308,12 +308,12 @@ int main() {
 	}
 	
 	processor2.setCustomWindowCurve(tooLargeCurve.data(), tooLargeCurve.size());
-	
-	size_t truncatedSize = config2.getCustomWindowCurveSize();
+
+	size_t truncatedSize = config2.getWindowFunction().size();
 	ASSERT_EQUAL(truncatedSize, (size_t)SIGNAL_LENGTH, "Too-large curve truncated to signalLength");
-	
-	const float* truncatedCurve = config2.getCustomWindowCurve();
-	bool truncatedMatches = std::equal(truncatedCurve, truncatedCurve + SIGNAL_LENGTH, tooLargeCurve.begin());
+
+	const std::vector<float>& truncatedCurve = config2.getWindowFunction();
+	bool truncatedMatches = std::equal(truncatedCurve.begin(), truncatedCurve.end(), tooLargeCurve.begin());
 	
 	ASSERT_TRUE(truncatedMatches, "First signalLength elements preserved in too-large curve");
 	
@@ -470,29 +470,29 @@ int main() {
 	processor5.setCustomResamplingCurve(originalSizeCurve.data(), originalSizeCurve.size());
 	
 	const ope::ProcessorConfiguration& config5 = processor5.getConfig();
-	ASSERT_EQUAL(config5.getCustomResamplingCurveSize(), (size_t)SIGNAL_LENGTH, 
+	ASSERT_EQUAL(config5.getResamplingLut().size(), (size_t)SIGNAL_LENGTH,
 	             "Initial curve size matches signalLength");
-	
+
 	// Change to smaller signalLength (should truncate)
 	int smallerLength = SIGNAL_LENGTH / 2;
 	processor5.setInputParameters(smallerLength, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, ope::DataType::UINT16);
-	
-	ASSERT_EQUAL(config5.getCustomResamplingCurveSize(), (size_t)smallerLength,
+
+	ASSERT_EQUAL(config5.getResamplingLut().size(), (size_t)smallerLength,
 	             "Curve truncated when signalLength decreased");
-	
-	const float* truncatedData = config5.getCustomResamplingCurve();
-	bool truncatedCorrect = std::equal(truncatedData, truncatedData + smallerLength, originalSizeCurve.begin());
+
+	const std::vector<float>& truncatedData = config5.getResamplingLut();
+	bool truncatedCorrect = std::equal(truncatedData.begin(), truncatedData.end(), originalSizeCurve.begin());
 	ASSERT_TRUE(truncatedCorrect, "Truncated curve data correct");
 	
 	// Change to larger signalLength (should zero-pad)
 	int largerLength = SIGNAL_LENGTH * 2;
 	processor5.setInputParameters(largerLength, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, ope::DataType::UINT16);
-	
-	ASSERT_EQUAL(config5.getCustomResamplingCurveSize(), (size_t)largerLength,
+
+	ASSERT_EQUAL(config5.getResamplingLut().size(), (size_t)largerLength,
 	             "Curve zero-padded when signalLength increased");
-	
-	const float* paddedData = config5.getCustomResamplingCurve();
-	bool originalDataPreserved = std::equal(originalSizeCurve.begin(), originalSizeCurve.end(), paddedData);
+
+	const std::vector<float>& paddedData = config5.getResamplingLut();
+	bool originalDataPreserved = std::equal(originalSizeCurve.begin(), originalSizeCurve.end(), paddedData.begin());
 	bool paddingZeros = true;
 	for (int i = SIGNAL_LENGTH; i < largerLength; ++i) {
 		if (paddedData[i] != 0.0f) {

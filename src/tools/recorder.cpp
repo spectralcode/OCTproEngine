@@ -145,7 +145,7 @@ void Recorder::allocateBuffers() {
 	                          config.dataParams.getBytesPerSample();
 
 
-	size_t newProcessedBufferSize = config.dataParams.outputSignalLength *
+	size_t newProcessedBufferSize = config.dataParams.outputSignalLength() *
 	                                config.dataParams.ascansPerBscan *
 	                                config.dataParams.bscansPerBuffer *
 	                                config.dataParams.getOutputBytesPerSample();

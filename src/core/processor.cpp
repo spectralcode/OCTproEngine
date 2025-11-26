@@ -130,69 +130,62 @@ public:
 
 	// Helper methods: Get appropriate curve based on flags
 	std::vector<float> getResamplingCurve() const {
-		if (this->config.resamplingParams.useCustomCurve && 
+		if (this->config.processingParams.resampling.useCustomLut &&
 		    this->config.hasCustomResamplingCurve()) {
-			const float* data = this->config.getCustomResamplingCurve();
-			size_t size = this->config.getCustomResamplingCurveSize();
-			return std::vector<float>(data, data + size);
+			return this->config.getResamplingLut();
 		}
-		const float* data = this->config.getGeneratedResamplingCurve();
-		size_t size = this->config.getGeneratedResamplingCurveSize();
-		return std::vector<float>(data, data + size);
+		return this->config.generateResamplingLut();
 	}
-	
+
 	std::vector<float> getWindowCurve() const {
-		if (this->config.windowingParams.useCustomCurve && 
+		if (this->config.processingParams.windowing.useCustomFunction &&
 		    this->config.hasCustomWindowCurve()) {
-			const float* data = this->config.getCustomWindowCurve();
-			size_t size = this->config.getCustomWindowCurveSize();
-			return std::vector<float>(data, data + size);
+			return this->config.getWindowFunction();
 		}
-		const float* data = this->config.getGeneratedWindowCurve();
-		size_t size = this->config.getGeneratedWindowCurveSize();
-		return std::vector<float>(data, data + size);
+		return this->config.generateWindowFunction();
 	}
-	
+
 	std::vector<float> getDispersionCurve() const {
-	const float* phaseData;
-	size_t phaseSize;
-	
-	if (this->config.dispersionParams.useCustomCurve && 
-	    this->config.hasCustomDispersionCurve()) {
-		phaseData = this->config.getCustomDispersionCurve();
-		phaseSize = this->config.getCustomDispersionCurveSize();
-	} else {
-		phaseData = this->config.getGeneratedDispersionCurve();
-		phaseSize = this->config.getGeneratedDispersionCurveSize();
+		if (this->config.processingParams.dispersion.useCustomPhase &&
+		    this->config.hasCustomDispersionCurve()) {
+			// Custom curve returns adjusted phase values, need to convert to complex
+			std::vector<float> phaseValues = this->config.getDispersionPhase();
+			size_t phaseSize = phaseValues.size();
+			std::vector<float> complexCurve(phaseSize * 2);
+			for (size_t i = 0; i < phaseSize; ++i) {
+				float phase = phaseValues[i];
+				complexCurve[i * 2] = std::cos(phase);
+				complexCurve[i * 2 + 1] = std::sin(phase);
+			}
+			return complexCurve;
+		}
+		// Generated curve is already in complex format
+		return this->config.generateDispersionPhase();
 	}
-	
-	// Convert phase values to complex format (cos/sin) for backend
-	std::vector<float> complexCurve(phaseSize * 2);
-	for (size_t i = 0; i < phaseSize; ++i) {
-		float phase = phaseData[i];
-		complexCurve[i * 2] = std::cos(phase);
-		complexCurve[i * 2 + 1] = std::sin(phase);
-	}
-	return complexCurve;
-}
 
 	// Backend update methods
 	void updateBackendResamplingCurve() {
 		if (!this->initialized) return;
 		std::vector<float> curve = this->getResamplingCurve();
-		this->backend->updateResamplingCurve(curve.data(), curve.size());
+		if (!curve.empty()) {
+			this->backend->updateResamplingCurve(curve.data(), curve.size());
+		}
 	}
-	
+
 	void updateBackendWindowCurve() {
 		if (!this->initialized) return;
 		std::vector<float> curve = this->getWindowCurve();
-		this->backend->updateWindowCurve(curve.data(), curve.size());
+		if (!curve.empty()) {
+			this->backend->updateWindowCurve(curve.data(), curve.size());
+		}
 	}
 	
 	void updateBackendDispersionCurve() {
 		if (!this->initialized) return;
 		std::vector<float> curve = this->getDispersionCurve();
-		this->backend->updateDispersionCurve(curve.data(), curve.size());
+		if (!curve.empty()) {
+			this->backend->updateDispersionCurve(curve.data(), curve.size());
+		}
 	}
 	
 	void updateAllBackendCurves() {
@@ -259,9 +252,9 @@ public:
 	bool needsReinit() const {
 		const auto& current = this->config.dataParams;
 		const auto& last = this->lastInitializedDataParams;
-		
+
 		return current.signalLength != last.signalLength ||
-		       current.samplesPerBuffer != last.samplesPerBuffer ||
+		       current.samplesPerBuffer() != last.samplesPerBuffer() ||
 		       current.ascansPerBscan != last.ascansPerBscan ||
 		       current.bscansPerBuffer != last.bscansPerBuffer;
 	}
@@ -307,7 +300,7 @@ void Processor::loadConfigurationFromFile(const std::string& filepath) {
 	if (!loadedConfig.loadFromFile(filepath)) {
 		throw std::runtime_error("Failed to load configuration from: " + filepath);
 	}
-	this->setConfig(loadedConfig); //todo: right now config file does not contain any arrays like background profile etc, when loading from file all arrays will be zeroed. maybe redesign?
+	this->setConfig(loadedConfig);
 }
 
 void Processor::saveConfigurationToFile(const std::string& filepath) const {
@@ -326,15 +319,19 @@ const ProcessorConfiguration& Processor::getConfig() const {
 
 void Processor::setConfig(const ProcessorConfiguration& config) {
 	// Check if buffer dimensions changed
-	bool dimensionsChanged = 
+	bool dimensionsChanged =
 		this->impl->config.dataParams.signalLength != config.dataParams.signalLength ||
-		this->impl->config.dataParams.samplesPerBuffer != config.dataParams.samplesPerBuffer ||
+		this->impl->config.dataParams.samplesPerBuffer() != config.dataParams.samplesPerBuffer() ||
 		this->impl->config.dataParams.ascansPerBscan != config.dataParams.ascansPerBscan ||
 		this->impl->config.dataParams.bscansPerBuffer != config.dataParams.bscansPerBuffer;
-	
+
 	// Copy the entire configuration (including custom curves)
 	this->impl->config = config;
-	
+
+	// Automatically adjust all custom curves to match the new dimensions
+	// This ensures curves are always the correct size without user intervention
+	this->impl->config.adjustAllCustomCurves();
+
 	// If initialized, handle backend updates
 	if (this->impl->initialized) {
 		if (dimensionsChanged) {
@@ -363,15 +360,13 @@ void Processor::setInputParameters(
 	this->impl->config.dataParams.signalLength = samplesPerRawAscan;
 	this->impl->config.dataParams.ascansPerBscan = ascansPerBscan;
 	this->impl->config.dataParams.bscansPerBuffer = bscansPerBuffer;
-	this->impl->config.dataParams.samplesPerBuffer = samplesPerRawAscan * ascansPerBscan * bscansPerBuffer;
 	this->impl->config.dataParams.inputDataType = type;
-	this->impl->config.dataParams.outputSignalLength = samplesPerRawAscan / 2; 	// currently truncate step always produces signalLength/2 processe samples. todo: make truncate optional and/or add zero-padding option that can increae samples per ascan
-
+	// samplesPerBuffer and outputSignalLength are computed properties now
 
 	// If signalLength changed, re-adjust all custom curves
 	if (samplesPerRawAscan != oldSignalLength) {
 		this->impl->config.adjustAllCustomCurves();
-		
+
 		// Update backend with new curves if initialized
 		if (this->impl->initialized) {
 			this->impl->updateAllBackendCurves();
@@ -404,13 +399,12 @@ void Processor::setBackend(Backend backend) {
 		// Get profiles from backend and update processor's config
 		const std::vector<float>& bgProfile = this->impl->backend->getPostProcessBackgroundProfile();
 		if (!bgProfile.empty()) {
-			this->impl->config.setCustomPostProcessBackgroundProfile(bgProfile.data(), bgProfile.size());
+			this->impl->config.setBackgroundProfile(bgProfile);
 		}
 
 		const std::vector<float>& fpnProfile = this->impl->backend->getFixedPatternNoiseProfile();
 		if (!fpnProfile.empty()) {
-			size_t complexPairs = fpnProfile.size() / 2;
-			this->impl->config.setCustomFixedPatternNoiseProfile(fpnProfile.data(), complexPairs);
+			this->impl->config.setFixedPatternNoiseProfile(fpnProfile);
 		}
 
 		// Clean up old backend
@@ -525,9 +519,8 @@ int Processor::getNumInputBuffers() const {
 // Resampling - Curve generation (needs backend call)
 
 void Processor::setResamplingCoefficients(const float coefficients[4]) {
-	std::copy(coefficients, coefficients + 4, this->impl->config.resamplingParams.coefficients);
-	this->impl->config.resamplingParams.useCoefficients = true;
-	this->impl->config.resamplingParams.useCustomCurve = false;
+	std::copy(coefficients, coefficients + 4, this->impl->config.processingParams.resampling.coefficients);
+	this->impl->config.processingParams.resampling.useCustomLut = false;
 	
 	this->impl->updateBackendResamplingCurve();
 }
@@ -536,14 +529,13 @@ void Processor::setCustomResamplingCurve(const float* curve, size_t length) {
 	if (!curve || length == 0) {
 		throw std::invalid_argument("Invalid custom resampling curve");
 	}
-	
-	// Store in config
-	this->impl->config.setCustomResamplingCurve(curve, length);
-	
+
+	// Store in config using new vector API
+	this->impl->config.setResamplingLut(std::vector<float>(curve, curve + length));
+
 	// Update config flags
-	this->impl->config.resamplingParams.useCustomCurve = true;
-	this->impl->config.resamplingParams.useCoefficients = false;
-	
+	this->impl->config.processingParams.resampling.useCustomLut = true;
+
 	// Update backend
 	this->impl->updateBackendResamplingCurve();
 }
@@ -553,11 +545,9 @@ void Processor::useCustomResamplingCurve(bool useCustom) {
 		if (!this->impl->config.hasCustomResamplingCurve()) {
 			throw std::runtime_error("No custom resampling curve set. Call setCustomResamplingCurve() first.");
 		}
-		this->impl->config.resamplingParams.useCustomCurve = true;
-		this->impl->config.resamplingParams.useCoefficients = false;
+		this->impl->config.processingParams.resampling.useCustomLut = true;
 	} else {
-		this->impl->config.resamplingParams.useCoefficients = true;
-		this->impl->config.resamplingParams.useCustomCurve = false;
+		this->impl->config.processingParams.resampling.useCustomLut = false;
 	}
 	
 	// Update backend
@@ -565,11 +555,11 @@ void Processor::useCustomResamplingCurve(bool useCustom) {
 }
 
 void Processor::enableResampling(bool enable) {
-	this->impl->config.resamplingParams.enabled = enable;
+	this->impl->config.processingParams.resampling.enabled = enable;
 }
 
 void Processor::setInterpolationMethod(InterpolationMethod method) {
-	this->impl->config.resamplingParams.interpolationMethod = method;
+	this->impl->config.processingParams.resampling.method = method;
 }
 
 // ============================================
@@ -577,10 +567,9 @@ void Processor::setInterpolationMethod(InterpolationMethod method) {
 // ============================================
 
 void Processor::setDispersionCoefficients(const float coefficients[4], float factor) {
-	std::copy(coefficients, coefficients + 4, this->impl->config.dispersionParams.coefficients);
-	this->impl->config.dispersionParams.factor = factor;
-	this->impl->config.dispersionParams.useCoefficients = true;
-	this->impl->config.dispersionParams.useCustomCurve = false;
+	std::copy(coefficients, coefficients + 4, this->impl->config.processingParams.dispersion.coefficients);
+	this->impl->config.processingParams.dispersion.factor = factor;
+	this->impl->config.processingParams.dispersion.useCustomPhase = false;
 	
 	this->impl->updateBackendDispersionCurve();
 }
@@ -589,14 +578,13 @@ void Processor::setCustomDispersionCurve(const float* curve, size_t length) {
 	if (!curve || length == 0) {
 		throw std::invalid_argument("Invalid custom dispersion curve");
 	}
-	
-	// Store in config (phase values)
-	this->impl->config.setCustomDispersionCurve(curve, length);
-	
+
+	// Store in config (phase values) using new vector API
+	this->impl->config.setDispersionPhase(std::vector<float>(curve, curve + length));
+
 	// Update config flags
-	this->impl->config.dispersionParams.useCustomCurve = true;
-	this->impl->config.dispersionParams.useCoefficients = false;
-	
+	this->impl->config.processingParams.dispersion.useCustomPhase = true;
+
 	// Update backend
 	this->impl->updateBackendDispersionCurve();
 }
@@ -606,11 +594,9 @@ void Processor::useCustomDispersionCurve(bool useCustom) {
 		if (!this->impl->config.hasCustomDispersionCurve()) {
 			throw std::runtime_error("No custom dispersion curve set. Call setCustomDispersionCurve() first.");
 		}
-		this->impl->config.dispersionParams.useCustomCurve = true;
-		this->impl->config.dispersionParams.useCoefficients = false;
+		this->impl->config.processingParams.dispersion.useCustomPhase = true;
 	} else {
-		this->impl->config.dispersionParams.useCoefficients = true;
-		this->impl->config.dispersionParams.useCustomCurve = false;
+		this->impl->config.processingParams.dispersion.useCustomPhase = false;
 	}
 	
 	// Update backend
@@ -618,7 +604,7 @@ void Processor::useCustomDispersionCurve(bool useCustom) {
 }
 
 void Processor::enableDispersionCompensation(bool enable) {
-	this->impl->config.dispersionParams.enabled = enable;
+	this->impl->config.processingParams.dispersion.enabled = enable;
 }
 
 // ============================================
@@ -627,10 +613,10 @@ void Processor::enableDispersionCompensation(bool enable) {
 
 void Processor::setWindowParameters(WindowType type, float centerPosition, float fillFactor) {
 	// Update config
-	this->impl->config.windowingParams.windowType = type;
-	this->impl->config.windowingParams.windowCenterPosition = centerPosition;
-	this->impl->config.windowingParams.windowFillFactor = fillFactor;
-	this->impl->config.windowingParams.useCustomCurve = false;
+	this->impl->config.processingParams.windowing.type = type;
+	this->impl->config.processingParams.windowing.centerPosition = centerPosition;
+	this->impl->config.processingParams.windowing.fillFactor = fillFactor;
+	this->impl->config.processingParams.windowing.useCustomFunction = false;
 	// Don't clear custom curve - keep it for later toggling!
 	
 	// Update backend
@@ -641,13 +627,13 @@ void Processor::setCustomWindowCurve(const float* curve, size_t length) {
 	if (!curve || length == 0) {
 		throw std::invalid_argument("Invalid custom window curve");
 	}
-	
-	// Store in config
-	this->impl->config.setCustomWindowCurve(curve, length);
-	
+
+	// Store in config using new vector API
+	this->impl->config.setWindowFunction(std::vector<float>(curve, curve + length));
+
 	// Update config flags
-	this->impl->config.windowingParams.useCustomCurve = true;
-	
+	this->impl->config.processingParams.windowing.useCustomFunction = true;
+
 	// Update backend
 	this->impl->updateBackendWindowCurve();
 }
@@ -657,9 +643,9 @@ void Processor::useCustomWindowCurve(bool useCustom) {
 		if (!this->impl->config.hasCustomWindowCurve()) {
 			throw std::runtime_error("No custom window curve set. Call setCustomWindowCurve() first.");
 		}
-		this->impl->config.windowingParams.useCustomCurve = true;
+		this->impl->config.processingParams.windowing.useCustomFunction = true;
 	} else {
-		this->impl->config.windowingParams.useCustomCurve = false;
+		this->impl->config.processingParams.windowing.useCustomFunction = false;
 	}
 	
 	// Update backend
@@ -667,47 +653,47 @@ void Processor::useCustomWindowCurve(bool useCustom) {
 }
 
 void Processor::enableWindowing(bool enable) {
-	this->impl->config.windowingParams.enabled = enable;
+	this->impl->config.processingParams.windowing.enabled = enable;
 }
 
 // Post-processing - Simple parameters (backend reads from config)
 
 void Processor::setGrayscaleRange(float min, float max) {
-	this->impl->config.postProcessingParams.grayscaleMin = min;
-	this->impl->config.postProcessingParams.grayscaleMax = max;
+	this->impl->config.processingParams.intensity.rangeMin = min;
+	this->impl->config.processingParams.intensity.rangeMax = max;
 }
 
 void Processor::setSignalMultiplicatorAndAddend(float multiplicator, float addend) {
-	this->impl->config.postProcessingParams.multiplicator = multiplicator;
-	this->impl->config.postProcessingParams.addend = addend;
+	this->impl->config.processingParams.intensity.preScale = multiplicator;
+	this->impl->config.processingParams.intensity.postOffset = addend;
 }
 
 void Processor::enableLogScaling(bool enable) {
-	this->impl->config.postProcessingParams.logScaling = enable;
+	this->impl->config.processingParams.intensity.logScale = enable;
 }
 
 // Background removal - Simple parameters (backend reads from config)
 
 void Processor::enableBackgroundRemoval(bool enable) {
-	this->impl->config.backgroundRemovalParams.enabled = enable;
+	this->impl->config.processingParams.dcRemoval.enabled = enable;
 }
 
 void Processor::setBackgroundRemovalWindowSize(int windowSize) {
-	this->impl->config.backgroundRemovalParams.rollingAverageWindowSize = windowSize;
+	this->impl->config.processingParams.dcRemoval.windowSize = windowSize;
 }
 
 // Other toggles - Simple flags (backend reads from config)
 
 void Processor::enableBscanFlip(bool enable) {
-	this->impl->config.postProcessingParams.bscanFlip = enable;
+	this->impl->config.processingParams.geometry.alternatingBscanFlip = enable;
 }
 
 void Processor::enableSinusoidalScanCorrection(bool enable) {
-	this->impl->config.postProcessingParams.sinusoidalScanCorrection = enable;
+	this->impl->config.processingParams.geometry.sinusoidalCorrection = enable;
 }
 
 void Processor::enableFixedPatternNoiseRemoval(bool enable) {
-	this->impl->config.postProcessingParams.fixedPatternNoiseRemoval = enable;
+	this->impl->config.processingParams.fixedPatternNoise.enabled = enable;
 
 	// Update backend config if initialized
 	if (this->impl->initialized) {
@@ -716,7 +702,7 @@ void Processor::enableFixedPatternNoiseRemoval(bool enable) {
 }
 
 void Processor::enablePostProcessBackgroundSubtraction(bool enable) {
-	this->impl->config.postProcessingParams.backgroundRemoval = enable;
+	this->impl->config.processingParams.background.enabled = enable;
 
 	// Update backend config if initialized
 	if (this->impl->initialized) {
@@ -736,14 +722,14 @@ void Processor::requestFixedPatternNoiseDetermination() {
 
 void Processor::setFixedPatternNoiseBscanCount(int numberOfBscans) {
 	if (numberOfBscans < 1) throw std::invalid_argument("numberOfBscans must be >= 1");
-	this->impl->config.postProcessingParams.fixedPatternNoiseBscanCount = numberOfBscans;
+	this->impl->config.processingParams.fixedPatternNoise.bscanAverageCount = numberOfBscans;
 	if (this->impl->initialized) {
 		this->impl->backend->updateConfig(this->impl->config);
 	}
 }
 
 void Processor::enableContinuousFixedPatternNoiseDetermination(bool enable) {
-	this->impl->config.postProcessingParams.continuousFixedPatternNoiseDetermination = enable;
+	this->impl->config.processingParams.fixedPatternNoise.continuous = enable;
 	if (this->impl->initialized) {
 		this->impl->backend->updateConfig(this->impl->config);
 	}
@@ -752,9 +738,10 @@ void Processor::enableContinuousFixedPatternNoiseDetermination(bool enable) {
 void Processor::setFixedPatternNoiseProfile(const float* data, size_t complexPairs) {
 	if (!data || complexPairs == 0) throw std::invalid_argument("Invalid fixed pattern noise profile");
 	
-	// Store in configuration (for metadata persistence)
-	this->impl->config.setCustomFixedPatternNoiseProfile(data, complexPairs);
-	
+	// Store in configuration (for metadata persistence) using new vector API
+	// Convert from raw pointer to vector (data contains interleaved real/imag, so size is complexPairs * 2)
+	this->impl->config.setFixedPatternNoiseProfile(std::vector<float>(data, data + complexPairs * 2));
+
 	// Update backend if initialized
 	if (this->impl->initialized) {
 		this->impl->backend->setFixedPatternNoiseProfile(data, complexPairs);
@@ -763,12 +750,14 @@ void Processor::setFixedPatternNoiseProfile(const float* data, size_t complexPai
 
 const float* Processor::getFixedPatternNoiseProfile() const {
 	// Get from config (single source of truth for recorded profiles)
-	return this->impl->config.getCustomFixedPatternNoiseProfile();
+	const std::vector<float>& profile = this->impl->config.getFixedPatternNoiseProfile();
+	return profile.empty() ? nullptr : profile.data();
 }
 
 size_t Processor::getFixedPatternNoiseProfileSize() const {
 	// Get from config (single source of truth for recorded profiles)
-	return this->impl->config.getCustomFixedPatternNoiseProfileSize(); // returns complex pairs
+	// Returns complex pairs (vector size / 2)
+	return this->impl->config.getFixedPatternNoiseProfile().size() / 2;
 }
 
 bool Processor::hasFixedPatternNoiseProfile() const {
@@ -778,14 +767,14 @@ bool Processor::hasFixedPatternNoiseProfile() const {
 
 void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) const {
 	// Get from config (single source of truth)
-	const float* profile = this->impl->config.getCustomFixedPatternNoiseProfile();
-	size_t size = this->impl->config.getCustomFixedPatternNoiseProfileSize() * 2; // convert pairs to float count
+	const std::vector<float>& profileVec = this->impl->config.getFixedPatternNoiseProfile();
 
-	if (!profile || size == 0) {
+	if (profileVec.empty()) {
 		throw std::runtime_error("No fixed pattern noise profile to save");
 	}
-	
-	size_t complexPairs = size / 2;
+
+	const float* profile = profileVec.data();
+	size_t complexPairs = profileVec.size() / 2;
 	std::ofstream file(filepath);
 	if (!file.is_open()) throw std::runtime_error("Failed to open file for writing: " + filepath);
 	file << "Sample Number;Real;Imag\n";
@@ -793,7 +782,7 @@ void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) 
 		file << i << ";" << profile[i*2] << ";" << profile[i*2+1] << "\n";
 	}
 	file.close();
-	
+
 	if (!file.good()) {
 		throw std::runtime_error("Error writing to file: " + filepath);
 	}
@@ -835,8 +824,8 @@ void Processor::loadFixedPatternNoiseProfileFromFile(const std::string& filepath
 }
 
 void Processor::setPostProcessBackgroundWeight(float weight) {
-	this->impl->config.postProcessingParams.backgroundWeight = weight;
-	
+	this->impl->config.processingParams.background.weight = weight;
+
 	// Update backend config (hot-swap)
 	if (this->impl->initialized) {
 		this->impl->backend->updateConfig(this->impl->config);
@@ -844,8 +833,8 @@ void Processor::setPostProcessBackgroundWeight(float weight) {
 }
 
 void Processor::setPostProcessBackgroundOffset(float offset) {
-	this->impl->config.postProcessingParams.backgroundOffset = offset;
-	
+	this->impl->config.processingParams.background.offset = offset;
+
 	// Update backend config (hot-swap)
 	if (this->impl->initialized) {
 		this->impl->backend->updateConfig(this->impl->config);
@@ -861,7 +850,8 @@ const float* Processor::getPostProcessBackgroundProfile() const {
 		}
 	}
 	// Fall back to config
-	return this->impl->config.getCustomPostProcessBackgroundProfile();
+	const std::vector<float>& profile = this->impl->config.getBackgroundProfile();
+	return profile.empty() ? nullptr : profile.data();
 }
 
 size_t Processor::getPostProcessBackgroundProfileSize() const {
@@ -873,7 +863,7 @@ size_t Processor::getPostProcessBackgroundProfileSize() const {
 		}
 	}
 	// Fall back to config
-	return this->impl->config.getCustomPostProcessBackgroundProfileSize();
+	return this->impl->config.getBackgroundProfile().size();
 }
 
 bool Processor::hasPostProcessBackgroundProfile() const {
@@ -892,25 +882,26 @@ void Processor::setPostProcessBackgroundProfile(const float* data, size_t size) 
 	if (!data || size == 0) {
 		throw std::invalid_argument("Invalid post-process background curve data");
 	}
-	
-	// Store in configuration (for metadata persistence)
-	this->impl->config.setCustomPostProcessBackgroundProfile(data, size);
-	
+
+	// Store in configuration (for metadata persistence) using new vector API
+	this->impl->config.setBackgroundProfile(std::vector<float>(data, data + size));
+
 	// Update backend if initialized
 	if (this->impl->initialized) {
 		this->impl->backend->setPostProcessBackgroundProfile(data, size);
 	}
 }
 
+//todo: use csvhelper here!
 void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepath) const {
-	// Get from config (single source of truth)
-	const float* curve = this->impl->config.getCustomPostProcessBackgroundProfile();
-	size_t size = this->impl->config.getCustomPostProcessBackgroundProfileSize();
+	const std::vector<float>& curveVec = this->impl->config.getBackgroundProfile();
 
-	if (!curve || size == 0) {
+	if (curveVec.empty()) {
 		throw std::runtime_error("No post-process background curve to save");
 	}
-	
+
+	const float* curve = curveVec.data();
+	size_t size = curveVec.size();
 	std::ofstream file(filepath);
 	if (!file.is_open()) {
 		throw std::runtime_error("Failed to open file for writing: " + filepath);
@@ -1124,7 +1115,8 @@ std::unique_ptr<BackendConfig> Processor::getBackendConfig() const {
 	return this->impl->backendConfig->clone();
 }
 
-void Processor::saveBackendConfigToFile(const std::string& filepath) const {
+//todo: use inihelper to save and load backend config
+void Processor::saveBackendConfigToFile(const std::string& filepath) const { 
 	std::ofstream file(filepath);
 	if (!file.is_open()) {
 		throw std::runtime_error("Failed to open file for writing: " + filepath);
@@ -1228,17 +1220,5 @@ void Processor::loadBackendConfigFromFile(const std::string& filepath) {
 		}
 	}
 }
-
-// NOTE: Old CUDA-specific methods removed - use setBackendConfig() instead
-// The following methods have been replaced by the unified backend configuration API:
-// - setCudaDevice, setCudaNumStreams, setCudaBlockSize
-// - getCudaDevice, getCudaNumStreams, getCudaBlockSize, getCudaGridSize
-// - saveCudaSettingsToFile, loadCudaSettingsFromFile
-//
-// Use setBackendConfig() with CudaConfig, OpenCLConfig, or CpuConfig instead.
-// Example:
-//   CudaConfig config;
-//   config.deviceId = 0;
-//   processor.setBackendConfig(config);
 
 } // namespace ope

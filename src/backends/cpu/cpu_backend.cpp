@@ -116,10 +116,7 @@ struct CpuBackend::Impl {
 
 		//sync recorded profile to configuration
 		if (!this->postProcessBackgroundProfile.empty()) {
-			this->config.setCustomPostProcessBackgroundProfile(
-				this->postProcessBackgroundProfile.data(),
-				this->postProcessBackgroundProfile.size()
-			);
+			this->config.setBackgroundProfile(this->postProcessBackgroundProfile);
 		}
 
 		this->postProcessBackgroundRecordingRequested = false;
@@ -144,7 +141,7 @@ struct CpuBackend::Impl {
 			}
 			
 			// Resize buffer if needed (only happens on first frame or config change)
-			size_t inputDataSize = this->config.dataParams.samplesPerBuffer * 
+			size_t inputDataSize = this->config.dataParams.samplesPerBuffer() *
 								(this->config.dataParams.getBitDepth() / 8);
 			if (this->processingBuffer.size() != inputDataSize) {
 				this->processingBuffer.resize(inputDataSize);
@@ -209,17 +206,17 @@ struct CpuBackend::Impl {
 			);
 			
 			// 2. Background removal (if enabled)
-			if (config.backgroundRemovalParams.enabled) {
+			if (config.processingParams.dcRemoval.enabled) {
 				cpu_kernels::rollingAverageDCRemoval<float>(
 					spectrum,
-					config.backgroundRemovalParams.rollingAverageWindowSize
+					config.processingParams.dcRemoval.windowSize
 				);
 			}
 			
 			// 3. K-linearization (if enabled)
 			std::vector<std::complex<float>> linearizedSpectrum = spectrum;
-			if (config.resamplingParams.enabled) {
-				switch (config.resamplingParams.interpolationMethod) {
+			if (config.processingParams.resampling.enabled) {
+				switch (config.processingParams.resampling.method) {
 					case InterpolationMethod::LINEAR:
 						cpu_kernels::kLinearizationLinear<float>(spectrum, this->resampleCurve, linearizedSpectrum);
 						break;
@@ -233,12 +230,12 @@ struct CpuBackend::Impl {
 			}
 			
 			// 4. Windowing (if enabled)
-			if (config.windowingParams.enabled) {
+			if (config.processingParams.windowing.enabled) {
 				cpu_kernels::applyWindow<float>(linearizedSpectrum, this->windowCurve);
 			}
 			
 			// 5. Dispersion compensation (if enabled)
-			if (config.dispersionParams.enabled) {
+			if (config.processingParams.dispersion.enabled) {
 				cpu_kernels::dispersionCompensation<float>(linearizedSpectrum, this->dispersionPhaseComplex);
 			}
 			
@@ -261,7 +258,7 @@ struct CpuBackend::Impl {
 
 			for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
 				std::vector<std::complex<float>>& ifftOutputRef = this->allIfftOutputs[ascanIdx];
-				if (config.postProcessingParams.fixedPatternNoiseRemoval && !this->recordedFixedPatternNoise.empty()) {
+				if (config.processingParams.fixedPatternNoise.enabled && !this->recordedFixedPatternNoise.empty()) {
 					const std::vector<float>& meanVec = this->recordedFixedPatternNoise;
 					if (!meanVec.empty()) {
 						cpu_kernels::meanALineSubtraction<float>(ifftOutputRef, meanVec);
@@ -269,24 +266,24 @@ struct CpuBackend::Impl {
 				}
 				// 8. Magnitude calculation, grayscale conversion, truncation
 				std::vector<float> processedAscan;
-				if (config.postProcessingParams.logScaling) {
+				if (config.processingParams.intensity.logScale) {
 					cpu_kernels::logScaleAndTruncate<float>(
 						ifftOutputRef,
 						processedAscan,
-						config.postProcessingParams.multiplicator,
-						config.postProcessingParams.grayscaleMin,
-						config.postProcessingParams.grayscaleMax,
-						config.postProcessingParams.addend,
-						(config.postProcessingParams.grayscaleMin == config.postProcessingParams.grayscaleMax)
+						config.processingParams.intensity.preScale,
+						config.processingParams.intensity.rangeMin,
+						config.processingParams.intensity.rangeMax,
+						config.processingParams.intensity.postOffset,
+						(config.processingParams.intensity.rangeMin == config.processingParams.intensity.rangeMax)
 					);
 				} else {
 					cpu_kernels::linearScaleAndTruncate<float>(
 						ifftOutputRef,
 						processedAscan,
-						config.postProcessingParams.multiplicator,
-						config.postProcessingParams.grayscaleMin,
-						config.postProcessingParams.grayscaleMax,
-						config.postProcessingParams.addend
+						config.processingParams.intensity.preScale,
+						config.processingParams.intensity.rangeMin,
+						config.processingParams.intensity.rangeMax,
+						config.processingParams.intensity.postOffset
 					);
 				}
 				// Copy to output
@@ -295,7 +292,7 @@ struct CpuBackend::Impl {
 			}
 
 			// 9. Post-process background profile subtraction
-		if (config.postProcessingParams.backgroundRemoval) {
+		if (config.processingParams.background.enabled) {
 			// Record background if requested (must happen BEFORE removal)
 			if (this->postProcessBackgroundRecordingRequested) {
 				this->recordPostProcessBackground(outputPtr, outputSamplesPerAscan, totalAscans);
@@ -306,8 +303,8 @@ struct CpuBackend::Impl {
 				cpu_kernels::applyPostProcessBackgroundSubtraction<float>(
 					outputPtr,
 					this->postProcessBackgroundProfile.data(),
-					config.postProcessingParams.backgroundWeight,
-					config.postProcessingParams.backgroundOffset,
+					config.processingParams.background.weight,
+					config.processingParams.background.offset,
 					outputSamplesPerAscan,
 					totalAscans
 				);
@@ -324,11 +321,11 @@ void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfig
 		this->accumulatedAscanCount++;
 	}
 
-	int requiredAscanCount = config.postProcessingParams.fixedPatternNoiseBscanCount *
+	int requiredAscanCount = config.processingParams.fixedPatternNoise.bscanAverageCount *
 							 config.dataParams.ascansPerBscan;
 
 	// Only compute when we have at least the required number of A-scans.
-	if (!(this->fixedPatternNoiseDeterminationRequested || config.postProcessingParams.continuousFixedPatternNoiseDetermination)) {
+	if (!(this->fixedPatternNoiseDeterminationRequested || config.processingParams.fixedPatternNoise.continuous)) {
 		return;
 	}
 	if (this->accumulatedAscanCount < requiredAscanCount) {
@@ -355,14 +352,11 @@ void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfig
 
 	//sync recorded profile to configuration
 	if (!this->recordedFixedPatternNoise.empty()) {
-		this->config.setCustomFixedPatternNoiseProfile(
-			this->recordedFixedPatternNoise.data(),
-			positivePairs
-		);
+		this->config.setFixedPatternNoiseProfile(this->recordedFixedPatternNoise);
 	}
 
 	// If continuous mode, keep the last requiredAscanCount A-scans as a sliding window.
-	if (config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
+	if (config.processingParams.fixedPatternNoise.continuous) {
 		if (this->accumulatedAscanCount > requiredAscanCount) {
 			// erase newer entries, keep the earliest ones
 			this->accumulatedIfftOutputs.erase(this->accumulatedIfftOutputs.begin() + requiredAscanCount,
@@ -417,18 +411,18 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	}
 	
 	// Allocate output buffers
-	size_t outputSize = (config.dataParams.samplesPerBuffer / 2) * sizeof(float);
-	
+	size_t outputSize = (config.dataParams.samplesPerBuffer() / 2) * sizeof(float);
+
 	if (!this->impl->outputBuffer1.allocateMemory(outputSize) ||
 		!this->impl->outputBuffer2.allocateMemory(outputSize)) {
 		throw std::runtime_error("Failed to allocate output buffers");
 	}
-	
+
 	this->impl->outputBuffer1.setDataType(IOBuffer::DataType::FLOAT32);
 	this->impl->outputBuffer2.setDataType(IOBuffer::DataType::FLOAT32);
-	
+
 	// Allocate input buffers
-	size_t inputSize = config.dataParams.samplesPerBuffer * (config.dataParams.getBytesPerSample());
+	size_t inputSize = config.dataParams.samplesPerBuffer() * (config.dataParams.getBytesPerSample());
 	//size_t inputSize = config.dataParams.samplesPerBuffer * sizeof(float);
 	this->impl->hostInputBuffers.resize(this->impl->numInputBuffers);
 	
@@ -448,14 +442,10 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
-		const float* profile = config.getCustomPostProcessBackgroundProfile();
-		size_t profileSize = config.getCustomPostProcessBackgroundProfileSize();
-		this->impl->postProcessBackgroundProfile.assign(profile, profile + profileSize);
+		this->impl->postProcessBackgroundProfile = config.getBackgroundProfile();
 	}
 	if (config.hasCustomFixedPatternNoiseProfile()) {
-		const float* profile = config.getCustomFixedPatternNoiseProfile();
-		size_t complexPairs = config.getCustomFixedPatternNoiseProfileSize();
-		this->impl->recordedFixedPatternNoise.assign(profile, profile + complexPairs * 2);
+		this->impl->recordedFixedPatternNoise = config.getFixedPatternNoiseProfile();
 	}
 
 	// Start processing thread

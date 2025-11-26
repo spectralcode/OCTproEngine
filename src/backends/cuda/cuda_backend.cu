@@ -290,26 +290,26 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
-		const float* profile = config.getCustomPostProcessBackgroundProfile();
-		size_t profileSize = config.getCustomPostProcessBackgroundProfileSize();
-		this->impl->recordedPostProcessBackground.assign(profile, profile + profileSize);
+		const std::vector<float>& profileVec = config.getBackgroundProfile();
+		this->impl->recordedPostProcessBackground = profileVec;
 		//copy to device
 		checkCudaErrors(cudaMemcpyAsync(
 			this->impl->d_postProcBackgroundLine,
-			profile,
-			profileSize * sizeof(float),
+			profileVec.data(),
+			profileVec.size() * sizeof(float),
 			cudaMemcpyHostToDevice,
 			this->impl->streams[0]));
 		checkCudaErrors(cudaStreamSynchronize(this->impl->streams[0]));
 	}
 	if (config.hasCustomFixedPatternNoiseProfile()) {
-		const float* profile = config.getCustomFixedPatternNoiseProfile();
-		size_t complexPairs = config.getCustomFixedPatternNoiseProfileSize();
-		this->impl->recordedFixedPatternNoise.resize(complexPairs * 2);
-		for (size_t i = 0; i < complexPairs; ++i) {
-			this->impl->recordedFixedPatternNoise[i*2] = profile[i*2];
-			this->impl->recordedFixedPatternNoise[i*2+1] = profile[i*2+1];
-		}
+		const std::vector<float>& profileVec = config.getFixedPatternNoiseProfile();
+		size_t complexPairs = profileVec.size() / 2;
+		this->impl->recordedFixedPatternNoise = profileVec;
+		// No need to copy - already have the vector
+		// for (size_t i = 0; i < complexPairs; ++i) {
+		// 	this->impl->recordedFixedPatternNoise[i*2] = profileVec[i*2];
+		// 	this->impl->recordedFixedPatternNoise[i*2+1] = profileVec[i*2+1];
+		// }
 		//copy to device
 		std::vector<cufftComplex> hostMean(this->impl->signalLength);
 		for (size_t i = 0; i < this->impl->signalLength; ++i) {
@@ -317,8 +317,8 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 			hostMean[i].y = 0.0f;
 		}
 		for (size_t i = 0; i < complexPairs; ++i) {
-			hostMean[i].x = profile[i*2];
-			hostMean[i].y = profile[i*2+1];
+			hostMean[i].x = profileVec[i*2];
+			hostMean[i].y = profileVec[i*2+1];
 		}
 		checkCudaErrors(cudaMemcpyAsync(
 			this->impl->d_meanALine,
@@ -540,7 +540,7 @@ void CudaBackend::process(IOBuffer& input) {
 	const int bscansPerBuffer = this->impl->bscansPerBuffer;
 	
 	// Step 1: Convert input to cufftComplex
-	if (config.dataParams.bitshift) {
+	if (config.processingParams.input.bitshift) {
 		cuda_kernels::inputToCufftComplex_and_bitshift<<<gridSize, blockSize, 0, stream>>>(
 			this->impl->d_fftBuffer,
 			d_input,
@@ -576,12 +576,12 @@ void CudaBackend::process(IOBuffer& input) {
 #endif
 	
 	// Step 2: Rolling average background removal
-	if (config.backgroundRemovalParams.enabled) {
-		int sharedMemSize = (blockSize + 2 * config.backgroundRemovalParams.rollingAverageWindowSize) * sizeof(float);
+	if (config.processingParams.dcRemoval.enabled) {
+		int sharedMemSize = (blockSize + 2 * config.processingParams.dcRemoval.windowSize) * sizeof(float);
 		cuda_kernels::rollingAverageBackgroundRemoval<<<gridSize, blockSize, sharedMemSize, stream>>>(
 			this->impl->d_inputLinearized,
 			this->impl->d_fftBuffer,
-			config.backgroundRemovalParams.rollingAverageWindowSize,
+			config.processingParams.dcRemoval.windowSize,
 			signalLength,
 			ascansPerBscan,
 			signalLength * ascansPerBscan,
@@ -597,10 +597,10 @@ void CudaBackend::process(IOBuffer& input) {
 	cufftComplex* d_fftBuffer2 = this->impl->d_fftBuffer;
 	
 	// Determine which fused kernel to use based on enabled features
-	bool resampling = config.resamplingParams.enabled;
-	bool windowing = config.windowingParams.enabled;
-	bool dispersion = config.dispersionParams.enabled;
-	InterpolationMethod interpMethod = config.resamplingParams.interpolationMethod;
+	bool resampling = config.processingParams.resampling.enabled;
+	bool windowing = config.processingParams.windowing.enabled;
+	bool dispersion = config.processingParams.dispersion.enabled;
+	InterpolationMethod interpMethod = config.processingParams.resampling.method;
 	
 	if (this->impl->d_inputLinearized != nullptr && resampling && windowing && dispersion) {
 		// K-linearization + windowing + dispersion (most common case)
@@ -688,13 +688,13 @@ void CudaBackend::process(IOBuffer& input) {
 	checkCufftErrors(cufftExecC2C(this->impl->fftPlan, d_fftBuffer2, d_fftBuffer2, CUFFT_INVERSE));
 	
 	// Step 5: Fixed-pattern noise removal
-	if (config.postProcessingParams.fixedPatternNoiseRemoval) {
+	if (config.processingParams.fixedPatternNoise.enabled) {
 		int width = signalLength;
-		int height = config.postProcessingParams.fixedPatternNoiseBscanCount * ascansPerBscan;
+		int height = config.processingParams.fixedPatternNoise.bscanAverageCount * ascansPerBscan;
 		
-		if ((!config.postProcessingParams.continuousFixedPatternNoiseDetermination &&
+		if ((!config.processingParams.fixedPatternNoise.continuous &&
 			 !this->impl->fixedPatternNoiseDetermined) ||
-			config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
+			config.processingParams.fixedPatternNoise.continuous) {
 
 			int ascansInBuffer = samplesPerBuffer / signalLength;
 			if (height > ascansInBuffer) {
@@ -722,10 +722,9 @@ void CudaBackend::process(IOBuffer& input) {
 					this->impl->recordedFixedPatternNoise[i*2+1] = hostMean[i].y;
 				}
 
-				//sync to configuration
-				this->impl->config.setCustomFixedPatternNoiseProfile(
-					this->impl->recordedFixedPatternNoise.data(),
-					positivePairs
+				//sync to configuration using new vector API
+				this->impl->config.setFixedPatternNoiseProfile(
+					this->impl->recordedFixedPatternNoise
 				);
 
 				this->impl->fixedPatternNoiseDetermined = true;
@@ -739,31 +738,31 @@ void CudaBackend::process(IOBuffer& input) {
 	// Step 6: Post-process truncate (magnitude, log scaling, copy to output)
 	float* d_currBuffer = this->impl->d_processedBuffer;
 	
-	if (config.postProcessingParams.logScaling) {
+	if (config.processingParams.intensity.logScale) {
 		cuda_kernels::postProcessTruncateLog<<<gridSize/2, blockSize, 0, stream>>>(
 			d_currBuffer, d_fftBuffer2, signalLength / 2, samplesPerBuffer, 0,
-			config.postProcessingParams.grayscaleMax,
-			config.postProcessingParams.grayscaleMin,
-			config.postProcessingParams.addend,
-			config.postProcessingParams.multiplicator);
+			config.processingParams.intensity.rangeMax,
+			config.processingParams.intensity.rangeMin,
+			config.processingParams.intensity.postOffset,
+			config.processingParams.intensity.preScale);
 	} else {
 		cuda_kernels::postProcessTruncateLin<<<gridSize/2, blockSize, 0, stream>>>(
 			d_currBuffer, d_fftBuffer2, signalLength / 2, samplesPerBuffer,
-			config.postProcessingParams.grayscaleMax,
-			config.postProcessingParams.grayscaleMin,
-			config.postProcessingParams.addend,
-			config.postProcessingParams.multiplicator);
+			config.processingParams.intensity.rangeMax,
+			config.processingParams.intensity.rangeMin,
+			config.processingParams.intensity.postOffset,
+			config.processingParams.intensity.preScale);
 	}
 	
 	// Step 7: B-scan flip
-	if (config.postProcessingParams.bscanFlip) {
+	if (config.processingParams.geometry.alternatingBscanFlip) {
 		cuda_kernels::cuda_bscanFlip<<<gridSize/2, blockSize, 0, stream>>>(
 			d_currBuffer, d_currBuffer, signalLength / 2, ascansPerBscan,
 			(signalLength * ascansPerBscan) / 2, samplesPerBuffer / 4);
 	}
 	
 	// Step 8: Sinusoidal scan correction
-	if (config.postProcessingParams.sinusoidalScanCorrection && 
+	if (config.processingParams.geometry.sinusoidalCorrection && 
 		this->impl->d_sinusoidalScanTmpBuffer != nullptr) {
 		checkCudaErrors(cudaMemcpyAsync(
 			this->impl->d_sinusoidalScanTmpBuffer, d_currBuffer,
@@ -776,7 +775,7 @@ void CudaBackend::process(IOBuffer& input) {
 	}
 	
 	// Step 9: Post-process background removal
-	if (config.postProcessingParams.backgroundRemoval) {
+	if (config.processingParams.background.enabled) {
 		// Record background if requested
 		if (this->impl->postProcessBackgroundRecordingRequested) {
 			cuda_kernels::getPostProcessBackground<<<gridSize/2, blockSize, 0, stream>>>(
@@ -794,10 +793,9 @@ void CudaBackend::process(IOBuffer& input) {
 				stream));
 			checkCudaErrors(cudaStreamSynchronize(stream));
 
-			//sync recorded profile to configuration
-			this->impl->config.setCustomPostProcessBackgroundProfile(
-				this->impl->recordedPostProcessBackground.data(),
-				bgSize
+			//sync recorded profile to configuration using new vector API
+			this->impl->config.setBackgroundProfile(
+				this->impl->recordedPostProcessBackground
 			);
 
 			this->impl->postProcessBackgroundRecordingRequested = false;
@@ -813,8 +811,8 @@ void CudaBackend::process(IOBuffer& input) {
 		// Apply background removal
 		cuda_kernels::postProcessBackgroundSubtraction<<<gridSize/2, blockSize, 0, stream>>>(
 			d_currBuffer, this->impl->d_postProcBackgroundLine,
-			config.postProcessingParams.backgroundWeight,
-			config.postProcessingParams.backgroundOffset,
+			config.processingParams.background.weight,
+			config.processingParams.background.offset,
 			signalLength / 2, samplesPerBuffer / 2);
 	}
 	

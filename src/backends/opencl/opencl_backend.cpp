@@ -767,26 +767,21 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
-		const float* profile = config.getCustomPostProcessBackgroundProfile();
-		size_t profileSize = config.getCustomPostProcessBackgroundProfileSize();
-		this->impl->recordedPostProcessBackground.assign(profile, profile + profileSize);
+		const std::vector<float>& profileVec = config.getBackgroundProfile();
+		this->impl->recordedPostProcessBackground = profileVec;
 		//copy to device
 		checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_postProcBackgroundLine, CL_TRUE, 0,
-			profileSize * sizeof(float), profile, 0, nullptr, nullptr));
+			profileVec.size() * sizeof(float), profileVec.data(), 0, nullptr, nullptr));
 	}
 	if (config.hasCustomFixedPatternNoiseProfile()) {
-		const float* profile = config.getCustomFixedPatternNoiseProfile();
-		size_t complexPairs = config.getCustomFixedPatternNoiseProfileSize();
-		this->impl->recordedFixedPatternNoise.resize(complexPairs * 2);
-		for (size_t i = 0; i < complexPairs; ++i) {
-			this->impl->recordedFixedPatternNoise[i*2] = profile[i*2];
-			this->impl->recordedFixedPatternNoise[i*2+1] = profile[i*2+1];
-		}
+		const std::vector<float>& profileVec = config.getFixedPatternNoiseProfile();
+		this->impl->recordedFixedPatternNoise = profileVec;
+		size_t complexPairs = profileVec.size() / 2;
 		//copy to device (need to pad to full signal length with zeros)
 		std::vector<float> hostMeanInterleaved(this->impl->signalLength * 2, 0.0f);
 		for (size_t i = 0; i < complexPairs; ++i) {
-			hostMeanInterleaved[i*2] = profile[i*2];
-			hostMeanInterleaved[i*2+1] = profile[i*2+1];
+			hostMeanInterleaved[i*2] = profileVec[i*2];
+			hostMeanInterleaved[i*2+1] = profileVec[i*2+1];
 		}
 		checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_meanALine, CL_TRUE, 0,
 			this->impl->signalLength * 2 * sizeof(float), hostMeanInterleaved.data(), 0, nullptr, nullptr));
@@ -930,7 +925,7 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 
 	//	Step 1: Convert input to complex
-	cl_kernel inputKernel = config.dataParams.bitshift ?
+	cl_kernel inputKernel = config.processingParams.input.bitshift ?
 		this->impl->kernelInputToComplexBitshift : this->impl->kernelInputToComplex;
 
 	checkOpenClErrors(clSetKernelArg(inputKernel, 0, sizeof(cl_mem), &this->impl->d_fftBuffer));
@@ -943,8 +938,8 @@ void OpenClBackend::process(IOBuffer& input) {
 	checkOpenClErrors(clEnqueueNDRangeKernel(queue, inputKernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
 
 	//	Step 2: Rolling average background removal
-	if (config.backgroundRemovalParams.enabled) {
-		int windowSize = config.backgroundRemovalParams.rollingAverageWindowSize;
+	if (config.processingParams.dcRemoval.enabled) {
+		int windowSize = config.processingParams.dcRemoval.windowSize;
 		//	Allocate local memory: kernel needs local_size + 2 * rollingAverageWindowSize elements
 		size_t localMemSize = (localWorkSize + 2 * windowSize) * sizeof(float);
 
@@ -989,10 +984,10 @@ void OpenClBackend::process(IOBuffer& input) {
 	//	Step 3: K-linearization, windowing, and dispersion compensation
 	cl_mem d_fftBuffer2 = this->impl->d_fftBuffer;
 
-	bool resampling = config.resamplingParams.enabled;
-	bool windowing = config.windowingParams.enabled;
-	bool dispersion = config.dispersionParams.enabled;
-	InterpolationMethod interpMethod = config.resamplingParams.interpolationMethod;
+	bool resampling = config.processingParams.resampling.enabled;
+	bool windowing = config.processingParams.windowing.enabled;
+	bool dispersion = config.processingParams.dispersion.enabled;
+	InterpolationMethod interpMethod = config.processingParams.resampling.method;
 
 	if (this->impl->d_inputLinearized != nullptr && resampling && windowing && dispersion) {
 		//	K-linearization + windowing + dispersion (most common case)
@@ -1111,13 +1106,13 @@ void OpenClBackend::process(IOBuffer& input) {
 #endif
 
 	//	Step 5: Fixed-pattern noise removal
-	if (config.postProcessingParams.fixedPatternNoiseRemoval) {
+	if (config.processingParams.fixedPatternNoise.enabled) {
 		int width = signalLength;
-		int height = config.postProcessingParams.fixedPatternNoiseBscanCount * ascansPerBscan;
+		int height = config.processingParams.fixedPatternNoise.bscanAverageCount * ascansPerBscan;
 
-		if ((!config.postProcessingParams.continuousFixedPatternNoiseDetermination &&
+		if ((!config.processingParams.fixedPatternNoise.continuous &&
 			!this->impl->fixedPatternNoiseDetermined) ||
-			config.postProcessingParams.continuousFixedPatternNoiseDetermination) {
+			config.processingParams.fixedPatternNoise.continuous) {
 
 			int ascansInBuffer = samplesPerBuffer / signalLength;
 			if (height <= ascansInBuffer) {
@@ -1147,9 +1142,8 @@ void OpenClBackend::process(IOBuffer& input) {
 				}
 
 				//sync to configuration
-				this->impl->config.setCustomFixedPatternNoiseProfile(
-					this->impl->recordedFixedPatternNoise.data(),
-					positivePairs
+				this->impl->config.setFixedPatternNoiseProfile(
+					this->impl->recordedFixedPatternNoise
 				);
 
 				this->impl->fixedPatternNoiseDetermined = true;
@@ -1178,13 +1172,13 @@ void OpenClBackend::process(IOBuffer& input) {
 			globalWorkSize2 = ((globalWorkSize2 + localWorkSize - 1) / localWorkSize) * localWorkSize;
 		}
 
-	if (config.postProcessingParams.logScaling) {
+	if (config.processingParams.intensity.logScale) {
 		int signalLength2 = signalLength / 2;
 		int samplesPerBuffer2 = samplesPerBuffer / 2;
-		float maxVal = config.postProcessingParams.grayscaleMax;
-		float minVal = config.postProcessingParams.grayscaleMin;
-		float addend = config.postProcessingParams.addend;
-		float multiplicator = config.postProcessingParams.multiplicator;
+		float maxVal = config.processingParams.intensity.rangeMax;
+		float minVal = config.processingParams.intensity.rangeMin;
+		float addend = config.processingParams.intensity.postOffset;
+		float multiplicator = config.processingParams.intensity.preScale;
 
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 0, sizeof(cl_mem), &d_currBuffer));
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLog, 1, sizeof(cl_mem), &d_fftBuffer2));
@@ -1199,10 +1193,10 @@ void OpenClBackend::process(IOBuffer& input) {
 	} else {
 		int signalLength2 = signalLength / 2;
 		int samplesPerBuffer2 = samplesPerBuffer / 2;
-		float maxVal = config.postProcessingParams.grayscaleMax;
-		float minVal = config.postProcessingParams.grayscaleMin;
-		float addend = config.postProcessingParams.addend;
-		float multiplicator = config.postProcessingParams.multiplicator;
+		float maxVal = config.processingParams.intensity.rangeMax;
+		float minVal = config.processingParams.intensity.rangeMin;
+		float addend = config.processingParams.intensity.postOffset;
+		float multiplicator = config.processingParams.intensity.preScale;
 
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 0, sizeof(cl_mem), &d_currBuffer));
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessTruncateLin, 1, sizeof(cl_mem), &d_fftBuffer2));
@@ -1217,7 +1211,7 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 
 	//	Step 7: B-scan flip
-	if (config.postProcessingParams.bscanFlip) {
+	if (config.processingParams.geometry.alternatingBscanFlip) {
 		int signalLength2 = signalLength / 2;
 		int pitch = (signalLength * ascansPerBscan) / 2;
 		int samplesPerBuffer4 = samplesPerBuffer / 4;
@@ -1232,7 +1226,7 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 
 	//	Step 8: Sinusoidal scan correction
-	if (config.postProcessingParams.sinusoidalScanCorrection &&
+	if (config.processingParams.geometry.sinusoidalCorrection &&
 		this->impl->d_sinusoidalScanTmpBuffer != nullptr) {
 		size_t copySize = sizeof(float) * samplesPerBuffer / 2;
 		checkOpenClErrors(clEnqueueCopyBuffer(queue, d_currBuffer, this->impl->d_sinusoidalScanTmpBuffer,
@@ -1251,7 +1245,7 @@ void OpenClBackend::process(IOBuffer& input) {
 	}
 
 	//	Step 9: Post-process background removal
-	if (config.postProcessingParams.backgroundRemoval) {
+	if (config.processingParams.background.enabled) {
 		//	Record background if requested
 		if (this->impl->postProcessBackgroundRecordingRequested) {
 			int signalLength2 = signalLength / 2;
@@ -1268,9 +1262,8 @@ void OpenClBackend::process(IOBuffer& input) {
 				bgSize * sizeof(float), this->impl->recordedPostProcessBackground.data(), 0, nullptr, nullptr));
 
 			//sync recorded profile to configuration
-			this->impl->config.setCustomPostProcessBackgroundProfile(
-				this->impl->recordedPostProcessBackground.data(),
-				bgSize
+			this->impl->config.setBackgroundProfile(
+				this->impl->recordedPostProcessBackground
 			);
 
 			this->impl->postProcessBackgroundRecordingRequested = false;
@@ -1285,8 +1278,8 @@ void OpenClBackend::process(IOBuffer& input) {
 		//	Apply background removal
 		int signalLength2 = signalLength / 2;
 		int samplesPerBuffer2 = samplesPerBuffer / 2;
-		float bgWeight = config.postProcessingParams.backgroundWeight;
-		float bgOffset = config.postProcessingParams.backgroundOffset;
+		float bgWeight = config.processingParams.background.weight;
+		float bgOffset = config.processingParams.background.offset;
 
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 0, sizeof(cl_mem), &d_currBuffer));
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelPostProcessBackgroundSubtraction, 1, sizeof(cl_mem), &this->impl->d_postProcBackgroundLine));

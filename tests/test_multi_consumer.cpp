@@ -11,7 +11,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include <cassert>
+#include "test_utils.h"
 
 // Test configuration
 const int SIGNAL_LENGTH = 1024;
@@ -42,11 +42,11 @@ void configureProcessor(ope::Processor& processor) {
 	config.dataParams.inputDataType = ope::DataType::UINT16;
 	
 	// Disable all processing for simple test
-	config.resamplingParams.enabled = false;
-	config.windowingParams.enabled = false;
-	config.dispersionParams.enabled = false;
-	config.backgroundRemovalParams.enabled = false;
-	config.postProcessingParams.logScaling = false;
+	config.processingParams.resampling.enabled = false;
+	config.processingParams.windowing.enabled = false;
+	config.processingParams.dispersion.enabled = false;
+	config.processingParams.dcRemoval.enabled = false;
+	config.processingParams.intensity.logScale = false;
 	
 	processor.setConfig(config);
 }
@@ -79,7 +79,7 @@ bool test_basic_multi_consumer() {
 	});
 	
 	// Verify callback count
-	assert(processor.getOutputCallbackCount() == 3);
+	TEST_ASSERT(processor.getOutputCallbackCount() == 3, "Expected 3 callbacks registered");
 	std::cout << "  [OK] Registered 3 callbacks" << std::endl;
 	
 	// Process one frame
@@ -122,7 +122,7 @@ bool test_remove_callback() {
 	auto id2 = processor.addOutputCallback([&](const ope::IOBuffer& buf) { count2++; });
 	auto id3 = processor.addOutputCallback([&](const ope::IOBuffer& buf) { count3++; });
 	
-	assert(processor.getOutputCallbackCount() == 3);
+	TEST_ASSERT(processor.getOutputCallbackCount() == 3, "Expected 3 callbacks registered");
 	std::cout << "  [OK] Added 3 callbacks" << std::endl;
 	
 	// Remove middle callback
@@ -132,7 +132,7 @@ bool test_remove_callback() {
 		return false;
 	}
 	
-	assert(processor.getOutputCallbackCount() == 2);
+	TEST_ASSERT(processor.getOutputCallbackCount() == 2, "Expected 2 callbacks registered");
 	std::cout << "  [OK] Removed callback 2" << std::endl;
 	
 	// Process frame
@@ -175,13 +175,13 @@ bool test_clear_callbacks() {
 	processor.addOutputCallback([&](const ope::IOBuffer& buf) { count1++; });
 	processor.addOutputCallback([&](const ope::IOBuffer& buf) { count2++; });
 	
-	assert(processor.getOutputCallbackCount() == 2);
+	TEST_ASSERT(processor.getOutputCallbackCount() == 2, "Expected 2 callbacks registered");
 	std::cout << "  [OK] Added 2 callbacks" << std::endl;
 	
 	// Clear all
 	processor.clearOutputCallbacks();
 	
-	assert(processor.getOutputCallbackCount() == 0);
+	TEST_ASSERT(processor.getOutputCallbackCount() == 0, "Expected 0 callbacks after clear");
 	std::cout << "  [OK] Cleared all callbacks" << std::endl;
 	
 	// Process frame
@@ -344,7 +344,7 @@ bool test_legacy_api() {
 		count++;
 	});
 	
-	assert(processor.getOutputCallbackCount() == 1);
+	TEST_ASSERT(processor.getOutputCallbackCount() == 1, "Expected 1 callback from setOutputCallback");
 	std::cout << "  [OK] setOutputCallback() registered 1 callback" << std::endl;
 	
 	// Process frame

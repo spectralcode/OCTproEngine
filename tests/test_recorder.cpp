@@ -544,7 +544,7 @@ void testDiskWritePerformance() {
 	processor.initialize();
 
 	// Calculate buffer sizes using processor configuration
-	int outputSignalLength = processor.getConfig().dataParams.outputSignalLength;
+	int outputSignalLength = processor.getConfig().dataParams.outputSignalLength();
 	size_t rawBytesPerBuffer = static_cast<size_t>(signalLength) * ascansPerBscan * bscansPerBuffer * sizeof(uint16_t);
 	size_t processedBytesPerBuffer = static_cast<size_t>(outputSignalLength) * ascansPerBscan * bscansPerBuffer * sizeof(float);
 	double rawGBperBuffer = rawBytesPerBuffer / (1024.0 * 1024.0 * 1024.0);

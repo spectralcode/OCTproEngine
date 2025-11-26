@@ -21,8 +21,8 @@ public:
 		if (!title.empty()) {
 			file << "# " << title << "\n";
 		}
-		file << "# OCTproEngine\n";
-		file << "# Size: " << data.size() << "\n";
+		//file << "# OCTproEngine\n";
+		//file << "# Size: " << data.size() << "\n";
 		file << "index,value\n";
 
 		for (size_t i = 0; i < data.size(); ++i) {
