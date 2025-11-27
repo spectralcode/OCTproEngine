@@ -32,8 +32,12 @@ if(BUILD_OCT_VIEWER)
 	# ============================================================================
 	message(STATUS "Checking GLFW dependency...")
 
-	# Check if GLFW already exists
-	if(EXISTS ${CMAKE_SOURCE_DIR}/thirdparty/glfw/CMakeLists.txt)
+	# First, try to find system-installed GLFW
+	find_package(glfw3 QUIET)
+
+	if(glfw3_FOUND)
+		message(STATUS "  GLFW found via system package")
+	elseif(EXISTS ${CMAKE_SOURCE_DIR}/thirdparty/glfw/CMakeLists.txt)
 		message(STATUS "  GLFW found in thirdparty folder, using existing installation")
 		set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 		set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
