@@ -50,6 +50,8 @@ add_ope_test(test_multi_consumer test_multi_consumer.cpp)
 add_ope_test(test_buffer_id_and_raw_callbacks test_buffer_id_and_raw_callbacks.cpp)
 add_ope_test(test_backend_state_transfer test_backend_state_transfer.cpp)
 add_ope_test(test_backend_config test_backend_config.cpp)
+add_ope_test(test_zerocopy_runtime test_zerocopy_runtime.cpp)
+add_ope_test(test_zerocopy_performance test_zerocopy_performance.cpp)
 
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)
