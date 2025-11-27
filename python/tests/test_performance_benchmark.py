@@ -11,6 +11,7 @@ import sys
 import numpy as np
 import time
 import threading
+import platform
 
 try:
     import octproengine as ope
@@ -22,18 +23,33 @@ except ImportError:
 # CONFIGURE BENCHMARK HERE (matches C++ test)
 # ============================================
 
-# Which backends to benchmark
-BENCHMARK_CPU = False
-BENCHMARK_CUDA = True
-BENCHMARK_OPENCL = True
+# Platform-specific configuration
+is_aarch64 = platform.machine().lower() in ['aarch64', 'arm64']
 
-# Buffer sizes to test (will test all combinations)
-SIGNAL_LENGTHS = [512, 1024, 2048, 4096]
-ASCANS_PER_BSCAN = [256, 512, 1024, 2048]
-BSCANS_PER_BUFFER = [1]
+if not is_aarch64:
+    # ============================================
+    # Desktop: Full benchmark with all backends
+    # ============================================
+    BENCHMARK_CPU = True
+    BENCHMARK_CUDA = True
+    BENCHMARK_OPENCL = True
 
-# Number of iterations per test
-ITERATIONS = 100
+    SIGNAL_LENGTHS = [512, 1024, 2048, 4096]
+    ASCANS_PER_BSCAN = [256, 512, 1024, 2048]
+    BSCANS_PER_BUFFER = [1]
+    ITERATIONS = 1000
+else:
+    # ============================================
+    # Jetson: CUDA-only with reduced sizes
+    # ============================================
+    BENCHMARK_CPU = False
+    BENCHMARK_CUDA = True
+    BENCHMARK_OPENCL = False
+
+    SIGNAL_LENGTHS = [512, 1024, 2048]
+    ASCANS_PER_BSCAN = [256, 512, 1024]
+    BSCANS_PER_BUFFER = [1]
+    ITERATIONS = 2000
 
 # Processing configuration
 ENABLE_RESAMPLING = True
@@ -209,9 +225,9 @@ def run_benchmark(backend, signal_length, ascans_per_bscan, bscans_per_buffer, t
     for iter in range(ITERATIONS):
         # Get next available buffer (blocks if all buffers are busy)
         buffer = processor.get_next_available_buffer()
-        
+
         # Copy data to buffer
-        buffer[:] = test_data
+        buffer[:] = test_data.reshape(buffer.shape)
         
         # Submit for processing (returns immediately, processing happens async)
         processor.process(buffer)
@@ -303,9 +319,11 @@ def save_results_csv(results, filename):
 
 def print_configuration():
     """Print test configuration"""
+    platform_name = "Jetson (ARM64)" if is_aarch64 else "Desktop"
+    print(f"Platform: {platform_name}")
     print("Configuration:")
     print("  Processing: ", end="")
-    
+
     enabled = []
     if ENABLE_RESAMPLING:
         method_name = {
@@ -322,7 +340,7 @@ def print_configuration():
         enabled.append("BG-Removal")
     if ENABLE_LOG_SCALING:
         enabled.append("Log-Scale")
-    
+
     print(" + ".join(enabled))
     print(f"  Iterations per test: {ITERATIONS}")
     print("  Backends: ", end="")
