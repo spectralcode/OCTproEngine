@@ -6,6 +6,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
 const bool DELETE_TEST_FILES = true;

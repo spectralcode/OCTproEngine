@@ -1,6 +1,7 @@
 #include "tools/recorder.h"
 #include "processor.h"
 #include <iostream>
+#include <cstring>
 
 // Example demonstrating the Recorder tool
 
