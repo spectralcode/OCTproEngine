@@ -74,15 +74,16 @@ std::string ope_dtype_to_string(ope::DataType dtype) {
 // ============================================
 
 // Return NumPy array view of IOBuffer (zero-copy)
-py::array buffer_to_numpy(ope::IOBuffer& buffer) {
+// config: optional processor configuration for proper 3D shape
+py::array buffer_to_numpy(ope::IOBuffer& buffer, const ope::ProcessorConfiguration* config = nullptr) {
 	void* ptr = buffer.getDataPointer();
 	size_t size_bytes = buffer.getSizeInBytes();
 	ope::DataType dtype = buffer.getDataType();
-	
+
 	// Determine NumPy dtype and element count
 	py::dtype np_dtype;
 	size_t num_elements;
-	
+
 	switch (dtype) {
 		case ope::DataType::UINT8:
 			np_dtype = py::dtype::of<uint8_t>();
@@ -107,9 +108,29 @@ py::array buffer_to_numpy(ope::IOBuffer& buffer) {
 		default:
 			throw BufferError("Unsupported IOBuffer data type");
 	}
-	
-	// Create NumPy array view (no copy, doesn't own data)
-	return py::array(np_dtype, {num_elements}, {np_dtype.itemsize()}, ptr, py::cast(&buffer));
+
+	// Create properly shaped 3D array if configuration is available
+	if (config) {
+		int bscans = config->dataParams.bscansPerBuffer;
+		int ascans = config->dataParams.ascansPerBscan;
+		// Calculate signal length from actual buffer size
+		int signal = num_elements / (bscans * ascans);
+
+		// Shape: (bscans, ascans, signal_length)
+		// Strides: in bytes for each dimension (row-major C order)
+		size_t stride_signal = np_dtype.itemsize();
+		size_t stride_ascan = stride_signal * signal;
+		size_t stride_bscan = stride_ascan * ascans;
+
+		return py::array(np_dtype,
+			{bscans, ascans, signal},  // shape
+			{stride_bscan, stride_ascan, stride_signal},  // strides
+			ptr,
+			py::cast(&buffer));
+	} else {
+		// Fallback to 1D array if no config available
+		return py::array(np_dtype, {num_elements}, {np_dtype.itemsize()}, ptr, py::cast(&buffer));
+	}
 }
 
 // ============================================
@@ -135,16 +156,19 @@ public:
 		
 		// Set C++ callback that will call Python callback
 		processor.setOutputCallback([this](const ope::IOBuffer& output) {
+			// Capture buffer ID immediately before buffer can be recycled
+			uint64_t bufferId = output.getBufferId();
+
 			// Re-acquire GIL to call Python code
 			py::gil_scoped_acquire acquire;
-			
+
 			try {
 				// Create NumPy view of output buffer (cast away const for view)
 				ope::IOBuffer& output_ref = const_cast<ope::IOBuffer&>(output);
-				py::array output_array = buffer_to_numpy(output_ref);
-				
-				// Call Python callback with buffer ID
-				callback(output_array, output.getBufferId());
+				py::array output_array = buffer_to_numpy(output_ref, &processor.getConfig());
+
+				// Call Python callback with captured buffer ID
+				callback(output_array, bufferId);
 			} catch (const std::exception& e) {
 				// Handle errors in callback
 				if (!error_callback.is_none()) {
@@ -163,17 +187,20 @@ public:
 ope::Processor::CallbackId add_output_callback(py::function cb) {
 		// Create C++ wrapper callback that handles GIL
 		auto wrappedCallback = [this, cb](const ope::IOBuffer& buffer) {
-			// CRITICAL: Re-acquire GIL before calling Python code
+			// Capture buffer ID immediately before buffer can be recycled
+			uint64_t bufferId = buffer.getBufferId();
+
+			// Re-acquire GIL before calling Python code
 			// We're in a C++ callback thread, need GIL to call Python
 			py::gil_scoped_acquire acquire;
-			
+
 			try {
 				// Create NumPy view of buffer (zero-copy)
 				ope::IOBuffer& buffer_ref = const_cast<ope::IOBuffer&>(buffer);
-				py::array output_array = buffer_to_numpy(buffer_ref);
-				
-				// Call Python callback with buffer ID
-				cb(output_array, buffer.getBufferId());
+				py::array output_array = buffer_to_numpy(buffer_ref, &processor.getConfig());
+
+				// Call Python callback with captured buffer ID
+				cb(output_array, bufferId);
 				
 			} catch (const py::error_already_set& e) {
 				// Python exception
@@ -234,16 +261,19 @@ ope::Processor::CallbackId add_output_callback(py::function cb) {
 	ope::Processor::CallbackId add_input_callback(py::function cb) {
 		// Create C++ wrapper callback that handles GIL
 		auto wrappedCallback = [this, cb](const ope::IOBuffer& buffer) {
-			// CRITICAL: Re-acquire GIL before calling Python code
+			// Capture buffer ID immediately before buffer can be recycled
+			uint64_t bufferId = buffer.getBufferId();
+
+			// Re-acquire GIL before calling Python code
 			py::gil_scoped_acquire acquire;
 
 			try {
 				// Create NumPy view of buffer (zero-copy)
 				ope::IOBuffer& buffer_ref = const_cast<ope::IOBuffer&>(buffer);
-				py::array input_array = buffer_to_numpy(buffer_ref);
+				py::array input_array = buffer_to_numpy(buffer_ref, &processor.getConfig());
 
-				// Call Python callback with buffer ID
-				cb(input_array, buffer.getBufferId());
+				// Call Python callback with captured buffer ID
+				cb(input_array, bufferId);
 
 			} catch (const py::error_already_set& e) {
 				// Python exception
@@ -319,14 +349,14 @@ ope::Processor::CallbackId add_output_callback(py::function cb) {
 	
 	py::array get_next_available_buffer() {
 		ope::IOBuffer* buffer;
-		
+
 		// Release GIL while waiting for buffer
 		{
 			py::gil_scoped_release release;
 			buffer = &processor.getNextAvailableInputBuffer();
 		}
-		
-		return buffer_to_numpy(*buffer);
+
+		return buffer_to_numpy(*buffer, &processor.getConfig());
 	}
 	
 	// Wrapper methods that release GIL
@@ -1256,7 +1286,7 @@ PYBIND11_MODULE(octproengine, m) {
 		.def("attach_to_processor", [](ope::tools::Recorder& self, ProcessorWrapper& wrapper) {
 			py::gil_scoped_release release;
 			self.attachToProcessor(&wrapper.processor);
-		}, py::arg("processor"),
+		}, py::arg("processor"), py::keep_alive<1, 2>(),
 			"Attach recorder to a processor\n\n"
 			"Args:\n"
 			"    processor: Processor instance to attach to")
