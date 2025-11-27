@@ -1,34 +1,40 @@
 #include "../../include/iobuffer.h"
+#include <cstring>
 
-#if defined(_WIN32) //windows replacement for posix_memalign
-	#include <conio.h>
+#if defined(_WIN32)
 	#include <Windows.h>
-	#include <errno.h>
-	static inline int _posix_memalign_wrapper(void** p, size_t a, size_t s) {
-		*p = _aligned_malloc(s, a);
-		return (*p) ? 0 : ENOMEM;
-	}
-	#define posix_memalign(p, a, s) _posix_memalign_wrapper((p), (a), (s))
-	#define posix_memalign_free _aligned_free
-#elif defined(__aarch64__) //jetson nano
-	#include <cstring>
+#elif defined(__aarch64__)
 	#include <cuda_runtime.h>
+#else
 	#include <stdlib.h>
-	#include <errno.h>
-	// Note: We need access to the IOBuffer instance to check allocationHint
-	// So we'll handle CUDA allocation directly in IOBuffer::allocateMemory()
-	// and keep this as a fallback for any non-IOBuffer usage
-	static inline int _posix_memalign_wrapper(void** p, size_t a, size_t s) {
-		(void)a; //alignment parameter ignored by cudaHostAlloc
-		cudaError_t err = cudaHostAlloc(p, s, cudaHostAllocPortable); // Default: portable
-		return (err == cudaSuccess) ? 0 : ENOMEM;
-	}
-	#define posix_memalign(p, a, s) _posix_memalign_wrapper((p), (a), (s))
-	#define posix_memalign_free(p) cudaFreeHost((p))
-#else //default posix_memalign for linux
-	#include <stdlib.h>
-	#define posix_memalign_free free
 #endif
+
+
+static inline bool allocate_aligned(void** dataPointer, size_t sizeInBytes, ope::IOBuffer::AllocationHint hint) {
+#if defined(_WIN32)
+	(void)hint;
+	*dataPointer = _aligned_malloc(sizeInBytes, 64);
+	return (*dataPointer != nullptr);
+#elif defined(__aarch64__)
+	unsigned int cudaFlags = (hint == ope::IOBuffer::AllocationHint::DEVICE_MAPPED)
+		? cudaHostAllocMapped
+		: cudaHostAllocPortable;
+	return cudaHostAlloc(dataPointer, sizeInBytes, cudaFlags) == cudaSuccess;
+#else
+	(void)hint;
+	return posix_memalign(dataPointer, 64, sizeInBytes) == 0;
+#endif
+}
+
+static inline void free_aligned(void* dataPointer) {
+#if defined(_WIN32)
+	_aligned_free(dataPointer);
+#elif defined(__aarch64__)
+	cudaFreeHost(dataPointer);
+#else
+	free(dataPointer);
+#endif
+}
 
 namespace ope {
 IOBuffer::IOBuffer()
@@ -51,45 +57,18 @@ bool IOBuffer::allocateMemory(size_t sizeInBytes) {
 		return true;
 	}
 
-#ifdef __aarch64__
-	// Jetson: Use runtime hint to choose CUDA allocation strategy
-	unsigned int cudaFlags;
-	switch (this->allocationHint) {
-		case AllocationHint::DEVICE_MAPPED:
-			cudaFlags = cudaHostAllocMapped;  // Zero-copy
-			break;
-		case AllocationHint::PORTABLE:
-			cudaFlags = cudaHostAllocPortable;  // Pinned
-			break;
-		case AllocationHint::DEFAULT:
-		default:
-			cudaFlags = cudaHostAllocPortable;  // Safe default
-			break;
-	}
-
-	cudaError_t err = cudaHostAlloc(&this->dataPtr, sizeInBytes, cudaFlags);
-	if (err != cudaSuccess) {
+	if (!allocate_aligned(&this->dataPtr, sizeInBytes, this->allocationHint)) {
 		return false;
 	}
 
 	memset(this->dataPtr, 0, sizeInBytes);
-#else
-	// Desktop/Other platforms: Use standard aligned allocation
-	const size_t alignment = 64;
-	if (posix_memalign(&this->dataPtr, alignment, sizeInBytes) != 0) {
-		return false;
-	}
-
-	memset(this->dataPtr, 0, sizeInBytes);
-#endif
-
 	this->sizeInBytes = sizeInBytes;
 	return true;
 }
 
 void IOBuffer::releaseMemory() {
 	if (this->dataPtr) {
-		posix_memalign_free(this->dataPtr);
+		free_aligned(this->dataPtr);
 		this->dataPtr = nullptr;
 		this->sizeInBytes = 0;
 	}
@@ -158,4 +137,3 @@ IOBuffer::AllocationHint IOBuffer::getAllocationHint() const {
 }
 
 } // namespace ope
-
