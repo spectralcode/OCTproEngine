@@ -62,7 +62,9 @@ set_target_properties(octproengine_python PROPERTIES
 )
 
 # Windows: Copy all required DLLs to the Python module directory
-copy_required_dlls(octproengine_python)
+if(WIN32 AND COMMAND copy_required_dlls)
+	copy_required_dlls(octproengine_python)
+endif()
 
 # Linux: Set RPATH so the module can find shared libraries
 if(UNIX AND NOT APPLE)
