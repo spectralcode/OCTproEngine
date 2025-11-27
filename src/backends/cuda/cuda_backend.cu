@@ -43,8 +43,8 @@ struct CudaBackend::Impl {
 	ProcessorConfiguration config;
 
 	// CUDA parameters
-	int numStreams = 8;  // Default from original code
-	int blockSize = 128;  // Default from original code
+	int numStreams = 2;
+	int blockSize = 128;
 	int gridSize = 0;
 	int deviceId = 0;
 	bool enableZeroCopy = false;
@@ -100,12 +100,10 @@ struct CudaBackend::Impl {
 	
 	// cuFFT plan
 	cufftHandle fftPlan = 0;
-	
-	// Output buffers for callback (ping-pong)
-	IOBuffer outputBuffer1;
-	IOBuffer outputBuffer2;
-	int currentOutputBuffer = 0;
-	
+
+	// Output buffers for callback (one per stream)
+	std::vector<IOBuffer> outputBuffers;
+
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
 	
@@ -255,37 +253,29 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
 	}
 	
-	// Allocate output buffers
+	// Allocate output buffers (one per stream to prevent race conditions)
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
+	this->impl->outputBuffers.resize(this->impl->numStreams);
 
-	// Set allocation hint for output buffers (same as input buffers)
-	this->impl->outputBuffer1.setAllocationHint(hint);
-	this->impl->outputBuffer2.setAllocationHint(hint);
+	for (int i = 0; i < this->impl->numStreams; ++i) {
+		// Set allocation hint for output buffer (same as input buffers)
+		this->impl->outputBuffers[i].setAllocationHint(hint);
 
-	if (!this->impl->outputBuffer1.allocateMemory(outputSize) ||
-		!this->impl->outputBuffer2.allocateMemory(outputSize)) {
-		throw std::runtime_error("Failed to allocate output buffers");
-	}
-	this->impl->outputBuffer1.setDataType(IOBuffer::DataType::FLOAT32);
-	this->impl->outputBuffer2.setDataType(IOBuffer::DataType::FLOAT32);
-	
+		if (!this->impl->outputBuffers[i].allocateMemory(outputSize)) {
+			throw std::runtime_error("Failed to allocate output buffer " + std::to_string(i));
+		}
+		this->impl->outputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
+
 #ifndef __aarch64__
-	// Register output buffers for fast host-to-device transfers (Desktop only)
-	void* outPtr1 = this->impl->outputBuffer1.getDataPointer();
-	void* outPtr2 = this->impl->outputBuffer2.getDataPointer();
-	
-	cudaError_t err1 = cudaHostRegister(outPtr1, outputSize, cudaHostRegisterPortable);
-	if (err1 != cudaSuccess) {
-		fprintf(stderr, "Warning: cudaHostRegister failed for output buffer 1: %s\n", 
-		        cudaGetErrorString(err1));
-	}
-	
-	cudaError_t err2 = cudaHostRegister(outPtr2, outputSize, cudaHostRegisterPortable);
-	if (err2 != cudaSuccess) {
-		fprintf(stderr, "Warning: cudaHostRegister failed for output buffer 2: %s\n", 
-		        cudaGetErrorString(err2));
-	}
+		// Register output buffer for fast host-to-device transfers (Desktop only)
+		void* outPtr = this->impl->outputBuffers[i].getDataPointer();
+		cudaError_t err = cudaHostRegister(outPtr, outputSize, cudaHostRegisterPortable);
+		if (err != cudaSuccess) {
+			fprintf(stderr, "Warning: cudaHostRegister failed for output buffer %d: %s\n",
+			        i, cudaGetErrorString(err));
+		}
 #endif
+	}
 	
 	// Create cuFFT plan
 	checkCufftErrors(cufftPlan1d(
@@ -393,44 +383,38 @@ void CudaBackend::cleanup() {
 	while (!this->impl->freeBuffersQueue.empty()) {
 		this->impl->freeBuffersQueue.pop();
 	}
-	
+
 #ifndef __aarch64__
 	// Unregister output buffers (Desktop only)
-	void* outPtr1 = this->impl->outputBuffer1.getDataPointer();
-	void* outPtr2 = this->impl->outputBuffer2.getDataPointer();
-	
-	if (outPtr1) {
-		cudaError_t err = cudaHostUnregister(outPtr1);
-		if (err != cudaSuccess && err != cudaErrorHostMemoryNotRegistered) {
-			fprintf(stderr, "Warning: cudaHostUnregister failed for output buffer 1: %s\n", 
-			        cudaGetErrorString(err));
-		}
-	}
-	
-	if (outPtr2) {
-		cudaError_t err = cudaHostUnregister(outPtr2);
-		if (err != cudaSuccess && err != cudaErrorHostMemoryNotRegistered) {
-			fprintf(stderr, "Warning: cudaHostUnregister failed for output buffer 2: %s\n", 
-			        cudaGetErrorString(err));
+	for (auto& buffer : this->impl->outputBuffers) {
+		void* outPtr = buffer.getDataPointer();
+		if (outPtr) {
+			cudaError_t err = cudaHostUnregister(outPtr);
+			if (err != cudaSuccess && err != cudaErrorHostMemoryNotRegistered) {
+				fprintf(stderr, "Warning: cudaHostUnregister failed for output buffer: %s\n",
+				        cudaGetErrorString(err));
+			}
 		}
 	}
 #endif
-	
+
 	// Release device buffers
 	this->releaseDeviceBuffers();
-	
+
 	// Destroy cuFFT plan
 	if (this->impl->fftPlan) {
 		cufftDestroy(this->impl->fftPlan);
 		this->impl->fftPlan = 0;
 	}
-	
+
 	// Destroy streams and events
 	this->destroyStreamsAndEvents();
-	
+
 	// Release output buffers
-	this->impl->outputBuffer1.releaseMemory();
-	this->impl->outputBuffer2.releaseMemory();
+	for (auto& buffer : this->impl->outputBuffers) {
+		buffer.releaseMemory();
+	}
+	this->impl->outputBuffers.clear();
 	
 	this->impl->cudaInitialized = false;
 }
@@ -513,15 +497,12 @@ void CudaBackend::process(IOBuffer& input) {
 	
 	// Round-robin device buffer selection
 	this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
-	
-	// Select output buffer (ping-pong)
-	this->impl->currentOutputBuffer = (this->impl->currentOutputBuffer + 1) % 2;
-	IOBuffer* currentOutputBuf = (this->impl->currentOutputBuffer == 0) ?
-		&this->impl->outputBuffer1 : &this->impl->outputBuffer2;
 
-	// Get buffer ID from input to propagate to output later in the pipeline 
+	// Select output buffer
+	IOBuffer* currentOutputBuf = &this->impl->outputBuffers[this->impl->currentStream];
+
+	// Get buffer ID from input to propagate to output later in the pipeline
 	uint64_t bufferId = input.getBufferId();
-	//currentOutputBuf->setBufferId(bufferId); // not here, because this output buffer may be still in use by a ProcessorTool
 
 	// Copy input to device
 	void* d_input = nullptr;
