@@ -12,6 +12,13 @@ class OPE_API IOBuffer {
 public:
 	using DataType = ope::DataType;
 
+	// Allocation hints for platform-specific memory optimizations
+	enum class AllocationHint {
+		DEFAULT,         // Platform default allocation
+		DEVICE_MAPPED,   // Device-mapped memory (zero-copy on integrated GPUs like Jetson)
+		PORTABLE         // Portable pinned memory (optimized for PCIe transfers)
+	};
+
 	IOBuffer();
 	~IOBuffer();
 
@@ -31,11 +38,16 @@ public:
 	void setBufferId(uint64_t id);
 	uint64_t getBufferId() const;
 
+	// Allocation hint (must be set before allocateMemory)
+	void setAllocationHint(AllocationHint hint);
+	AllocationHint getAllocationHint() const;
+
 private:
 	void* dataPtr;
 	size_t sizeInBytes;
 	DataType dataType;
 	uint64_t bufferId;
+	AllocationHint allocationHint;
 };
 
 } // namespace ope

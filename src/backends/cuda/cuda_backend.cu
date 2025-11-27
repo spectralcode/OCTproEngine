@@ -41,12 +41,13 @@ namespace ope {
 struct CudaBackend::Impl {
 	// Configuration
 	ProcessorConfiguration config;
-	
+
 	// CUDA parameters
 	int numStreams = 8;  // Default from original code
 	int blockSize = 128;  // Default from original code
 	int gridSize = 0;
 	int deviceId = 0;
+	bool enableZeroCopy = false;
 	bool cudaInitialized = false;
 	
 	// Data dimensions
@@ -172,6 +173,13 @@ void CudaBackend::setDeviceId(int deviceId) {
 	this->impl->deviceId = deviceId;
 }
 
+void CudaBackend::setEnableZeroCopy(bool enable) {
+	if (this->impl->cudaInitialized) {
+		throw std::runtime_error("Cannot change zero-copy mode after initialization");
+	}
+	this->impl->enableZeroCopy = enable;
+}
+
 // ============================================
 // Lifecycle Methods
 // ============================================
@@ -209,24 +217,32 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	// Allocate and register host input buffers
 	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
 	this->impl->hostInputBuffers.resize(this->impl->numInputBuffers);
-	
+
+	// Determine allocation hint based on zero-copy setting (Jetson only)
+	IOBuffer::AllocationHint hint = this->impl->enableZeroCopy ?
+		IOBuffer::AllocationHint::DEVICE_MAPPED :
+		IOBuffer::AllocationHint::PORTABLE;
+
 	for (int i = 0; i < this->impl->numInputBuffers; ++i) {
+		// Set allocation hint before allocating (affects Jetson only)
+		this->impl->hostInputBuffers[i].setAllocationHint(hint);
+
 		// Allocate memory using IOBuffer's normal allocation
 		if (!this->impl->hostInputBuffers[i].allocateMemory(inputSize)) {
 			throw std::runtime_error("Failed to allocate input buffer " + std::to_string(i));
 		}
-		
-#if defined(__aarch64__) && defined(ENABLE_CUDA_ZERO_COPY)
-		// Jetson with zero-copy: IOBuffer already allocated with cudaHostAlloc + cudaHostAllocMapped
-		// No need to register - memory is already mapped
-		// Note: Use cudaHostGetDevicePointer() when accessing on device side
+
+#ifdef __aarch64__
+		// Jetson: IOBuffer already allocated with cudaHostAlloc (see iobuffer.cpp)
+		// No need to register - memory is already CUDA-pinned
+		// Note: Use cudaHostGetDevicePointer() if ENABLE_CUDA_ZERO_COPY is defined
 #else
 		// Desktop: Register the allocated memory with CUDA for fast PCIe transfers
 		void* ptr = this->impl->hostInputBuffers[i].getDataPointer();
 		cudaError_t err = cudaHostRegister(ptr, inputSize, cudaHostRegisterPortable);
 		if (err != cudaSuccess) {
 			// Warning only - continue with unregistered memory
-			fprintf(stderr, "Warning: cudaHostRegister failed for input buffer %d: %s\n", 
+			fprintf(stderr, "Warning: cudaHostRegister failed for input buffer %d: %s\n",
 			        i, cudaGetErrorString(err));
 			fprintf(stderr, "Continuing with unregistered memory (may be slower)\n");
 		}
@@ -241,6 +257,11 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	
 	// Allocate output buffers
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
+
+	// Set allocation hint for output buffers (same as input buffers)
+	this->impl->outputBuffer1.setAllocationHint(hint);
+	this->impl->outputBuffer2.setAllocationHint(hint);
+
 	if (!this->impl->outputBuffer1.allocateMemory(outputSize) ||
 		!this->impl->outputBuffer2.allocateMemory(outputSize)) {
 		throw std::runtime_error("Failed to allocate output buffers");
@@ -350,15 +371,15 @@ void CudaBackend::cleanup() {
 	for (auto& buffer : this->impl->hostInputBuffers) {
 		void* ptr = buffer.getDataPointer();
 		if (ptr) {
-#if defined(__aarch64__) && defined(ENABLE_CUDA_ZERO_COPY)
-			// Jetson with zero-copy: Memory was allocated with cudaHostAlloc
-			// IOBuffer will handle cleanup via cudaFreeHost (see iobuffer.cpp)
+#ifdef __aarch64__
+			// Jetson: Memory was allocated with cudaHostAlloc (see iobuffer.cpp)
+			// IOBuffer will handle cleanup via cudaFreeHost
 			// No unregistration needed
 #else
 			// Desktop: Unregister the memory from CUDA before releasing it
 			cudaError_t err = cudaHostUnregister(ptr);
 			if (err != cudaSuccess && err != cudaErrorHostMemoryNotRegistered) {
-				fprintf(stderr, "Warning: cudaHostUnregister failed for input buffer: %s\n", 
+				fprintf(stderr, "Warning: cudaHostUnregister failed for input buffer: %s\n",
 				        cudaGetErrorString(err));
 			}
 #endif

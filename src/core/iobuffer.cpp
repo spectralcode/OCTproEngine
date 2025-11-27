@@ -10,18 +10,17 @@
 	}
 	#define posix_memalign(p, a, s) _posix_memalign_wrapper((p), (a), (s))
 	#define posix_memalign_free _aligned_free
-#elif defined(__aarch64__) //jetson nano 
+#elif defined(__aarch64__) //jetson nano
+	#include <cstring>
 	#include <cuda_runtime.h>
 	#include <stdlib.h>
 	#include <errno.h>
+	// Note: We need access to the IOBuffer instance to check allocationHint
+	// So we'll handle CUDA allocation directly in IOBuffer::allocateMemory()
+	// and keep this as a fallback for any non-IOBuffer usage
 	static inline int _posix_memalign_wrapper(void** p, size_t a, size_t s) {
 		(void)a; //alignment parameter ignored by cudaHostAlloc
-		cudaError_t err;
-		#ifdef ENABLE_CUDA_ZERO_COPY
-			err = cudaHostAlloc(p, s, cudaHostAllocMapped);
-		#else
-			err = cudaHostAlloc(p, s, cudaHostAllocPortable);
-		#endif
+		cudaError_t err = cudaHostAlloc(p, s, cudaHostAllocPortable); // Default: portable
 		return (err == cudaSuccess) ? 0 : ENOMEM;
 	}
 	#define posix_memalign(p, a, s) _posix_memalign_wrapper((p), (a), (s))
@@ -36,7 +35,8 @@ IOBuffer::IOBuffer()
 	: dataPtr(nullptr),
 	sizeInBytes(0),
 	dataType(DataType::UINT8),
-	bufferId(0)
+	bufferId(0),
+	allocationHint(AllocationHint::DEFAULT)
 {
 }
 
@@ -51,12 +51,37 @@ bool IOBuffer::allocateMemory(size_t sizeInBytes) {
 		return true;
 	}
 
+#ifdef __aarch64__
+	// Jetson: Use runtime hint to choose CUDA allocation strategy
+	unsigned int cudaFlags;
+	switch (this->allocationHint) {
+		case AllocationHint::DEVICE_MAPPED:
+			cudaFlags = cudaHostAllocMapped;  // Zero-copy
+			break;
+		case AllocationHint::PORTABLE:
+			cudaFlags = cudaHostAllocPortable;  // Pinned
+			break;
+		case AllocationHint::DEFAULT:
+		default:
+			cudaFlags = cudaHostAllocPortable;  // Safe default
+			break;
+	}
+
+	cudaError_t err = cudaHostAlloc(&this->dataPtr, sizeInBytes, cudaFlags);
+	if (err != cudaSuccess) {
+		return false;
+	}
+
+	memset(this->dataPtr, 0, sizeInBytes);
+#else
+	// Desktop/Other platforms: Use standard aligned allocation
 	const size_t alignment = 64;
 	if (posix_memalign(&this->dataPtr, alignment, sizeInBytes) != 0) {
 		return false;
 	}
 
 	memset(this->dataPtr, 0, sizeInBytes);
+#endif
 
 	this->sizeInBytes = sizeInBytes;
 	return true;
@@ -122,6 +147,14 @@ void IOBuffer::setBufferId(uint64_t id) {
 
 uint64_t IOBuffer::getBufferId() const {
 	return this->bufferId;
+}
+
+void IOBuffer::setAllocationHint(AllocationHint hint) {
+	this->allocationHint = hint;
+}
+
+IOBuffer::AllocationHint IOBuffer::getAllocationHint() const {
+	return this->allocationHint;
 }
 
 } // namespace ope

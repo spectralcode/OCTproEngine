@@ -66,7 +66,7 @@ public:
 					const auto* cudaConfig = static_cast<const CudaConfig*>(this->backendConfig.get());
 					cudaBackend->setDeviceId(cudaConfig->deviceId);
 					cudaBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of cudaConfig
-					//cudaBackend->setEnableZeroCopy(cudaConfig->enableZeroCopy); //todo: add setter
+					cudaBackend->setEnableZeroCopy(cudaConfig->enableZeroCopy);
 
 					this->backend = std::move(cudaBackend);
 				}

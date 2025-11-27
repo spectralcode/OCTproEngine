@@ -196,7 +196,8 @@ public:
 	void setNumStreams(int numStreams);
 	void setBlockSize(int blockSize);
 	void setDeviceId(int deviceId);
-	
+	void setEnableZeroCopy(bool enable);  // Must be called before initialize()
+
 	int getNumStreams() const;
 	int getBlockSize() const;
 	int getCurrentDeviceId() const;
