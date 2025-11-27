@@ -116,13 +116,13 @@ def main():
 	result_ready = threading.Event()
 	output_data = {'array': None}
 	
-	def on_result(output_array):
+	def on_result(output_array, buffer_id):
 		"""Callback function that receives processed output"""
-		print(f"Received processed output: shape={output_array.shape}, dtype={output_array.dtype}")
-		
+		print(f"Received processed output: shape={output_array.shape}, dtype={output_array.dtype}, buffer_id={buffer_id}")
+
 		# Save reference to output data
 		output_data['array'] = output_array.copy()
-		
+
 		# Signal that result is ready
 		result_ready.set()
 	
@@ -144,9 +144,9 @@ def main():
 	buffer = processor.get_next_available_buffer()
 	print(f"Got buffer: shape={buffer.shape}, dtype={buffer.dtype}\n")
 	
-	# Fill buffer with test data (flatten to 1D)
+	# Fill buffer with test data (reshape to match buffer dimensions)
 	print("Filling buffer with test data...")
-	buffer[:] = test_data.ravel()
+	buffer[:] = test_data.reshape(buffer.shape)
 	print("Buffer filled\n")
 	
 	# Process asynchronously

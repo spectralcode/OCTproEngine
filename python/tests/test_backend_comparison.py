@@ -229,10 +229,10 @@ def run_backend_test(backend_name, backend_type, test_data):
         result.event.set()
 
     processor.add_output_callback(on_output)
-    
+
     result.start_time = time.time()
     buffer = processor.get_next_available_buffer()
-    buffer[:] = test_data
+    buffer[:] = test_data.reshape(buffer.shape)
     processor.process(buffer)
     
     if not result.wait_for_completion():
