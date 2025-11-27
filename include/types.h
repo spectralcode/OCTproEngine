@@ -1,6 +1,8 @@
 #ifndef OPE_TYPES_H
 #define OPE_TYPES_H
 
+#include "export.h"
+
 namespace ope {
 
 enum class DataType {
@@ -18,9 +20,9 @@ enum class DataType {
 	COMPLEX_FLOAT64 = 12
 };
 
-int getDataTypeBitDepth(DataType type);
+OPE_API int getDataTypeBitDepth(DataType type);
 
-int getDataTypeByteSize(DataType type);
+OPE_API int getDataTypeByteSize(DataType type);
 
 } // namespace ope
 
