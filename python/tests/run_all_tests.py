@@ -43,9 +43,12 @@ def main():
     print("OCTproEngine Python Test Suite")
     print("=" * 60)
     print()
-    
-    # Auto-discover all test_*.py files
-    test_files = sorted(glob.glob('test_*.py'))
+
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Auto-discover all test_*.py files in the script's directory
+    test_files = sorted(glob.glob(os.path.join(script_dir, 'test_*.py')))
     
     if not test_files:
         print("ERROR: No test files found (test_*.py)")
@@ -53,41 +56,49 @@ def main():
     
     print(f"Found {len(test_files)} test(s):")
     for test in test_files:
-        print(f"  - {test}")
+        print(f"  - {os.path.basename(test)}")
     print()
     print("=" * 60)
     print()
-    
+
+    # Change to script directory for test execution
+    original_dir = os.getcwd()
+    os.chdir(script_dir)
+
     passed = 0
     failed = 0
     failed_tests = []
-    
+
     start_time = time.time()
-    
+
     for test in test_files:
-        if not os.path.exists(test):
-            print(f"WARNING: Test file not found: {test}")
+        test_name = os.path.basename(test)
+        if not os.path.exists(test_name):
+            print(f"WARNING: Test file not found: {test_name}")
             continue
-        
-        print(f"Running {test}...")
+
+        print(f"Running {test_name}...")
         print("-" * 60)
-        
+
         test_start = time.time()
-        return_code, output = run_test_with_output(test)
+        return_code, output = run_test_with_output(test_name)
         test_duration = time.time() - test_start
-        
+
         print("-" * 60)
-        
+
         if return_code == 0:
-            print(f"{test} PASSED ({test_duration:.2f}s)")
+            print(f"{test_name} PASSED ({test_duration:.2f}s)")
             passed += 1
         else:
-            print(f"{test} FAILED (exit code: {return_code}, {test_duration:.2f}s)")
+            print(f"{test_name} FAILED (exit code: {return_code}, {test_duration:.2f}s)")
             failed += 1
-            failed_tests.append(test)
-        
+            failed_tests.append(test_name)
+
         print()
-    
+
+    # Restore original directory
+    os.chdir(original_dir)
+
     total_duration = time.time() - start_time
     
     # Summary
