@@ -88,7 +88,7 @@ def test_recorder_basic():
 	for i in range(buffers_to_record+7):
 		buf = proc.get_next_available_buffer()
 		buf[:] = i  # Fill with test data
-		time.sleep(0.0001)  # wait for 100us to simulate acquisition time
+		time.sleep(0.002)  # wait to simulate acquisition time
 		proc.process(buf)
 
 	print(f"  [OK] Processed {buffers_to_record+7} buffers")
@@ -150,7 +150,7 @@ def test_start_recording_while_processing():
 
 		buf = proc.get_next_available_buffer()
 		buf[:] = (i * 100) % 255  # Fill with test data pattern
-		time.sleep(0.0001)  # wait for 100us to simulate acquisition time
+		time.sleep(0.002)  # wait to simulate acquisition time
 		proc.process(buf)
 
 
