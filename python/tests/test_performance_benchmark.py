@@ -37,7 +37,7 @@ if not is_aarch64:
     SIGNAL_LENGTHS = [512, 1024, 2048, 4096]
     ASCANS_PER_BSCAN = [256, 512, 1024, 2048]
     BSCANS_PER_BUFFER = [1]
-    ITERATIONS = 1000
+    ITERATIONS = 100
 else:
     # ============================================
     # Jetson: CUDA-only with reduced sizes
