@@ -43,7 +43,7 @@ const bool BENCHMARK_OPENCL = false;
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
 const int BSCANS_PER_BUFFER[] = {1};
-const int ITERATIONS = 100;
+const int ITERATIONS = 2000;
 #endif
 
 // Processing configuration
@@ -129,7 +129,7 @@ std::vector<uint16_t> generateTestData(int signalLength, int ascansPerBscan, int
 		singleBscan.insert(singleBscan.end(), ascan.begin(), ascan.end());
 	}
 	
-	// Copy the same B-scan multiple times (fast!)
+	// Copy the same B-scan multiple times
 	for (int b = 0; b < bscansPerBuffer; ++b) {
 		data.insert(data.end(), singleBscan.begin(), singleBscan.end());
 	}

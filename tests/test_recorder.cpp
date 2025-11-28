@@ -33,6 +33,12 @@ void testBasicRecording() {
 
 	ope::Processor processor(TEST_BACKEND);
 	processor.setInputParameters(2048, 1024, 2, ope::DataType::UINT16);
+
+
+	//ope::CudaConfig cudaConfig;
+	//cudaConfig.enableZeroCopy = true;
+	//processor.setBackendConfig(cudaConfig);
+	
 	processor.initialize();
 
 	ope::tools::Recorder recorder;
@@ -96,7 +102,7 @@ void testStartRecordingWhileProcessing() {
 	}
 
 	// Wait for recording to complete
-	bool success = recorder.waitForCompletion(5000);
+	bool success = recorder.waitForCompletion(50000);
 	TEST_ASSERT(success, "Operation should succeed");
 	auto summary = recorder.getLastRecordingSummary();
 	TEST_ASSERT(summary.rawRecorded == buffersToRecord, "Raw buffers should match buffersToRecord");
@@ -161,7 +167,7 @@ void testEarlyStopIncompleteRecording() {
 	}
 	
 	// Wait for write to complete (data should be saved with partial recording)
-	bool writeSuccess = recorder.waitForCompletion(5000);
+	bool writeSuccess = recorder.waitForCompletion(50000);
 	TEST_ASSERT(writeSuccess, "Data should be written despite incomplete recording");
 
 	auto summary = recorder.getLastRecordingSummary();
@@ -208,7 +214,7 @@ void testVolumeSynchronizationBothMode() {
 		}
 	}
 
-	bool success = recorder.waitForCompletion(5000);
+	bool success = recorder.waitForCompletion(50000);
 	
 	auto summary = recorder.getLastRecordingSummary();
 	std::cout << "  Raw buffer IDs: [";

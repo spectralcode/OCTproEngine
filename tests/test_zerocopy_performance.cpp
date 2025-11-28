@@ -22,7 +22,7 @@ const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
 const int BSCANS_PER_BUFFER[] = {2}; 
 
 // Number of iterations per test
-const int ITERATIONS = 100;
+const int ITERATIONS = 2000;
 
 // Processing configuration
 const bool ENABLE_RESAMPLING = true;
@@ -368,7 +368,9 @@ int main() {
 	std::cout << std::endl;
 
 	std::vector<BenchmarkResult> results;
+	std::vector<BenchmarkResult> portableResults;  // Store portable results for speedup calculation
 
+	// Run all portable mode tests first
 	for (int sl = 0; sl < numSignalLengths; ++sl) {
 		int signalLength = SIGNAL_LENGTHS[sl];
 
@@ -376,7 +378,7 @@ int main() {
 			int ascansPerBscan = ASCANS_PER_BSCAN[ap];
 			int bscansPerBuffer = BSCANS_PER_BUFFER[0];
 
-			// Generate test data once for both modes
+			// Generate test data
 			auto testData = generateTestData(signalLength, ascansPerBscan, bscansPerBuffer);
 
 			// Test portable (pinned) mode
@@ -387,9 +389,24 @@ int main() {
 
 			auto portableResult = runBenchmark(signalLength, ascansPerBscan, bscansPerBuffer,
 			                                    testData, false, "Portable");
+			portableResults.push_back(portableResult);
 			results.push_back(portableResult);
 
 			std::cout << std::fixed << std::setprecision(3) << portableResult.avgTimeMs << " ms" << std::endl;
+		}
+	}
+
+	// Run all zero-copy mode tests
+	int resultIdx = 0;
+	for (int sl = 0; sl < numSignalLengths; ++sl) {
+		int signalLength = SIGNAL_LENGTHS[sl];
+
+		for (int ap = 0; ap < numAscans; ++ap) {
+			int ascansPerBscan = ASCANS_PER_BSCAN[ap];
+			int bscansPerBuffer = BSCANS_PER_BUFFER[0];
+
+			// Generate test data
+			auto testData = generateTestData(signalLength, ascansPerBscan, bscansPerBuffer);
 
 			// Test zero-copy mode
 			currentTest++;
@@ -400,8 +417,9 @@ int main() {
 			auto zerocopyResult = runBenchmark(signalLength, ascansPerBscan, bscansPerBuffer,
 			                                    testData, true, "Zero-Copy");
 
-			// Calculate speedup relative to portable mode
-			zerocopyResult.speedup = portableResult.avgTimeMs / zerocopyResult.avgTimeMs;
+			// Calculate speedup relative to corresponding portable mode result
+			zerocopyResult.speedup = portableResults[resultIdx].avgTimeMs / zerocopyResult.avgTimeMs;
+			resultIdx++;
 
 			results.push_back(zerocopyResult);
 

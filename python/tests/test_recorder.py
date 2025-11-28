@@ -8,6 +8,7 @@ sys.path.insert(0, build_dir)
 
 import octproengine as ope
 import numpy as np
+import time
 
 def test_recorder_enums():
 	"""Test that all recorder enums are accessible"""
@@ -40,7 +41,14 @@ def test_recorder_basic():
 
 	# Create processor
 	proc = ope.Processor(ope.Backend.CUDA)
+
+	# Set cuda memory config:
+	cuda_config = ope.CudaConfig()
+	cuda_config.enable_zero_copy = False
+	proc.set_backend_config(cuda_config)
+
 	proc.set_input_parameters(1024, 512, 1, ope.DataType.UINT16)
+
 	proc.initialize()
 	print("  [OK] Processor created and initialized")
 
@@ -54,16 +62,17 @@ def test_recorder_basic():
 	print("  [OK] Attached to processor")
 
 	# Configure recorder
+	buffers_to_record = 128
 	recorder.set_mode(ope.RecorderMode.BOTH)
-	recorder.set_buffer_count(5)
+	recorder.set_buffer_count(buffers_to_record)
 	recorder.set_output_base_name("test_python_recording")
 	recorder.set_use_timestamp(False)
 	recorder.set_manual_allocation(True)
 	print("  [OK] Recorder configured")
 
 	# Check configuration
-	assert recorder.get_buffer_count() == 5
-	print("  [OK] Buffer count verified: 5")
+	assert recorder.get_buffer_count() == buffers_to_record
+	print(f"  [OK] Buffer count verified: {buffers_to_record}")
 
 	# Allocate buffers
 	recorder.allocate_buffers()
@@ -76,14 +85,16 @@ def test_recorder_basic():
 	print("  [OK] Recording started")
 
 	# Process some data
-	for i in range(10):
+	for i in range(buffers_to_record+7):
 		buf = proc.get_next_available_buffer()
 		buf[:] = i  # Fill with test data
+		time.sleep(0.0001)  # wait for 100us to simulate acquisition time
 		proc.process(buf)
-	print("  [OK] Processed 10 buffers")
+
+	print(f"  [OK] Processed {buffers_to_record+7} buffers")
 
 	# Wait for recording to complete
-	success = recorder.wait_for_completion(10000)
+	success = recorder.wait_for_completion(100000)
 	assert success, f"Recording failed: {recorder.get_last_error()}"
 	print("  [OK] Recording completed")
 
@@ -95,9 +106,9 @@ def test_recorder_basic():
 	print(f"    Processed recorded: {summary.processed_recorded}")
 	print(f"    Complete: {summary.complete}")
 
-	assert summary.expected_buffers == 5
-	assert summary.raw_recorded == 5
-	assert summary.processed_recorded == 5
+	assert summary.expected_buffers == buffers_to_record
+	assert summary.raw_recorded == buffers_to_record
+	assert summary.processed_recorded == buffers_to_record
 	assert summary.complete == True
 	print("  [OK] Recording summary verified")
 
@@ -122,8 +133,8 @@ def test_start_recording_while_processing():
 	recorder.set_manual_allocation(True)
 
 	print("  Processing buffers...")
-	buffers_before_recording = 64
-	buffers_to_record = 32
+	buffers_before_recording = 63
+	buffers_to_record = 512
 
 	recorder.set_buffer_count(buffers_to_record)
 	recorder.allocate_buffers()
@@ -139,12 +150,14 @@ def test_start_recording_while_processing():
 
 		buf = proc.get_next_available_buffer()
 		buf[:] = (i * 100) % 255  # Fill with test data pattern
+		time.sleep(0.0001)  # wait for 100us to simulate acquisition time
 		proc.process(buf)
 
-	print("  [OK] Processed all buffers")
+
+	print("  [OK] Processed all buffers. Waiting for recording to complete...")
 
 	# Wait for recording to complete
-	success = recorder.wait_for_completion(5000)
+	success = recorder.wait_for_completion(50000)
 
 	# Get and verify summary
 	summary = recorder.get_last_recording_summary()
@@ -162,7 +175,7 @@ def test_start_recording_while_processing():
 		f"Raw buffers should be {buffers_to_record}, got {summary.raw_recorded}"
 	assert summary.processed_recorded == buffers_to_record, \
 		f"Processed buffers should be {buffers_to_record}, got {summary.processed_recorded}"
-	print("  [OK] Buffer counts verified")
+	print(f"  [OK] Buffer counts verified: Processed buffers should be {buffers_to_record}, got {summary.processed_recorded}")
 
 
 	# Verify IDs match
