@@ -3,7 +3,7 @@
 High-performance Optical Coherence Tomography (OCT) processing library with GPU acceleration.
 
 ## Performance
-Preliminary results: [Performance Benchmark 2025-11-25](documentation/developer/PERFORMANCE.md)
+Preliminary results: [Performance Benchmark](documentation/developer/PERFORMANCE.md)
 
 ## Requirements
 
@@ -35,7 +35,7 @@ The bat script builds the C++ library as well as the Python bindings.
 
 
 **Alternative: build manually**  
-For default build wihtout python bindings, run:
+For default build without python bindings, run:
 ```bash
 cd path\to\octproengine  # Replace with your actual path
 mkdir build
@@ -67,9 +67,9 @@ Here is a list of all available build options:
 
 **Note:** At least one backend (`BUILD_CUDA`, `BUILD_CPU`, or `BUILD_OPENCL`) must be enabled.
 
-### Linux
+### Linux / Jetson
 
-not tested yet
+See [Jetson Build Instructions](documentation/BUILDING_JETSON.md) for NVIDIA Jetson platforms.
 
 ## Running Tests
 
