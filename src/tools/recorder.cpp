@@ -444,16 +444,19 @@ void Recorder::registerCallbacksForCurrentMode() {
 void Recorder::collectRawBuffer(const IOBuffer& buffer) {
 	if (this->status.load() != Status::RECORDING) return;
 
+	uint64_t bufferId = buffer.getBufferId();
+	const void* dataPtr = buffer.getDataPointer();
+	size_t dataSize = buffer.getSizeInBytes();
+
 	if (this->waitingForVolumeStartRaw) {
-		uint64_t bufferId = buffer.getBufferId();
 		if (bufferId % this->buffersPerVolume != 0) {
 			return;
 		}
 		this->waitingForVolumeStartRaw = false;
 	}
-	
+
 	// Claim next index atomically
-	// this loop handles the case where collectRawBuffer is called extremy fast in succession. 
+	// this loop handles the case where collectRawBuffer is called extremy fast in succession.
 	// it avoids overshooting the numBuffersToRecord
 	size_t index = this->rawBuffersRecorded.load();
 	while (index < this->numBuffersToRecord) {
@@ -461,7 +464,7 @@ void Recorder::collectRawBuffer(const IOBuffer& buffer) {
 			// On success it returns true. On failure (another thread updated the value or a so called 'spurious failure').
 			// it returns false and updates 'index' to the current value of rawBuffersRecorded.
 			// see: - Wikipedia, atomic adder example: https://en.wikipedia.org/wiki/Compare-and-swap
-			//      - cppreference: https://en.cppreference.com/w/cpp/atomic/atomic/compare_exchange.html 
+			//      - cppreference: https://en.cppreference.com/w/cpp/atomic/atomic/compare_exchange.html
 			//      - Raymond Chen blog post: https://devblogs.microsoft.com/oldnewthing/20180330-00/?p=98395)
 		if (this->rawBuffersRecorded.compare_exchange_weak(index, index + 1)) { //compare_exchane_weak increases rawBuffersRecorded if not already increased by another thread
 			break; // Successfully claimed this index
@@ -472,14 +475,14 @@ void Recorder::collectRawBuffer(const IOBuffer& buffer) {
 	}
 
 	if (index == 0) {
-		this->firstRawBufferId.store(buffer.getBufferId()); //used for syncing processed buffers in BOTH mode
+		this->firstRawBufferId.store(bufferId); //used for syncing processed buffers in BOTH mode
 	}
 
 	size_t offset = index * this->rawBufferSize;
 	std::memcpy(this->rawData.data() + offset,
-	            buffer.getDataPointer(),
-	            buffer.getSizeInBytes());
-	this->rawBufferIds[index] = buffer.getBufferId();
+	            dataPtr,
+	            dataSize);
+	this->rawBufferIds[index] = bufferId;
 
 	// Check if this was the last buffer and signal raw completion thread
 	if (index + 1 == this->numBuffersToRecord) {
