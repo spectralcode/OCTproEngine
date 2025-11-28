@@ -62,9 +62,9 @@ struct CudaBackend::Impl {
 	cudaStream_t userRequestStream;
 	cudaEvent_t syncEvent;
 	int currentStream = 0;
-	
+
 	// Input buffer management (queue-based, thread-safe)
-	int numInputBuffers = 2;  // Default 2, user configurable
+	int numInputBuffers = 2;  // Default 2
 	std::vector<IOBuffer> hostInputBuffers;
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
@@ -184,7 +184,7 @@ void CudaBackend::setEnableZeroCopy(bool enable) {
 
 void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->config = config;
-	
+
 	// Set CUDA device
 	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
 	
@@ -233,7 +233,6 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 #ifdef __aarch64__
 		// Jetson: IOBuffer already allocated with cudaHostAlloc (see iobuffer.cpp)
 		// No need to register - memory is already CUDA-pinned
-		// Note: Use cudaHostGetDevicePointer() if ENABLE_CUDA_ZERO_COPY is defined
 #else
 		// Desktop: Register the allocated memory with CUDA for fast PCIe transfers
 		void* ptr = this->impl->hostInputBuffers[i].getDataPointer();
@@ -494,9 +493,15 @@ void CudaBackend::process(IOBuffer& input) {
 	// Round-robin stream selection
 	this->impl->currentStream = (this->impl->currentStream + 1) % this->impl->numStreams;
 	cudaStream_t stream = this->impl->streams[this->impl->currentStream];
-	
-	// Round-robin device buffer selection
+
+	// Round-robin device buffer selection 
+#ifdef __aarch64__
+	if (!this->impl->enableZeroCopy) {
+		this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
+	}
+#else
 	this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
+#endif
 
 	// Select output buffer
 	IOBuffer* currentOutputBuf = &this->impl->outputBuffers[this->impl->currentStream];
@@ -506,12 +511,38 @@ void CudaBackend::process(IOBuffer& input) {
 
 	// Copy input to device
 	void* d_input = nullptr;
-	
-#if defined(__aarch64__) && defined(ENABLE_CUDA_ZERO_COPY)
-	// Zero-copy: Get device pointer directly to host memory
-	checkCudaErrors(cudaHostGetDevicePointer(&d_input, input.getDataPointer(), 0));
+
+#ifdef __aarch64__
+	// Jetson: Check runtime zero-copy setting
+	if (this->impl->enableZeroCopy) {
+		// Zero-copy: Get device pointer directly to host memory (allocated with cudaHostAllocMapped)
+		checkCudaErrors(cudaHostGetDevicePointer(&d_input, input.getDataPointer(), 0));
+
+		// In zero-copy mode, GPU accesses host buffer directly, so we must return it only
+		// after the entire processing stream completes (not just after memcpy like non-zero-copy)
+		// We'll register this callback at the end of the stream (after all processing kernels)
+	} else {
+		// Zero-copy disabled: Use regular async copy (memory allocated with cudaHostAllocPortable)
+		d_input = this->impl->d_inputBuffers[this->impl->currentBuffer];
+		checkCudaErrors(cudaMemcpyAsync(
+			d_input,
+			input.getDataPointer(),
+			this->impl->samplesPerBuffer * this->impl->bytesPerSample,
+			cudaMemcpyHostToDevice,
+			stream
+		));
+
+		// Get pre-allocated callback data for returning buffer after memcpy
+		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
+		          static_cast<int>(this->impl->callbackDataPool.size());
+		Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
+		returnData->inputBuffer = &input;
+
+		// Register callback to return buffer after memcpy completes
+		checkCudaErrors(cudaLaunchHostFunc(stream, returnBufferCallback, returnData));
+	}
 #else
-	// Regular path: Async copy to device
+	// Desktop: Always use regular async copy
 	d_input = this->impl->d_inputBuffers[this->impl->currentBuffer];
 	checkCudaErrors(cudaMemcpyAsync(
 		d_input,
@@ -520,13 +551,13 @@ void CudaBackend::process(IOBuffer& input) {
 		cudaMemcpyHostToDevice,
 		stream
 	));
-	
+
 	// Get pre-allocated callback data for returning buffer after memcpy
-	int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) % 
+	int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
 	          static_cast<int>(this->impl->callbackDataPool.size());
 	Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
 	returnData->inputBuffer = &input;
-	
+
 	// Register callback to return buffer after memcpy completes
 	checkCudaErrors(cudaLaunchHostFunc(stream, returnBufferCallback, returnData));
 #endif
@@ -561,22 +592,24 @@ void CudaBackend::process(IOBuffer& input) {
 			samplesPerBuffer
 		);
 	}
-	
-#if defined(__aarch64__) && defined(ENABLE_CUDA_ZERO_COPY)
-	// Zero-copy: Return buffer after inputToCufftComplex completes
-	// (input buffer no longer needed after conversion to d_fftBuffer)
-	int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) % 
-	          static_cast<int>(this->impl->callbackDataPool.size());
-	Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
-	returnData->inputBuffer = &input;
-	checkCudaErrors(cudaLaunchHostFunc(stream, returnBufferCallback, returnData));
-#else
-	// Synchronization for data acquisition pacing / Zero-copy buffer return
+
+	// Synchronization 
 	//todo: review. probably can be removed, synchronization is done via input buffer callbacks
 	cudaEventRecord(this->impl->syncEvent, stream);
 	cudaEventSynchronize(this->impl->syncEvent);
+
+
+	// For zero-copy mode on Jetson, return the input buffer
+#ifdef __aarch64__
+	if (this->impl->enableZeroCopy) {
+		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
+		          static_cast<int>(this->impl->callbackDataPool.size());
+		Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
+		returnData->inputBuffer = &input;
+		checkCudaErrors(cudaLaunchHostFunc(stream, returnBufferCallback, returnData));
+	}
 #endif
-	
+
 	// Step 2: Rolling average background removal
 	if (config.processingParams.dcRemoval.enabled) {
 		int sharedMemSize = (blockSize + 2 * config.processingParams.dcRemoval.windowSize) * sizeof(float);
@@ -829,7 +862,7 @@ void CudaBackend::process(IOBuffer& input) {
 		stream
 	));
 	
-	// Step 11: Register callback to be called when stream completes
+	// Step 11: Register callbacks to be called when stream completes
 	if (this->impl->callback) {
 		// Get pre-allocated callback data for output callback
 		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
@@ -1103,10 +1136,20 @@ GpuDeviceInfo CudaBackend::getDeviceInfo(int deviceId) {
 
 void CudaBackend::allocateDeviceBuffers() {
 	// Allocate device input buffers (one per stream for overlap, unless using zero-copy)
-#if !defined(__aarch64__) || !defined(ENABLE_CUDA_ZERO_COPY)
+#ifdef __aarch64__
+	// Jetson: Only allocate if zero-copy is disabled at runtime
+	if (!this->impl->enableZeroCopy) {
+		this->impl->d_inputBuffers.resize(this->impl->numStreams);
+		for (int i = 0; i < this->impl->numStreams; ++i) {
+			checkCudaErrors(cudaMalloc(&this->impl->d_inputBuffers[i],
+				this->impl->bytesPerSample * this->impl->samplesPerBuffer));
+		}
+	}
+#else
+	// Desktop: Always allocate device input buffers
 	this->impl->d_inputBuffers.resize(this->impl->numStreams);
 	for (int i = 0; i < this->impl->numStreams; ++i) {
-		checkCudaErrors(cudaMalloc(&this->impl->d_inputBuffers[i], 
+		checkCudaErrors(cudaMalloc(&this->impl->d_inputBuffers[i],
 			this->impl->bytesPerSample * this->impl->samplesPerBuffer));
 	}
 #endif
