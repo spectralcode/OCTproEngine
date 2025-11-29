@@ -74,15 +74,16 @@ struct VulkanBackend::Impl {
 	// IMPORTANT: Keep this in sync with the order of push_back calls in createComputePipelines()
 	enum class PipelineIndex : size_t {
 		InputConversion = 0,       // Convert input data to float
-		Truncate = 1,              // Post-FFT magnitude/truncate
-		Windowing = 2,             // Apply window function
-		Postprocess = 3,           // Log scaling, grayscale normalization
-		DcRemoval = 4,             // Rolling average background removal
-		KLinearization = 5,        // K-space linearization (resampling)
-		Dispersion = 6,            // Dispersion compensation
+		Windowing = 1,             // Apply window function
+		DcRemoval = 2,             // Rolling average background removal
+		KLinearization = 3,        // K-space linearization (resampling)
+		Dispersion = 4,            // Dispersion compensation
+		FpnDetermination = 5,      // Fixed pattern noise determination
 		// NOTE: Universal pre-FFT pipeline variants are stored separately in universalPipelines[] array
+		// NOTE: Universal post-FFT pipeline variants are stored separately in universalPostFFTPipelines[] array
+		//       (replaces old Truncate + Postprocess pipelines)
 
-		Count = 7  // Total number of pipelines (universal variants not included)
+		Count = 6  // Total number of pipelines (universal variants not included)
 	};
 
 	// Helper function to get pipeline with type-safe indexing
@@ -175,20 +176,10 @@ struct VulkanBackend::Impl {
 	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> descriptorSets;
 
-	// Truncate pipeline resources
-	VkPipelineLayout truncatePipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout truncateDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> truncateDescriptorSets;
-
 	// Windowing pipeline resources
 	VkPipelineLayout windowingPipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout windowingDescriptorSetLayout = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> windowingDescriptorSets;
-
-	// Post-processing pipeline resources
-	VkPipelineLayout postprocessPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout postprocessDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> postprocessDescriptorSets;
 
 	// DC removal pipeline resources
 	VkPipelineLayout dcRemovalPipelineLayout = VK_NULL_HANDLE;
@@ -216,6 +207,22 @@ struct VulkanBackend::Impl {
 	//   interpolation_method: 0=cubic, 1=linear, 2=lanczos
 	// DC removal is now a separate pass
 	VkPipeline universalPipelines[6];  // [useIntermediate][interpolation] flattened
+
+	// Universal post-FFT processing pipeline resources
+	VkPipelineLayout universalPostFFTPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout universalPostFFTDescriptorSetLayout = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> universalPostFFTDescriptorSets;
+
+	// Universal post-FFT pipeline variants (with different specialization constants)
+	// Linear index: enableFixedPatternNoise * 2 + logScaling
+	//   enableFixedPatternNoise: 0=disabled, 1=enabled
+	//   logScaling: 0=linear, 1=log
+	VkPipeline universalPostFFTPipelines[4];  // [FPN][logScaling] flattened
+
+	// Fixed pattern noise determination pipeline resources
+	VkPipelineLayout fpnDeterminationPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout fpnDeterminationDescriptorSetLayout = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> fpnDeterminationDescriptorSets;
 
 	// Shader modules (will be created later)
 	std::vector<VkShaderModule> shaderModules;
@@ -1111,89 +1118,117 @@ void VulkanBackend::process(IOBuffer& input) {
 	                     0, nullptr);
 
 	// ============================================
-	// Dispatch Truncate Shader
+	// Fixed Pattern Noise Determination (if needed)
 	// ============================================
 
-	// Bind truncate pipeline
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::Truncate));
+	if (this->impl->config.processingParams.fixedPatternNoise.enabled && !this->impl->fixedPatternNoiseDetermined) {
+		// Dispatch FPN determination shader to compute mean A-line
+		// This happens once when FPN is first requested, using the current frame's data
 
-	// Bind truncate descriptor set
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->truncatePipelineLayout,
-	                        0, 1, &this->impl->truncateDescriptorSets[idx], 0, nullptr);
+		// Bind FPN determination pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::FpnDetermination));
 
-	// Push constants for truncate: fullSignalLength, outputSignalLength, samplesPerBuffer
+		// Bind FPN determination descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->fpnDeterminationPipelineLayout,
+		                        0, 1, &this->impl->fpnDeterminationDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: width, height, segments, stride, outputSignalLength
+		struct FpnDeterminationPushConstants {
+			uint32_t width;         // outputSignalLength (samples per A-scan after truncation)
+			uint32_t height;        // Number of A-scans in buffer
+			uint32_t segments;      // Number of segments for minimum variance calculation
+			uint32_t stride;        // fullSignalLength (stride between A-scans in input)
+			uint32_t outputSignalLength;  // Same as width
+		} fpnPush;
+
+		int outputSignalLength = this->impl->signalLength / 2;
+		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
+		fpnPush.height = static_cast<uint32_t>(this->impl->ascansPerBscan * this->impl->bscansPerBuffer);
+		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
+		fpnPush.stride = static_cast<uint32_t>(this->impl->signalLength);
+		fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
+
+		vkCmdPushConstants(cmd, this->impl->fpnDeterminationPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(fpnPush), &fpnPush);
+
+		// Dispatch FPN determination shader (one thread per sample in the output A-scan)
+		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + 127) / 128;
+		vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
+
+		// Barrier: wait for FPN profile to be written before using it
+		VkBufferMemoryBarrier fpnBarrier = {};
+		fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		fpnBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		fpnBarrier.buffer = this->impl->meanALineBuffer;
+		fpnBarrier.offset = 0;
+		fpnBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &fpnBarrier,
+		                     0, nullptr);
+
+		// Mark as determined for subsequent frames
+		this->impl->fixedPatternNoiseDetermined = true;
+	}
+
+	// ============================================
+	// Dispatch Universal Post-FFT Shader
+	// Merges: Fixed Pattern Noise Removal + Magnitude + Log/Linear Scaling + Normalization
+	// ============================================
+
+	// Select the appropriate universal post-FFT pipeline variant
+	bool fpnEnabled = this->impl->config.processingParams.fixedPatternNoise.enabled && this->impl->fixedPatternNoiseDetermined;
+	bool logScaling = this->impl->config.processingParams.intensity.logScale;
+	int fpnIdx = fpnEnabled ? 1 : 0;
+	int logIdx = logScaling ? 1 : 0;
+	int postFFTPipelineIdx = fpnIdx * 2 + logIdx;  // Linear index: 0-3
+
+	VkPipeline universalPostFFTPipeline = this->impl->universalPostFFTPipelines[postFFTPipelineIdx];
+
+	// Bind universal post-FFT pipeline
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPostFFTPipeline);
+
+	// Bind universal post-FFT descriptor set
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->universalPostFFTPipelineLayout,
+	                        0, 1, &this->impl->universalPostFFTDescriptorSets[idx], 0, nullptr);
+
+	// Push constants: fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
 	int outputSignalLength = this->impl->signalLength / 2;
-	uint32_t truncatePushConstants[3] = {
-		static_cast<uint32_t>(this->impl->signalLength),
-		static_cast<uint32_t>(outputSignalLength),
-		static_cast<uint32_t>(this->impl->samplesPerBuffer)
-	};
-	vkCmdPushConstants(cmd, this->impl->truncatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-	                   0, sizeof(truncatePushConstants), truncatePushConstants);
-
-	// Dispatch truncate shader
-	uint32_t truncateWorkgroups = (this->impl->samplesPerBuffer + 127) / 128;
-	vkCmdDispatch(cmd, truncateWorkgroups, 1, 1);
-
-
-	// Barrier after truncate (wait for writes to deviceProcessedBuffer to complete before postprocess)
-	VkBufferMemoryBarrier truncateToPostprocessBarrier = {};
-	truncateToPostprocessBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	truncateToPostprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	truncateToPostprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	truncateToPostprocessBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	truncateToPostprocessBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	truncateToPostprocessBarrier.buffer = this->impl->deviceProcessedBuffer;
-	truncateToPostprocessBarrier.offset = 0;
-	truncateToPostprocessBarrier.size = VK_WHOLE_SIZE;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &truncateToPostprocessBarrier,
-	                     0, nullptr);
-
-	// ============================================
-	// Dispatch Post-Process Shader (Log Scaling, Grayscale Normalization)
-	// ============================================
-
-	// Bind postprocess pipeline
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::Postprocess));
-
-	// Bind postprocess descriptor set
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->postprocessPipelineLayout,
-	                        0, 1, &this->impl->postprocessDescriptorSets[idx], 0, nullptr);
-
-	// Push constants for postprocess: samplesPerBuffer, logScaling, outputSignalLength, grayscaleMax, grayscaleMin, addend, multiplicator
 	size_t truncatedSamples = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
-	struct PostprocessPushConstants {
+
+	struct UniversalPostFFTPushConstants {
+		uint32_t fullSignalLength;
+		uint32_t outputSignalLength;
 		uint32_t samplesPerBuffer;
-		uint32_t logScaling;  // 1 for log, 0 for linear
-		uint32_t outputSignalLength;  // FFT size for normalization (1024)
 		float grayscaleMax;
 		float grayscaleMin;
 		float addend;
 		float multiplicator;
-	} postprocessPush;
+	} universalPostFFTPush;
 
-	postprocessPush.samplesPerBuffer = static_cast<uint32_t>(truncatedSamples);
-	postprocessPush.logScaling = this->impl->config.processingParams.intensity.logScale ? 1 : 0;
-	postprocessPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
-	postprocessPush.grayscaleMax = this->impl->config.processingParams.intensity.rangeMax;
-	postprocessPush.grayscaleMin = this->impl->config.processingParams.intensity.rangeMin;
-	postprocessPush.addend = this->impl->config.processingParams.intensity.postOffset;
-	postprocessPush.multiplicator = this->impl->config.processingParams.intensity.preScale;
+	universalPostFFTPush.fullSignalLength = static_cast<uint32_t>(this->impl->signalLength);
+	universalPostFFTPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
+	universalPostFFTPush.samplesPerBuffer = static_cast<uint32_t>(this->impl->samplesPerBuffer);
+	universalPostFFTPush.grayscaleMax = this->impl->config.processingParams.intensity.rangeMax;
+	universalPostFFTPush.grayscaleMin = this->impl->config.processingParams.intensity.rangeMin;
+	universalPostFFTPush.addend = this->impl->config.processingParams.intensity.postOffset;
+	universalPostFFTPush.multiplicator = this->impl->config.processingParams.intensity.preScale;
 
-	vkCmdPushConstants(cmd, this->impl->postprocessPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-	                   0, sizeof(postprocessPush), &postprocessPush);
+	vkCmdPushConstants(cmd, this->impl->universalPostFFTPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   0, sizeof(universalPostFFTPush), &universalPostFFTPush);
 
-	// Dispatch postprocess shader
-	uint32_t postprocessWorkgroups = (truncatedSamples + 127) / 128;
-	vkCmdDispatch(cmd, postprocessWorkgroups, 1, 1);
+	// Dispatch universal post-FFT shader
+	uint32_t universalPostFFTWorkgroups = (this->impl->samplesPerBuffer + 127) / 128;
+	vkCmdDispatch(cmd, universalPostFFTWorkgroups, 1, 1);
 
-	// Barrier after postprocess (wait for writes to complete before copy)
+	// Barrier after universal post-FFT (wait for writes to complete before copy)
 	VkBufferMemoryBarrier postprocessOutputBarrier = {};
 	postprocessOutputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
 	postprocessOutputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1489,9 +1524,78 @@ void VulkanBackend::requestFixedPatternNoiseDetermination() {
 }
 
 void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
+	if (!profileInterleaved || complexPairs == 0) {
+		throw std::invalid_argument("Invalid fixed pattern noise profile pointer or size");
+	}
+
+	// Expect complexPairs == outputSignalLength (signalLength/2)
+	size_t expectedPairs = static_cast<size_t>(this->impl->signalLength / 2);
+	if (complexPairs != expectedPairs) {
+		throw std::invalid_argument("Invalid fixed pattern noise profile size. Expected " + std::to_string(expectedPairs) + " complex pairs but got " + std::to_string(complexPairs));
+	}
+
+	// Store profile locally
 	this->impl->recordedFixedPatternNoise.assign(profileInterleaved, profileInterleaved + complexPairs * 2);
+
+	// Upload to GPU
+	if (this->impl->meanALineBuffer == VK_NULL_HANDLE) {
+		throw std::runtime_error("Mean A-line buffer not initialized");
+	}
+
+	// Create staging buffer for upload
+	VkBuffer stagingBuffer;
+	VkDeviceMemory stagingMemory;
+	VkDeviceSize bufferSize = complexPairs * 2 * sizeof(float);  // Interleaved complex data
+
+	createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
+	             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             stagingBuffer, stagingMemory);
+
+	// Copy profile data to staging buffer
+	void* mappedMemory;
+	vkMapMemory(this->impl->device, stagingMemory, 0, bufferSize, 0, &mappedMemory);
+	memcpy(mappedMemory, profileInterleaved, bufferSize);
+	vkUnmapMemory(this->impl->device, stagingMemory);
+
+	// Copy from staging to device buffer using a temporary command buffer
+	VkCommandBufferAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = this->impl->commandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+
+	VkCommandBuffer cmdBuffer;
+	vkAllocateCommandBuffers(this->impl->device, &allocInfo, &cmdBuffer);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+	vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+
+	VkBufferCopy copyRegion = {};
+	copyRegion.size = bufferSize;
+	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->meanALineBuffer, 1, &copyRegion);
+
+	vkEndCommandBuffer(cmdBuffer);
+
+	// Submit and wait
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &cmdBuffer;
+
+	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(this->impl->computeQueue);
+
+	// Cleanup
+	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
+	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
+	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
+
+	// Mark FPN as determined
 	this->impl->fixedPatternNoiseDetermined = true;
-	// TODO: Upload to device buffer
 }
 
 const std::vector<float>& VulkanBackend::getFixedPatternNoiseProfile() const {
@@ -1934,6 +2038,11 @@ std::vector<float> VulkanBackend::postProcessTruncate(
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 
+		// TODO: Update this to use universal post-FFT pipeline variant (FPN disabled, log/linear based on parameter)
+		// For now, background recording is disabled until universal post-FFT pipeline is fully integrated
+		throw std::runtime_error("requestPostProcessBackgroundRecording not yet implemented for universal post-FFT pipeline");
+
+		/* OLD CODE - Commented out until universal post-FFT pipeline integration is complete
 		// Create descriptor set
 		VkDescriptorSetAllocateInfo descAllocInfo = {};
 		descAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -2014,6 +2123,7 @@ std::vector<float> VulkanBackend::postProcessTruncate(
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
 		                     0, 1, &computeBarrier, 0, nullptr, 0, nullptr);
+		*/ // End of OLD CODE comment
 
 		// Create staging output buffer
 		VkBuffer stagingOutput = VK_NULL_HANDLE;
@@ -2243,6 +2353,13 @@ void VulkanBackend::allocateDeviceBuffers() {
 	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 	             this->impl->dispersionCurveBuffer, this->impl->dispersionCurveMemory);
+
+	// Mean A-line buffer for fixed pattern noise (complex float, outputSignalLength size)
+	size_t meanALineSize = curveSize * 2;  // outputSignalLength * sizeof(complex float)
+	createBuffer(this->impl->device, this->impl->physicalDevice, meanALineSize,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	             this->impl->meanALineBuffer, this->impl->meanALineMemory);
 }
 
 void VulkanBackend::releaseDeviceBuffers() {
@@ -2322,6 +2439,14 @@ void VulkanBackend::releaseDeviceBuffers() {
 	}
 	if (this->impl->dispersionCurveMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(this->impl->device, this->impl->dispersionCurveMemory, nullptr);
+	}
+
+	// Mean A-line buffer for fixed pattern noise
+	if (this->impl->meanALineBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->meanALineBuffer, nullptr);
+	}
+	if (this->impl->meanALineMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->meanALineMemory, nullptr);
 	}
 }
 
@@ -2597,86 +2722,19 @@ void VulkanBackend::createComputePipelines() {
 	this->impl->computePipelines.push_back(inputConversionPipeline);
 
 	// ============================================
-	// Create Truncate Shader Pipeline
-	// ============================================
-
-	// Create descriptor set layout for truncate (2 storage buffers: FFT input, processed output)
-	std::vector<VkDescriptorSetLayoutBinding> truncateBindings(2);
-
-	// Binding 0: FFT buffer (complex input)
-	truncateBindings[0].binding = 0;
-	truncateBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	truncateBindings[0].descriptorCount = 1;
-	truncateBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	truncateBindings[0].pImmutableSamplers = nullptr;
-
-	// Binding 1: Processed buffer (real output)
-	truncateBindings[1].binding = 1;
-	truncateBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	truncateBindings[1].descriptorCount = 1;
-	truncateBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	truncateBindings[1].pImmutableSamplers = nullptr;
-
-	VkDescriptorSetLayoutCreateInfo truncateLayoutInfo = {};
-	truncateLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	truncateLayoutInfo.bindingCount = static_cast<uint32_t>(truncateBindings.size());
-	truncateLayoutInfo.pBindings = truncateBindings.data();
-
-	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &truncateLayoutInfo, nullptr, &this->impl->truncateDescriptorSetLayout));
-
-	// Create pipeline layout for truncate (different push constants)
-	VkPushConstantRange truncatePushConstantRange = {};
-	truncatePushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	truncatePushConstantRange.offset = 0;
-	truncatePushConstantRange.size = sizeof(uint32_t) * 3;  // fullSignalLength, outputSignalLength, samplesPerBuffer
-
-	VkPipelineLayoutCreateInfo truncatePipelineLayoutInfo = {};
-	truncatePipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	truncatePipelineLayoutInfo.setLayoutCount = 1;
-	truncatePipelineLayoutInfo.pSetLayouts = &this->impl->truncateDescriptorSetLayout;
-	truncatePipelineLayoutInfo.pushConstantRangeCount = 1;
-	truncatePipelineLayoutInfo.pPushConstantRanges = &truncatePushConstantRange;
-
-	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &truncatePipelineLayoutInfo, nullptr, &this->impl->truncatePipelineLayout));
-
-	// Load and compile truncate shader
-	std::string truncateShaderPath = "src/backends/vulkan/shaders/truncate.comp";
-	std::string truncateShaderSource = loadShaderSource(truncateShaderPath);
-	std::vector<uint32_t> truncateSPIRV = compileGLSLToSPIRV(truncateShaderSource, truncateShaderPath, shaderc_compute_shader);
-
-	VkShaderModule truncateShader = createShaderModule(this->impl->device, truncateSPIRV);
-	this->impl->shaderModules.push_back(truncateShader);
-
-	// Create truncate compute pipeline
-	VkPipelineShaderStageCreateInfo truncateShaderStageInfo = {};
-	truncateShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	truncateShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	truncateShaderStageInfo.module = truncateShader;
-	truncateShaderStageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo truncatePipelineInfo = {};
-	truncatePipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	truncatePipelineInfo.stage = truncateShaderStageInfo;
-	truncatePipelineInfo.layout = this->impl->truncatePipelineLayout;
-
-	VkPipeline truncatePipeline;
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &truncatePipelineInfo, nullptr, &truncatePipeline));
-	this->impl->computePipelines.push_back(truncatePipeline);
-
-	// ============================================
 	// Create Descriptor Pool
 	// ============================================
 	// Pool needs to allocate for all pipeline descriptor sets
 
 	VkDescriptorPoolSize poolSize = {};
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 29);  // 2 (input conv) + 2 (truncate) + 3 (windowing) + 2 (postprocess) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 5 (merged klinear+windowing+dispersion) + 7 (universal pre-FFT) per command buffer
+	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 30);  // 2 (input conv) + 3 (windowing) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 7 (universal pre-FFT) + 3 (universal post-FFT) + 2 (FPN determination) + 5 (merged klinear+windowing+dispersion) per command buffer
 
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
-	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 9);  // 9 descriptor sets per command buffer (including merged and universal pipelines)
+	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 10);  // 10 descriptor sets per command buffer (including merged, universal, and FPN pipelines)
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Allow individual descriptor sets to be freed
 
 	checkVulkanErrors(vkCreateDescriptorPool(this->impl->device, &poolInfo, nullptr, &this->impl->descriptorPool));
@@ -2735,56 +2793,7 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
-	// Allocate and Update Truncate Descriptor Sets
-	// ============================================
-
-	std::vector<VkDescriptorSetLayout> truncateLayouts(this->impl->numCommandBuffers, this->impl->truncateDescriptorSetLayout);
-
-	VkDescriptorSetAllocateInfo truncateAllocInfo = {};
-	truncateAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	truncateAllocInfo.descriptorPool = this->impl->descriptorPool;
-	truncateAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
-	truncateAllocInfo.pSetLayouts = truncateLayouts.data();
-
-	this->impl->truncateDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &truncateAllocInfo, this->impl->truncateDescriptorSets.data()));
-
-	// Update truncate descriptor sets
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> truncateDescriptorWrites(2);
-
-		// Binding 0: FFT buffer (complex input)
-		VkDescriptorBufferInfo fftBufferInfo = {};
-		fftBufferInfo.buffer = this->impl->deviceFftBuffer;
-		fftBufferInfo.offset = 0;
-		fftBufferInfo.range = VK_WHOLE_SIZE;
-
-		truncateDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		truncateDescriptorWrites[0].dstSet = this->impl->truncateDescriptorSets[i];
-		truncateDescriptorWrites[0].dstBinding = 0;
-		truncateDescriptorWrites[0].dstArrayElement = 0;
-		truncateDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		truncateDescriptorWrites[0].descriptorCount = 1;
-		truncateDescriptorWrites[0].pBufferInfo = &fftBufferInfo;
-
-		// Binding 1: Processed buffer (real output)
-		VkDescriptorBufferInfo processedBufferInfo = {};
-		processedBufferInfo.buffer = this->impl->deviceProcessedBuffer;
-		processedBufferInfo.offset = 0;
-		processedBufferInfo.range = VK_WHOLE_SIZE;
-
-		truncateDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		truncateDescriptorWrites[1].dstSet = this->impl->truncateDescriptorSets[i];
-		truncateDescriptorWrites[1].dstBinding = 1;
-		truncateDescriptorWrites[1].dstArrayElement = 0;
-		truncateDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		truncateDescriptorWrites[1].descriptorCount = 1;
-		truncateDescriptorWrites[1].pBufferInfo = &processedBufferInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(truncateDescriptorWrites.size()), truncateDescriptorWrites.data(), 0, nullptr);
-	}
-
-	// ============================================
+	// Create Windowing Shader Pipeline
 	// ============================================
 
 	// Create descriptor set layout for windowing (3 storage buffers: input, window curve, output)
@@ -2917,126 +2926,6 @@ void VulkanBackend::createComputePipelines() {
 
 		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(windowingDescriptorWrites.size()), windowingDescriptorWrites.data(), 0, nullptr);
 	}
-
-	// ============================================
-	// Create Post-Processing Shader Pipeline
-	// ============================================
-
-	// Create descriptor set layout for post-processing (2 storage buffers: input, output)
-	std::vector<VkDescriptorSetLayoutBinding> postprocessBindings(2);
-
-	// Binding 0: Input buffer (magnitude data from truncate)
-	postprocessBindings[0].binding = 0;
-	postprocessBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	postprocessBindings[0].descriptorCount = 1;
-	postprocessBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	postprocessBindings[0].pImmutableSamplers = nullptr;
-
-	// Binding 1: Output buffer (scaled data)
-	postprocessBindings[1].binding = 1;
-	postprocessBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	postprocessBindings[1].descriptorCount = 1;
-	postprocessBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	postprocessBindings[1].pImmutableSamplers = nullptr;
-
-	VkDescriptorSetLayoutCreateInfo postprocessLayoutInfo = {};
-	postprocessLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	postprocessLayoutInfo.bindingCount = static_cast<uint32_t>(postprocessBindings.size());
-	postprocessLayoutInfo.pBindings = postprocessBindings.data();
-
-	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &postprocessLayoutInfo, nullptr, &this->impl->postprocessDescriptorSetLayout));
-
-	// Create pipeline layout for post-processing
-	VkPushConstantRange postprocessPushConstantRange = {};
-	postprocessPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	postprocessPushConstantRange.offset = 0;
-	postprocessPushConstantRange.size = sizeof(uint32_t) * 2 + sizeof(float) * 4;  // samplesPerBuffer, logScaling, grayscaleMax, grayscaleMin, addend, multiplicator
-
-	VkPipelineLayoutCreateInfo postprocessPipelineLayoutInfo = {};
-	postprocessPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	postprocessPipelineLayoutInfo.setLayoutCount = 1;
-	postprocessPipelineLayoutInfo.pSetLayouts = &this->impl->postprocessDescriptorSetLayout;
-	postprocessPipelineLayoutInfo.pushConstantRangeCount = 1;
-	postprocessPipelineLayoutInfo.pPushConstantRanges = &postprocessPushConstantRange;
-
-	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &postprocessPipelineLayoutInfo, nullptr, &this->impl->postprocessPipelineLayout));
-
-	// Load and compile post-processing shader
-	std::string postprocessShaderPath = "src/backends/vulkan/shaders/postprocess.comp";
-	std::string postprocessShaderSource = loadShaderSource(postprocessShaderPath);
-	std::vector<uint32_t> postprocessSPIRV = compileGLSLToSPIRV(postprocessShaderSource, postprocessShaderPath, shaderc_compute_shader);
-
-	VkShaderModule postprocessShader = createShaderModule(this->impl->device, postprocessSPIRV);
-	this->impl->shaderModules.push_back(postprocessShader);
-
-	// Create post-processing compute pipeline
-	VkPipelineShaderStageCreateInfo postprocessShaderStageInfo = {};
-	postprocessShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	postprocessShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	postprocessShaderStageInfo.module = postprocessShader;
-	postprocessShaderStageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo postprocessPipelineInfo = {};
-	postprocessPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	postprocessPipelineInfo.stage = postprocessShaderStageInfo;
-	postprocessPipelineInfo.layout = this->impl->postprocessPipelineLayout;
-
-	VkPipeline postprocessPipeline;
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &postprocessPipelineInfo, nullptr, &postprocessPipeline));
-	this->impl->computePipelines.push_back(postprocessPipeline);
-	// Allocate and Update Postprocess Descriptor Sets
-	// ============================================
-
-	std::vector<VkDescriptorSetLayout> postprocessLayouts(this->impl->numCommandBuffers, this->impl->postprocessDescriptorSetLayout);
-
-	VkDescriptorSetAllocateInfo postprocessAllocInfo = {};
-	postprocessAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	postprocessAllocInfo.descriptorPool = this->impl->descriptorPool;
-	postprocessAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
-	postprocessAllocInfo.pSetLayouts = postprocessLayouts.data();
-
-	this->impl->postprocessDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &postprocessAllocInfo, this->impl->postprocessDescriptorSets.data()));
-
-	// Update postprocess descriptor sets (both input and output point to same buffer for in-place processing)
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> postprocessDescriptorWrites(2);
-
-		// Binding 0: Processed buffer (input - magnitude data from truncate)
-		VkDescriptorBufferInfo inputBufferInfo = {};
-		inputBufferInfo.buffer = this->impl->deviceProcessedBuffer;
-		inputBufferInfo.offset = 0;
-		inputBufferInfo.range = VK_WHOLE_SIZE;
-
-		postprocessDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		postprocessDescriptorWrites[0].dstSet = this->impl->postprocessDescriptorSets[i];
-		postprocessDescriptorWrites[0].dstBinding = 0;
-		postprocessDescriptorWrites[0].dstArrayElement = 0;
-		postprocessDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		postprocessDescriptorWrites[0].descriptorCount = 1;
-		postprocessDescriptorWrites[0].pBufferInfo = &inputBufferInfo;
-
-		// Binding 1: Processed buffer (output - same buffer, in-place)
-		VkDescriptorBufferInfo outputBufferInfo = {};
-		outputBufferInfo.buffer = this->impl->deviceProcessedBuffer;
-		outputBufferInfo.offset = 0;
-		outputBufferInfo.range = VK_WHOLE_SIZE;
-
-		postprocessDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		postprocessDescriptorWrites[1].dstSet = this->impl->postprocessDescriptorSets[i];
-		postprocessDescriptorWrites[1].dstBinding = 1;
-		postprocessDescriptorWrites[1].dstArrayElement = 0;
-		postprocessDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		postprocessDescriptorWrites[1].descriptorCount = 1;
-		postprocessDescriptorWrites[1].pBufferInfo = &outputBufferInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(postprocessDescriptorWrites.size()), postprocessDescriptorWrites.data(), 0, nullptr);
-	}
-
-
-	// ============================================
-	// Create Windowing Shader Pipeline
-	// ============================================
 
 	// ============================================
 	// Create DC Removal Shader Pipeline
@@ -3423,6 +3312,73 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
+	// Create Fixed Pattern Noise Determination Shader Pipeline
+	// ============================================
+
+	// Create descriptor set layout for FPN determination (2 storage buffers: input, mean A-line output)
+	std::vector<VkDescriptorSetLayoutBinding> fpnDeterminationBindings(2);
+
+	// Binding 0: Input buffer (complex data after IFFT)
+	fpnDeterminationBindings[0].binding = 0;
+	fpnDeterminationBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	fpnDeterminationBindings[0].descriptorCount = 1;
+	fpnDeterminationBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	fpnDeterminationBindings[0].pImmutableSamplers = nullptr;
+
+	// Binding 1: Mean A-line output buffer
+	fpnDeterminationBindings[1].binding = 1;
+	fpnDeterminationBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	fpnDeterminationBindings[1].descriptorCount = 1;
+	fpnDeterminationBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	fpnDeterminationBindings[1].pImmutableSamplers = nullptr;
+
+	VkDescriptorSetLayoutCreateInfo fpnDeterminationLayoutInfo = {};
+	fpnDeterminationLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	fpnDeterminationLayoutInfo.bindingCount = static_cast<uint32_t>(fpnDeterminationBindings.size());
+	fpnDeterminationLayoutInfo.pBindings = fpnDeterminationBindings.data();
+
+	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &fpnDeterminationLayoutInfo, nullptr, &this->impl->fpnDeterminationDescriptorSetLayout));
+
+	// Create pipeline layout for FPN determination
+	VkPushConstantRange fpnDeterminationPushConstantRange = {};
+	fpnDeterminationPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	fpnDeterminationPushConstantRange.offset = 0;
+	fpnDeterminationPushConstantRange.size = sizeof(uint32_t) * 5;  // width, height, segments, stride, outputSignalLength
+
+	VkPipelineLayoutCreateInfo fpnDeterminationPipelineLayoutInfo = {};
+	fpnDeterminationPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	fpnDeterminationPipelineLayoutInfo.setLayoutCount = 1;
+	fpnDeterminationPipelineLayoutInfo.pSetLayouts = &this->impl->fpnDeterminationDescriptorSetLayout;
+	fpnDeterminationPipelineLayoutInfo.pushConstantRangeCount = 1;
+	fpnDeterminationPipelineLayoutInfo.pPushConstantRanges = &fpnDeterminationPushConstantRange;
+
+	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &fpnDeterminationPipelineLayoutInfo, nullptr, &this->impl->fpnDeterminationPipelineLayout));
+
+	// Load and compile FPN determination shader
+	std::string fpnDeterminationShaderPath = "src/backends/vulkan/shaders/fixed_pattern_noise_determination.comp";
+	std::string fpnDeterminationShaderSource = loadShaderSource(fpnDeterminationShaderPath);
+	std::vector<uint32_t> fpnDeterminationSPIRV = compileGLSLToSPIRV(fpnDeterminationShaderSource, fpnDeterminationShaderPath, shaderc_compute_shader);
+
+	VkShaderModule fpnDeterminationShader = createShaderModule(this->impl->device, fpnDeterminationSPIRV);
+	this->impl->shaderModules.push_back(fpnDeterminationShader);
+
+	// Create FPN determination compute pipeline
+	VkPipelineShaderStageCreateInfo fpnDeterminationShaderStageInfo = {};
+	fpnDeterminationShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	fpnDeterminationShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	fpnDeterminationShaderStageInfo.module = fpnDeterminationShader;
+	fpnDeterminationShaderStageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo fpnDeterminationPipelineInfo = {};
+	fpnDeterminationPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	fpnDeterminationPipelineInfo.stage = fpnDeterminationShaderStageInfo;
+	fpnDeterminationPipelineInfo.layout = this->impl->fpnDeterminationPipelineLayout;
+
+	VkPipeline fpnDeterminationPipeline;
+	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &fpnDeterminationPipelineInfo, nullptr, &fpnDeterminationPipeline));
+	this->impl->computePipelines.push_back(fpnDeterminationPipeline);
+
+	// ============================================
 	// Universal Pre-FFT Processing Shader
 	// ============================================
 	// This shader combines DC removal, k-linearization, windowing, and dispersion
@@ -3674,6 +3630,218 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
+	// Universal Post-FFT Processing Shader
+	// ============================================
+	// This shader merges: Fixed Pattern Noise Removal + Magnitude Calculation + Log/Linear Scaling + Normalization
+	// Uses specialization constants for compile-time optimization
+	// Replaces old truncate + postprocess pipelines
+
+	// Create descriptor set layout for universal post-FFT shader (3 bindings)
+	std::vector<VkDescriptorSetLayoutBinding> universalPostFFTBindings(3);
+
+	// Binding 0: Input buffer (deviceFftBuffer, complex post-IFFT data)
+	universalPostFFTBindings[0].binding = 0;
+	universalPostFFTBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPostFFTBindings[0].descriptorCount = 1;
+	universalPostFFTBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+	// Binding 1: Mean A-line buffer (for fixed pattern noise removal)
+	universalPostFFTBindings[1].binding = 1;
+	universalPostFFTBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPostFFTBindings[1].descriptorCount = 1;
+	universalPostFFTBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+	// Binding 2: Output buffer (deviceProcessedBuffer, real magnitude data)
+	universalPostFFTBindings[2].binding = 2;
+	universalPostFFTBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPostFFTBindings[2].descriptorCount = 1;
+	universalPostFFTBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+	VkDescriptorSetLayoutCreateInfo universalPostFFTDescriptorSetLayoutInfo = {};
+	universalPostFFTDescriptorSetLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	universalPostFFTDescriptorSetLayoutInfo.bindingCount = static_cast<uint32_t>(universalPostFFTBindings.size());
+	universalPostFFTDescriptorSetLayoutInfo.pBindings = universalPostFFTBindings.data();
+
+	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &universalPostFFTDescriptorSetLayoutInfo, nullptr, &this->impl->universalPostFFTDescriptorSetLayout));
+
+	// Create pipeline layout for universal post-FFT shader
+	VkPushConstantRange universalPostFFTPushConstantRange = {};
+	universalPostFFTPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	universalPostFFTPushConstantRange.offset = 0;
+	universalPostFFTPushConstantRange.size = sizeof(uint32_t) * 3 + sizeof(float) * 4;  // fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
+
+	VkPipelineLayoutCreateInfo universalPostFFTPipelineLayoutInfo = {};
+	universalPostFFTPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	universalPostFFTPipelineLayoutInfo.setLayoutCount = 1;
+	universalPostFFTPipelineLayoutInfo.pSetLayouts = &this->impl->universalPostFFTDescriptorSetLayout;
+	universalPostFFTPipelineLayoutInfo.pushConstantRangeCount = 1;
+	universalPostFFTPipelineLayoutInfo.pPushConstantRanges = &universalPostFFTPushConstantRange;
+
+	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &universalPostFFTPipelineLayoutInfo, nullptr, &this->impl->universalPostFFTPipelineLayout));
+
+	// Load and compile universal post-FFT shader
+	std::string universalPostFFTShaderPath = "src/backends/vulkan/shaders/universal_postfft_processing.comp";
+	std::string universalPostFFTShaderSource = loadShaderSource(universalPostFFTShaderPath);
+	std::vector<uint32_t> universalPostFFTSPIRV = compileGLSLToSPIRV(universalPostFFTShaderSource, universalPostFFTShaderPath, shaderc_compute_shader);
+
+	VkShaderModule universalPostFFTShader = createShaderModule(this->impl->device, universalPostFFTSPIRV);
+	this->impl->shaderModules.push_back(universalPostFFTShader);
+
+	// Create pipeline variants with different specialization constants
+	// We create variants for: FPN (enabled/disabled) × log scaling (log/linear)
+	for (int enableFPN = 0; enableFPN <= 1; ++enableFPN) {
+		for (int logScaling = 0; logScaling <= 1; ++logScaling) {
+			// Setup specialization constants
+			struct SpecializationData {
+				uint32_t enableFixedPatternNoise;
+				uint32_t logScaling;
+			} specData;
+
+			specData.enableFixedPatternNoise = enableFPN;
+			specData.logScaling = logScaling;
+
+			VkSpecializationMapEntry specEntries[2];
+			for (int i = 0; i < 2; ++i) {
+				specEntries[i].constantID = i;
+				specEntries[i].offset = i * sizeof(uint32_t);
+				specEntries[i].size = sizeof(uint32_t);
+			}
+
+			VkSpecializationInfo specInfo = {};
+			specInfo.mapEntryCount = 2;
+			specInfo.pMapEntries = specEntries;
+			specInfo.dataSize = sizeof(SpecializationData);
+			specInfo.pData = &specData;
+
+			VkPipelineShaderStageCreateInfo shaderStageInfo = {};
+			shaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+			shaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+			shaderStageInfo.module = universalPostFFTShader;
+			shaderStageInfo.pName = "main";
+			shaderStageInfo.pSpecializationInfo = &specInfo;
+
+			VkComputePipelineCreateInfo pipelineInfo = {};
+			pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+			pipelineInfo.stage = shaderStageInfo;
+			pipelineInfo.layout = this->impl->universalPostFFTPipelineLayout;
+
+			int pipelineIdx = enableFPN * 2 + logScaling;  // Linear index: 0-3
+			checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &this->impl->universalPostFFTPipelines[pipelineIdx]));
+		}
+	}
+
+	// Allocate universal post-FFT descriptor sets
+	std::vector<VkDescriptorSetLayout> universalPostFFTLayouts(this->impl->numCommandBuffers, this->impl->universalPostFFTDescriptorSetLayout);
+
+	VkDescriptorSetAllocateInfo universalPostFFTAllocInfo = {};
+	universalPostFFTAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	universalPostFFTAllocInfo.descriptorPool = this->impl->descriptorPool;
+	universalPostFFTAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
+	universalPostFFTAllocInfo.pSetLayouts = universalPostFFTLayouts.data();
+
+	this->impl->universalPostFFTDescriptorSets.resize(this->impl->numCommandBuffers);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &universalPostFFTAllocInfo, this->impl->universalPostFFTDescriptorSets.data()));
+
+	// Update universal post-FFT descriptor sets
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		std::vector<VkWriteDescriptorSet> descriptorWrites(3);
+
+		// Binding 0: Input buffer (deviceFftBuffer)
+		VkDescriptorBufferInfo inputInfo = {};
+		inputInfo.buffer = this->impl->deviceFftBuffer;
+		inputInfo.offset = 0;
+		inputInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[0].dstSet = this->impl->universalPostFFTDescriptorSets[i];
+		descriptorWrites[0].dstBinding = 0;
+		descriptorWrites[0].dstArrayElement = 0;
+		descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[0].descriptorCount = 1;
+		descriptorWrites[0].pBufferInfo = &inputInfo;
+
+		// Binding 1: Mean A-line buffer
+		VkDescriptorBufferInfo meanALineInfo = {};
+		meanALineInfo.buffer = this->impl->meanALineBuffer;
+		meanALineInfo.offset = 0;
+		meanALineInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[1].dstSet = this->impl->universalPostFFTDescriptorSets[i];
+		descriptorWrites[1].dstBinding = 1;
+		descriptorWrites[1].dstArrayElement = 0;
+		descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[1].descriptorCount = 1;
+		descriptorWrites[1].pBufferInfo = &meanALineInfo;
+
+		// Binding 2: Output buffer (deviceProcessedBuffer)
+		VkDescriptorBufferInfo outputInfo = {};
+		outputInfo.buffer = this->impl->deviceProcessedBuffer;
+		outputInfo.offset = 0;
+		outputInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[2].dstSet = this->impl->universalPostFFTDescriptorSets[i];
+		descriptorWrites[2].dstBinding = 2;
+		descriptorWrites[2].dstArrayElement = 0;
+		descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[2].descriptorCount = 1;
+		descriptorWrites[2].pBufferInfo = &outputInfo;
+
+		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+	}
+
+	// ============================================
+	// Allocate and Update FPN Determination Descriptor Sets
+	// ============================================
+
+	std::vector<VkDescriptorSetLayout> fpnDeterminationLayouts(this->impl->numCommandBuffers, this->impl->fpnDeterminationDescriptorSetLayout);
+
+	VkDescriptorSetAllocateInfo fpnDeterminationAllocInfo = {};
+	fpnDeterminationAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	fpnDeterminationAllocInfo.descriptorPool = this->impl->descriptorPool;
+	fpnDeterminationAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
+	fpnDeterminationAllocInfo.pSetLayouts = fpnDeterminationLayouts.data();
+
+	this->impl->fpnDeterminationDescriptorSets.resize(this->impl->numCommandBuffers);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &fpnDeterminationAllocInfo, this->impl->fpnDeterminationDescriptorSets.data()));
+
+	// Update FPN determination descriptor sets
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		std::vector<VkWriteDescriptorSet> fpnDescriptorWrites(2);
+
+		// Binding 0: Input buffer (deviceFftBuffer - complex post-IFFT data)
+		VkDescriptorBufferInfo inputInfo = {};
+		inputInfo.buffer = this->impl->deviceFftBuffer;
+		inputInfo.offset = 0;
+		inputInfo.range = VK_WHOLE_SIZE;
+
+		fpnDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		fpnDescriptorWrites[0].dstSet = this->impl->fpnDeterminationDescriptorSets[i];
+		fpnDescriptorWrites[0].dstBinding = 0;
+		fpnDescriptorWrites[0].dstArrayElement = 0;
+		fpnDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		fpnDescriptorWrites[0].descriptorCount = 1;
+		fpnDescriptorWrites[0].pBufferInfo = &inputInfo;
+
+		// Binding 1: Mean A-line output buffer
+		VkDescriptorBufferInfo meanALineInfo = {};
+		meanALineInfo.buffer = this->impl->meanALineBuffer;
+		meanALineInfo.offset = 0;
+		meanALineInfo.range = VK_WHOLE_SIZE;
+
+		fpnDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		fpnDescriptorWrites[1].dstSet = this->impl->fpnDeterminationDescriptorSets[i];
+		fpnDescriptorWrites[1].dstBinding = 1;
+		fpnDescriptorWrites[1].dstArrayElement = 0;
+		fpnDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		fpnDescriptorWrites[1].descriptorCount = 1;
+		fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
+
+		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+	}
+
+	// ============================================
 	// Validate Pipeline Creation
 	// ============================================
 
@@ -3722,17 +3890,6 @@ void VulkanBackend::destroyComputePipelines() {
 		this->impl->pipelineLayout = VK_NULL_HANDLE;
 	}
 
-	// Destroy truncate pipeline resources
-	if (this->impl->truncateDescriptorSetLayout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->truncateDescriptorSetLayout, nullptr);
-		this->impl->truncateDescriptorSetLayout = VK_NULL_HANDLE;
-	}
-
-	if (this->impl->truncatePipelineLayout != VK_NULL_HANDLE) {
-		vkDestroyPipelineLayout(this->impl->device, this->impl->truncatePipelineLayout, nullptr);
-		this->impl->truncatePipelineLayout = VK_NULL_HANDLE;
-	}
-
 	// Destroy windowing pipeline resources
 	if (this->impl->windowingDescriptorSetLayout != VK_NULL_HANDLE) {
 		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->windowingDescriptorSetLayout, nullptr);
@@ -3742,17 +3899,6 @@ void VulkanBackend::destroyComputePipelines() {
 	if (this->impl->windowingPipelineLayout != VK_NULL_HANDLE) {
 		vkDestroyPipelineLayout(this->impl->device, this->impl->windowingPipelineLayout, nullptr);
 		this->impl->windowingPipelineLayout = VK_NULL_HANDLE;
-	}
-
-	// Destroy post-processing pipeline resources
-	if (this->impl->postprocessDescriptorSetLayout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->postprocessDescriptorSetLayout, nullptr);
-		this->impl->postprocessDescriptorSetLayout = VK_NULL_HANDLE;
-	}
-
-	if (this->impl->postprocessPipelineLayout != VK_NULL_HANDLE) {
-		vkDestroyPipelineLayout(this->impl->device, this->impl->postprocessPipelineLayout, nullptr);
-		this->impl->postprocessPipelineLayout = VK_NULL_HANDLE;
 	}
 
 	// Destroy DC removal pipeline resources
@@ -3788,6 +3934,17 @@ void VulkanBackend::destroyComputePipelines() {
 		this->impl->dispersionPipelineLayout = VK_NULL_HANDLE;
 	}
 
+	// Destroy FPN determination pipeline resources
+	if (this->impl->fpnDeterminationDescriptorSetLayout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->fpnDeterminationDescriptorSetLayout, nullptr);
+		this->impl->fpnDeterminationDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->fpnDeterminationPipelineLayout != VK_NULL_HANDLE) {
+		vkDestroyPipelineLayout(this->impl->device, this->impl->fpnDeterminationPipelineLayout, nullptr);
+		this->impl->fpnDeterminationPipelineLayout = VK_NULL_HANDLE;
+	}
+
 	// Destroy universal pre-FFT pipeline resources
 	for (int i = 0; i < 6; ++i) {
 		if (this->impl->universalPipelines[i] != VK_NULL_HANDLE) {
@@ -3804,6 +3961,24 @@ void VulkanBackend::destroyComputePipelines() {
 	if (this->impl->universalPreFFTPipelineLayout != VK_NULL_HANDLE) {
 		vkDestroyPipelineLayout(this->impl->device, this->impl->universalPreFFTPipelineLayout, nullptr);
 		this->impl->universalPreFFTPipelineLayout = VK_NULL_HANDLE;
+	}
+
+	// Destroy universal post-FFT pipeline resources
+	for (int i = 0; i < 4; ++i) {
+		if (this->impl->universalPostFFTPipelines[i] != VK_NULL_HANDLE) {
+			vkDestroyPipeline(this->impl->device, this->impl->universalPostFFTPipelines[i], nullptr);
+			this->impl->universalPostFFTPipelines[i] = VK_NULL_HANDLE;
+		}
+	}
+
+	if (this->impl->universalPostFFTDescriptorSetLayout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->universalPostFFTDescriptorSetLayout, nullptr);
+		this->impl->universalPostFFTDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->universalPostFFTPipelineLayout != VK_NULL_HANDLE) {
+		vkDestroyPipelineLayout(this->impl->device, this->impl->universalPostFFTPipelineLayout, nullptr);
+		this->impl->universalPostFFTPipelineLayout = VK_NULL_HANDLE;
 	}
 
 }

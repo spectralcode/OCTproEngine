@@ -22,12 +22,12 @@ const int BSCANS_PER_BUFFER = 1;
 const bool ENABLE_RESAMPLING = true;
 const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
-const bool ENABLE_DC_REMOVAL = true;  // Testing DC removal with merged pipeline
+const bool ENABLE_DC_REMOVAL = false;  // Disabled for FPN testing (FPN removes similar structures)
 const int DC_REMOVAL_WINDOW_SIZE = 64;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_BSCAN_FLIP = false;
 const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = false;
-const bool ENABLE_FIXED_PATTERN_NOISE_CORRECTION = false;
+const bool ENABLE_FIXED_PATTERN_NOISE_CORRECTION = true;  // Testing FPN
 
 const ope::InterpolationMethod INTERPOLATION_METHOD = ope::InterpolationMethod::CUBIC;
 const float RESAMPLING_COEFFS[4] = {0.5f, 2048.0f, -100.0f, 50.0f};
@@ -251,12 +251,13 @@ int main() {
 	std::cout << "  DC Removal(" << DC_REMOVAL_WINDOW_SIZE <<  "): " << (ENABLE_DC_REMOVAL ? "ON" : "OFF");
 	std::cout << "  Resampling: " << (ENABLE_RESAMPLING ? "ON" : "OFF");
 	if (ENABLE_RESAMPLING) {
-		std::cout << " (" << (INTERPOLATION_METHOD == ope::InterpolationMethod::LINEAR ? "LINEAR" : 
+		std::cout << " (" << (INTERPOLATION_METHOD == ope::InterpolationMethod::LINEAR ? "LINEAR" :
 		                      INTERPOLATION_METHOD == ope::InterpolationMethod::CUBIC ? "CUBIC" : "LANCZOS") << ")";
 	}
 	std::cout << std::endl;
 	std::cout << "  Windowing: " << (ENABLE_WINDOWING ? "ON" : "OFF") << std::endl;
 	std::cout << "  Dispersion: " << (ENABLE_DISPERSION ? "ON" : "OFF") << std::endl;
+	std::cout << "  Fixed Pattern Noise: " << (ENABLE_FIXED_PATTERN_NOISE_CORRECTION ? "ON" : "OFF") << std::endl;
 	std::cout << "  Log Scaling: " << (ENABLE_LOG_SCALING ? "ON" : "OFF") << std::endl;
 	std::cout << "  Tolerance: " << TOLERANCE << std::endl;
 	std::cout << std::endl;

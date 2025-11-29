@@ -1,0 +1,84 @@
+#version 450
+
+// Fixed Pattern Noise Determination Shader
+// Calculates the minimum variance mean A-line from input data
+// Each thread processes one sample index across all A-lines
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex input data (post-IFFT)
+} inputBuf;
+
+layout(binding = 1) buffer MeanALineBuffer {
+	vec2 data[];  // Output: mean A-line (size: width)
+} meanALineBuf;
+
+// ============================================
+// Push Constants (runtime)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint width;  // Full signal length for width compatibility (NOT USED - use outputSignalLength instead)
+	uint height;  // Number of A-lines
+	uint segments;  // Number of segments to divide data into (default: 3)
+	uint stride;  // Stride between A-scans in input (fullSignalLength)
+	uint outputSignalLength;  // Output signal length (positive-depth portion only)
+} params;
+
+#define FLT_MAX 3.402823466e+38F
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+
+	// Each thread processes one sample index in the output
+	if (index >= params.outputSignalLength) {
+		return;
+	}
+
+	uint segWidth = params.height / params.segments;
+	uint stride = params.stride;  // Full signal length for input indexing
+	float factor = 1.0f / float(segWidth);
+
+	float minVariance = FLT_MAX;
+	vec2 meanAtMinVariance = vec2(0.0f, 0.0f);
+
+	// Loop through each segment
+	for (uint i = 0; i < params.segments; i++) {
+		uint offset = i * segWidth * stride + index;
+
+		float sumX = 0.0f, sumY = 0.0f;
+		float sumXX = 0.0f;
+
+		// Calculate sum and sum of squares for this segment
+		for (uint j = 0; j < segWidth; j++) {
+			vec2 val = inputBuf.data[offset + j * stride];
+			float dx = val.x;  // Real component
+			float dy = val.y;  // Imaginary component
+
+			sumX += dx;
+			sumY += dy;
+			sumXX += dx * dx + dy * dy;  // Magnitude squared
+		}
+
+		// Calculate mean
+		float meanX = sumX * factor;
+		float meanY = sumY * factor;
+
+		// Calculate variance
+		// var(X) = E[|X|²] - |E[X]|²
+		float variance = (sumXX * factor) - (meanX * meanX + meanY * meanY);
+
+		// Track the mean with minimum variance
+		if (variance < minVariance) {
+			minVariance = variance;
+			meanAtMinVariance.x = meanX;
+			meanAtMinVariance.y = meanY;
+		}
+	}
+
+	// Write the minimum variance mean for this sample index
+	meanALineBuf.data[index] = meanAtMinVariance;
+}

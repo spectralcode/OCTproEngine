@@ -1,0 +1,104 @@
+#version 450
+
+// Universal Post-FFT Processing Shader
+// Merges: Fixed Pattern Noise Removal + Magnitude Calculation + Log/Linear Scaling + Normalization
+// Uses specialization constants for compile-time optimization
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Specialization Constants (compile-time)
+// ============================================
+layout(constant_id = 0) const uint ENABLE_FIXED_PATTERN_NOISE = 0;  // 0=disabled, 1=enabled
+layout(constant_id = 1) const uint LOG_SCALING = 0;  // 0=linear, 1=log
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex input from FFT (post-IFFT)
+} inputBuf;
+
+layout(binding = 1) buffer MeanALineBuffer {
+	vec2 data[];  // Mean A-line for fixed pattern noise removal (size: outputSignalLength)
+} meanALineBuf;
+
+layout(binding = 2) buffer OutputBuffer {
+	float data[];  // Real output (processed magnitude)
+} outputBuf;
+
+// ============================================
+// Push Constants (runtime)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint fullSignalLength;  // Original signal length before truncation
+	uint outputSignalLength;  // Truncated signal length (typically fullSignalLength / 2)
+	uint samplesPerBuffer;  // Total input samples per buffer (full signal length)
+	float grayscaleMax;  // Maximum grayscale value
+	float grayscaleMin;  // Minimum grayscale value
+	float addend;  // Additive factor
+	float multiplicator;  // Multiplicative factor
+} params;
+
+void main() {
+	uint idx = gl_GlobalInvocationID.x;
+
+	if (idx >= params.samplesPerBuffer) {
+		return;
+	}
+
+	// Calculate which A-scan and sample within A-scan
+	uint ascanIdx = idx / params.fullSignalLength;
+	uint sampleIdx = idx % params.fullSignalLength;
+
+	// Only process first half of samples (truncation to positive-depth portion)
+	if (sampleIdx < params.outputSignalLength) {
+		// ============================================
+		// Step 1: Read complex input value
+		// ============================================
+		vec2 complexValue = inputBuf.data[idx];
+
+		// ============================================
+		// Step 2: Fixed Pattern Noise Removal (if enabled)
+		// ============================================
+		if (ENABLE_FIXED_PATTERN_NOISE == 1) {
+			// Mean A-line is indexed by sample within A-scan (only positive-depth portion)
+			vec2 meanValue = meanALineBuf.data[sampleIdx];
+
+			// Complex subtraction
+			complexValue.x -= meanValue.x;  // Real component
+			complexValue.y -= meanValue.y;  // Imaginary component
+		}
+
+		// ============================================
+		// Step 3: Calculate magnitude
+		// ============================================
+		// magnitude = sqrt(real^2 + imag^2)
+		float magnitudeSquared = dot(complexValue, complexValue);
+		float magnitude = sqrt(magnitudeSquared);
+
+		// ============================================
+		// Step 4: Apply log or linear scaling with FFT normalization
+		// ============================================
+		float processed;
+		if (LOG_SCALING == 1) {
+			// Log scaling: 20*log10(magnitude) - 10*log10(N)
+			// This matches CUDA: 10*log10(magnitude²/N)
+			processed = 20.0f * log(magnitude) / log(10.0f) - 10.0f * log(float(params.outputSignalLength)) / log(10.0f);
+		} else {
+			// Linear scaling with FFT normalization
+			processed = magnitude / float(params.outputSignalLength);
+		}
+
+		// ============================================
+		// Step 5: Apply grayscale normalization
+		// ============================================
+		float normalized = (processed - params.grayscaleMin) / (params.grayscaleMax - params.grayscaleMin);
+
+		// ============================================
+		// Step 6: Apply addend and multiplicator, write output
+		// ============================================
+		uint outputIdx = ascanIdx * params.outputSignalLength + sampleIdx;
+		outputBuf.data[outputIdx] = params.multiplicator * (normalized + params.addend);
+	}
+}

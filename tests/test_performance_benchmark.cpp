@@ -54,6 +54,9 @@ const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
 const bool ENABLE_DC_REMOVAL = true;
 const bool ENABLE_LOG_SCALING = true;
+const bool ENABLE_FIXED_PATTERN_NOISE_REMOVAL = true;
+
+
 const bool ENABLE_BSCAN_FLIP = false;
 
 // DC Removal configuration
@@ -178,6 +181,8 @@ void configureProcessor(ope::Processor& processor, int signalLength, int ascansP
 	if (ENABLE_DC_REMOVAL) {
 		processor.setBackgroundRemovalWindowSize(DC_REMOVAL_WINDOW_SIZE);
 	}
+
+	processor.enableFixedPatternNoiseRemoval(ENABLE_FIXED_PATTERN_NOISE_REMOVAL);
 	processor.enableLogScaling(ENABLE_LOG_SCALING);
 	processor.setGrayscaleRange(GRAYSCALE_MIN, GRAYSCALE_MAX);
 	processor.enableBscanFlip(ENABLE_BSCAN_FLIP);
@@ -368,6 +373,7 @@ void printConfiguration() {
 	if (ENABLE_DISPERSION) enabled.push_back("Dispersion");
 	if (ENABLE_DC_REMOVAL) enabled.push_back("DC-Removal");
 	if (ENABLE_LOG_SCALING) enabled.push_back("Log-Scale");
+	if (ENABLE_FIXED_PATTERN_NOISE_REMOVAL) enabled.push_back("FPN-Removal");
 	
 	for (size_t i = 0; i < enabled.size(); ++i) {
 		std::cout << enabled[i];
