@@ -1121,7 +1121,13 @@ void VulkanBackend::process(IOBuffer& input) {
 	// Fixed Pattern Noise Determination (if needed)
 	// ============================================
 
-	if (this->impl->config.processingParams.fixedPatternNoise.enabled && !this->impl->fixedPatternNoiseDetermined) {
+	// Calculate required and available A-scans for FPN determination
+	int requiredAscans = this->impl->config.processingParams.fixedPatternNoise.bscanAverageCount * this->impl->ascansPerBscan;
+	int availableAscans = this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
+
+	if (this->impl->config.processingParams.fixedPatternNoise.enabled &&
+	    !this->impl->fixedPatternNoiseDetermined &&
+	    requiredAscans <= availableAscans) {
 		// Dispatch FPN determination shader to compute mean A-line
 		// This happens once when FPN is first requested, using the current frame's data
 
@@ -1135,7 +1141,7 @@ void VulkanBackend::process(IOBuffer& input) {
 		// Push constants: width, height, segments, stride, outputSignalLength
 		struct FpnDeterminationPushConstants {
 			uint32_t width;         // outputSignalLength (samples per A-scan after truncation)
-			uint32_t height;        // Number of A-scans in buffer
+			uint32_t height;        // Number of A-scans to use for FPN (bscanAverageCount * ascansPerBscan)
 			uint32_t segments;      // Number of segments for minimum variance calculation
 			uint32_t stride;        // fullSignalLength (stride between A-scans in input)
 			uint32_t outputSignalLength;  // Same as width
@@ -1143,7 +1149,7 @@ void VulkanBackend::process(IOBuffer& input) {
 
 		int outputSignalLength = this->impl->signalLength / 2;
 		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
-		fpnPush.height = static_cast<uint32_t>(this->impl->ascansPerBscan * this->impl->bscansPerBuffer);
+		fpnPush.height = static_cast<uint32_t>(requiredAscans);  // Use bscanAverageCount * ascansPerBscan (like CUDA/OpenCL)
 		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
 		fpnPush.stride = static_cast<uint32_t>(this->impl->signalLength);
 		fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
