@@ -16,6 +16,7 @@ configure_file(
 option(BUILD_CUDA "Build with CUDA support" ON)
 option(BUILD_CPU "Build with CPU backend" ON)
 option(BUILD_OPENCL "Build with OpenCL backend" ON)
+option(BUILD_VULKAN "Build with Vulkan backend" ON)
 option(BUILD_PYTHON "Build Python bindings" OFF)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_EXAMPLES "Build examples" ON)
@@ -34,8 +35,8 @@ if(MSVC)
 endif()
 
 # Validate backend selection
-if(NOT BUILD_CUDA AND NOT BUILD_CPU AND NOT BUILD_OPENCL)
-	message(FATAL_ERROR "At least one backend must be enabled (BUILD_CUDA, BUILD_CPU, or BUILD_OPENCL)")
+if(NOT BUILD_CUDA AND NOT BUILD_CPU AND NOT BUILD_OPENCL AND NOT BUILD_VULKAN)
+	message(FATAL_ERROR "At least one backend must be enabled (BUILD_CUDA, BUILD_CPU, BUILD_OPENCL, or BUILD_VULKAN)")
 endif()
 
 # Add cmake module path for custom Find modules
@@ -88,6 +89,73 @@ if(NOT BUILD_OPENCL)
 	message(STATUS "Building without OpenCL backend")
 endif()
 
+# Find Vulkan and VkFFT (only needed for Vulkan backend)
+if(BUILD_VULKAN)
+	# Auto-detect Vulkan SDK path
+	include(cmake/FindVulkanSDK.cmake)
+
+	find_package(Vulkan QUIET)
+
+	if(Vulkan_FOUND)
+		message(STATUS "Found Vulkan: ${Vulkan_LIBRARIES}")
+
+		# Find shaderc for runtime shader compilation
+		find_library(SHADERC_LIB NAMES shaderc_combined shaderc_shared shaderc
+			PATHS
+				${Vulkan_INCLUDE_DIRS}/../Lib
+				${Vulkan_INCLUDE_DIRS}/../lib
+				/usr/lib
+				/usr/local/lib
+		)
+
+		if(SHADERC_LIB)
+			message(STATUS "Found shaderc: ${SHADERC_LIB}")
+		else()
+			message(WARNING "shaderc not found - disabling Vulkan backend")
+			message(WARNING "To enable Vulkan backend, ensure shaderc is available in the Vulkan SDK")
+			set(BUILD_VULKAN OFF)
+		endif()
+
+		# Find glslang (needed by VkFFT for runtime compilation)
+		find_path(GLSLANG_INCLUDE_DIR
+			NAMES glslang_c_interface.h
+			PATHS
+				${Vulkan_INCLUDE_DIRS}/glslang/Include
+				${Vulkan_INCLUDE_DIRS}/../Include/glslang/Include
+				${Vulkan_INCLUDE_DIRS}/glslang
+				${Vulkan_INCLUDE_DIRS}/../Source/glslang
+				/usr/include/glslang
+				/usr/local/include/glslang
+		)
+
+		if(GLSLANG_INCLUDE_DIR)
+			message(STATUS "Found glslang include dir: ${GLSLANG_INCLUDE_DIR}")
+			# Use the directory directly where glslang_c_interface.h was found
+			set(GLSLANG_INCLUDE_DIRS ${GLSLANG_INCLUDE_DIR})
+		else()
+			message(WARNING "glslang headers not found - disabling Vulkan backend")
+			message(WARNING "To enable Vulkan backend, ensure glslang is available in the Vulkan SDK")
+			set(BUILD_VULKAN OFF)
+		endif()
+
+		# Find VkFFT (header-only library with auto-download support)
+		find_package(VkFFT QUIET)
+
+		if(NOT VkFFT_FOUND)
+			message(WARNING "VkFFT not found - disabling Vulkan backend")
+			message(WARNING "To enable Vulkan backend, ensure VkFFT is available or enable VKFFT_AUTO_DOWNLOAD")
+			set(BUILD_VULKAN OFF)
+		endif()
+	else()
+		message(WARNING "Vulkan not found - disabling Vulkan backend")
+		set(BUILD_VULKAN OFF)
+	endif()
+endif()
+
+if(NOT BUILD_VULKAN)
+	message(STATUS "Building without Vulkan backend")
+endif()
+
 # Include DLL copying helper for Windows
 include(cmake/CopyDLLs.cmake)
 
@@ -117,6 +185,7 @@ message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "CUDA backend: ${BUILD_CUDA}")
 message(STATUS "CPU backend: ${BUILD_CPU}")
 message(STATUS "OpenCL backend: ${BUILD_OPENCL}")
+message(STATUS "Vulkan backend: ${BUILD_VULKAN}")
 message(STATUS "Python bindings: ${BUILD_PYTHON}")
 message(STATUS "Build tests: ${BUILD_TESTS}")
 message(STATUS "Build examples: ${BUILD_EXAMPLES}")
