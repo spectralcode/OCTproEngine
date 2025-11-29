@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <vector>
+#include <array>
 #include <shaderc/shaderc.hpp>
 #include <glslang_c_interface.h>
 
@@ -215,7 +216,7 @@ struct VulkanBackend::Impl {
 	// Universal post-FFT processing pipeline resources
 	VkPipelineLayout universalPostFFTPipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout universalPostFFTDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> universalPostFFTDescriptorSets;
+	std::vector<std::array<VkDescriptorSet, 2>> universalPostFFTDescriptorSets;  // [cmdBuf][variant]: 0=FFT input, 1=Intermediate input
 
 	// Universal post-FFT pipeline variants (with different specialization constants)
 	// Linear index: enableFixedPatternNoise * 2 + logScaling
@@ -226,7 +227,7 @@ struct VulkanBackend::Impl {
 	// Fixed pattern noise determination pipeline resources
 	VkPipelineLayout fpnDeterminationPipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout fpnDeterminationDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> fpnDeterminationDescriptorSets;
+	std::vector<std::array<VkDescriptorSet, 2>> fpnDeterminationDescriptorSets;  // [cmdBuf][variant]: 0=FFT input, 1=Intermediate input
 
 	// Background subtraction pipeline resources
 	VkPipelineLayout backgroundSubtractionPipelineLayout = VK_NULL_HANDLE;
@@ -1126,26 +1127,8 @@ void VulkanBackend::process(IOBuffer& input) {
 		}
 	}
 
-	// Ensure data is in deviceFftBuffer for FFT
-	if (!dataInFftBuffer) {
-		// Copy from intermediate to FFT buffer
-		VkBufferCopy copyRegion = {};
-		copyRegion.size = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex data
-		vkCmdCopyBuffer(cmd, this->impl->deviceIntermediateBuffer, this->impl->deviceFftBuffer, 1, &copyRegion);
-
-		// Barrier after copy
-		preprocessBarrier.buffer = this->impl->deviceFftBuffer;
-		preprocessBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &preprocessBarrier,
-		                     0, nullptr);
-	}
+	// Select FFT buffer dynamically based on where data is (eliminates unnecessary buffer copy)
+	VkBuffer* fftBuffer = dataInFftBuffer ? &this->impl->deviceFftBuffer : &this->impl->deviceIntermediateBuffer;
 
 	// Final barrier before FFT
 	VkBufferMemoryBarrier fftInputBarrier = {};
@@ -1154,7 +1137,7 @@ void VulkanBackend::process(IOBuffer& input) {
 	fftInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	fftInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	fftInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftInputBarrier.buffer = this->impl->deviceFftBuffer;
+	fftInputBarrier.buffer = *fftBuffer;
 	fftInputBarrier.offset = 0;
 	fftInputBarrier.size = VK_WHOLE_SIZE;
 
@@ -1172,18 +1155,18 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	VkFFTLaunchParams fftLaunchParams = {};
 	fftLaunchParams.commandBuffer = &cmd;
-	fftLaunchParams.buffer = &this->impl->deviceFftBuffer;
+	fftLaunchParams.buffer = fftBuffer;  // Use dynamic buffer selection (CUDA-style pointer swap)
 
 	checkVkFFTErrors(VkFFTAppend(&this->impl->fftApp, 1, &fftLaunchParams));  // +1 = inverse FFT
 
-	// Barrier after FFT (wait for FFT to complete before truncate shader)
+	// Barrier after FFT (wait for FFT to complete before post-FFT processing)
 	VkBufferMemoryBarrier fftOutputBarrier = {};
 	fftOutputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
 	fftOutputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	fftOutputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	fftOutputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	fftOutputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftOutputBarrier.buffer = this->impl->deviceFftBuffer;
+	fftOutputBarrier.buffer = *fftBuffer;  // Use same dynamic buffer
 	fftOutputBarrier.offset = 0;
 	fftOutputBarrier.size = VK_WHOLE_SIZE;
 
@@ -1212,9 +1195,10 @@ void VulkanBackend::process(IOBuffer& input) {
 		// Bind FPN determination pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::FpnDetermination));
 
-		// Bind FPN determination descriptor set
+		// Bind FPN determination descriptor set (select variant based on which buffer was used for FFT)
+		int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->fpnDeterminationPipelineLayout,
-		                        0, 1, &this->impl->fpnDeterminationDescriptorSets[idx], 0, nullptr);
+		                        0, 1, &this->impl->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant], 0, nullptr);
 
 		// Push constants: width, height, segments, stride, outputSignalLength
 		struct FpnDeterminationPushConstants {
@@ -1279,9 +1263,10 @@ void VulkanBackend::process(IOBuffer& input) {
 	// Bind universal post-FFT pipeline
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPostFFTPipeline);
 
-	// Bind universal post-FFT descriptor set
+	// Bind universal post-FFT descriptor set (select variant based on which buffer was used for FFT)
+	int postFFTDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->universalPostFFTPipelineLayout,
-	                        0, 1, &this->impl->universalPostFFTDescriptorSets[idx], 0, nullptr);
+	                        0, 1, &this->impl->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant], 0, nullptr);
 
 	// Push constants: fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
 	int outputSignalLength = this->impl->signalLength / 2;
@@ -4268,56 +4253,116 @@ void VulkanBackend::createComputePipelines() {
 	universalPostFFTAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
 	universalPostFFTAllocInfo.pSetLayouts = universalPostFFTLayouts.data();
 
+	// Allocate 2 descriptor sets per command buffer (one for each input buffer variant)
+	std::vector<VkDescriptorSetLayout> universalPostFFTLayoutsExpanded(this->impl->numCommandBuffers * 2, this->impl->universalPostFFTDescriptorSetLayout);
+
+	VkDescriptorSetAllocateInfo universalPostFFTAllocInfoExpanded = {};
+	universalPostFFTAllocInfoExpanded.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	universalPostFFTAllocInfoExpanded.descriptorPool = this->impl->descriptorPool;
+	universalPostFFTAllocInfoExpanded.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 2);
+	universalPostFFTAllocInfoExpanded.pSetLayouts = universalPostFFTLayoutsExpanded.data();
+
+	std::vector<VkDescriptorSet> universalPostFFTDescriptorSetsFlat(this->impl->numCommandBuffers * 2);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &universalPostFFTAllocInfoExpanded, universalPostFFTDescriptorSetsFlat.data()));
+
+	// Copy into 2D array structure
 	this->impl->universalPostFFTDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &universalPostFFTAllocInfo, this->impl->universalPostFFTDescriptorSets.data()));
-
-	// Update universal post-FFT descriptor sets
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> descriptorWrites(3);
+		this->impl->universalPostFFTDescriptorSets[i][0] = universalPostFFTDescriptorSetsFlat[i * 2 + 0];
+		this->impl->universalPostFFTDescriptorSets[i][1] = universalPostFFTDescriptorSetsFlat[i * 2 + 1];
+	}
 
-		// Binding 0: Input buffer (deviceFftBuffer)
-		VkDescriptorBufferInfo inputInfo = {};
-		inputInfo.buffer = this->impl->deviceFftBuffer;
-		inputInfo.offset = 0;
-		inputInfo.range = VK_WHOLE_SIZE;
-
-		descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[0].dstSet = this->impl->universalPostFFTDescriptorSets[i];
-		descriptorWrites[0].dstBinding = 0;
-		descriptorWrites[0].dstArrayElement = 0;
-		descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[0].descriptorCount = 1;
-		descriptorWrites[0].pBufferInfo = &inputInfo;
-
-		// Binding 1: Mean A-line buffer
+	// Update universal post-FFT descriptor sets (2 variants per command buffer)
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		// Mean A-line buffer info (same for both variants)
 		VkDescriptorBufferInfo meanALineInfo = {};
 		meanALineInfo.buffer = this->impl->meanALineBuffer;
 		meanALineInfo.offset = 0;
 		meanALineInfo.range = VK_WHOLE_SIZE;
 
-		descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[1].dstSet = this->impl->universalPostFFTDescriptorSets[i];
-		descriptorWrites[1].dstBinding = 1;
-		descriptorWrites[1].dstArrayElement = 0;
-		descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[1].descriptorCount = 1;
-		descriptorWrites[1].pBufferInfo = &meanALineInfo;
-
-		// Binding 2: Output buffer (deviceProcessedBuffer)
+		// Output buffer info (same for both variants)
 		VkDescriptorBufferInfo outputInfo = {};
 		outputInfo.buffer = this->impl->deviceProcessedBuffer;
 		outputInfo.offset = 0;
 		outputInfo.range = VK_WHOLE_SIZE;
 
-		descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[2].dstSet = this->impl->universalPostFFTDescriptorSets[i];
-		descriptorWrites[2].dstBinding = 2;
-		descriptorWrites[2].dstArrayElement = 0;
-		descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[2].descriptorCount = 1;
-		descriptorWrites[2].pBufferInfo = &outputInfo;
+		// --- Variant 0: Input from deviceFftBuffer ---
+		{
+			std::vector<VkWriteDescriptorSet> descriptorWrites(3);
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+			// Binding 0: Input buffer (deviceFftBuffer)
+			VkDescriptorBufferInfo inputInfo = {};
+			inputInfo.buffer = this->impl->deviceFftBuffer;
+			inputInfo.offset = 0;
+			inputInfo.range = VK_WHOLE_SIZE;
+
+			descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrites[0].dstSet = this->impl->universalPostFFTDescriptorSets[i][0];
+			descriptorWrites[0].dstBinding = 0;
+			descriptorWrites[0].dstArrayElement = 0;
+			descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			descriptorWrites[0].descriptorCount = 1;
+			descriptorWrites[0].pBufferInfo = &inputInfo;
+
+			// Binding 1: Mean A-line buffer
+			descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrites[1].dstSet = this->impl->universalPostFFTDescriptorSets[i][0];
+			descriptorWrites[1].dstBinding = 1;
+			descriptorWrites[1].dstArrayElement = 0;
+			descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			descriptorWrites[1].descriptorCount = 1;
+			descriptorWrites[1].pBufferInfo = &meanALineInfo;
+
+			// Binding 2: Output buffer (deviceProcessedBuffer)
+			descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrites[2].dstSet = this->impl->universalPostFFTDescriptorSets[i][0];
+			descriptorWrites[2].dstBinding = 2;
+			descriptorWrites[2].dstArrayElement = 0;
+			descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			descriptorWrites[2].descriptorCount = 1;
+			descriptorWrites[2].pBufferInfo = &outputInfo;
+
+			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+		}
+
+		// --- Variant 1: Input from deviceIntermediateBuffer ---
+		{
+			std::vector<VkWriteDescriptorSet> descriptorWrites(3);
+
+			// Binding 0: Input buffer (deviceIntermediateBuffer)
+			VkDescriptorBufferInfo inputInfo = {};
+			inputInfo.buffer = this->impl->deviceIntermediateBuffer;
+			inputInfo.offset = 0;
+			inputInfo.range = VK_WHOLE_SIZE;
+
+			descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrites[0].dstSet = this->impl->universalPostFFTDescriptorSets[i][1];
+			descriptorWrites[0].dstBinding = 0;
+			descriptorWrites[0].dstArrayElement = 0;
+			descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			descriptorWrites[0].descriptorCount = 1;
+			descriptorWrites[0].pBufferInfo = &inputInfo;
+
+			// Binding 1: Mean A-line buffer
+			descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrites[1].dstSet = this->impl->universalPostFFTDescriptorSets[i][1];
+			descriptorWrites[1].dstBinding = 1;
+			descriptorWrites[1].dstArrayElement = 0;
+			descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			descriptorWrites[1].descriptorCount = 1;
+			descriptorWrites[1].pBufferInfo = &meanALineInfo;
+
+			// Binding 2: Output buffer (deviceProcessedBuffer)
+			descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrites[2].dstSet = this->impl->universalPostFFTDescriptorSets[i][1];
+			descriptorWrites[2].dstBinding = 2;
+			descriptorWrites[2].dstArrayElement = 0;
+			descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			descriptorWrites[2].descriptorCount = 1;
+			descriptorWrites[2].pBufferInfo = &outputInfo;
+
+			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+		}
 	}
 
 	// ============================================
@@ -4332,42 +4377,92 @@ void VulkanBackend::createComputePipelines() {
 	fpnDeterminationAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
 	fpnDeterminationAllocInfo.pSetLayouts = fpnDeterminationLayouts.data();
 
+	// Allocate 2 descriptor sets per command buffer (one for each input buffer variant)
+	std::vector<VkDescriptorSetLayout> fpnDeterminationLayoutsExpanded(this->impl->numCommandBuffers * 2, this->impl->fpnDeterminationDescriptorSetLayout);
+
+	VkDescriptorSetAllocateInfo fpnDeterminationAllocInfoExpanded = {};
+	fpnDeterminationAllocInfoExpanded.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	fpnDeterminationAllocInfoExpanded.descriptorPool = this->impl->descriptorPool;
+	fpnDeterminationAllocInfoExpanded.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 2);
+	fpnDeterminationAllocInfoExpanded.pSetLayouts = fpnDeterminationLayoutsExpanded.data();
+
+	std::vector<VkDescriptorSet> fpnDeterminationDescriptorSetsFlat(this->impl->numCommandBuffers * 2);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &fpnDeterminationAllocInfoExpanded, fpnDeterminationDescriptorSetsFlat.data()));
+
+	// Copy into 2D array structure
 	this->impl->fpnDeterminationDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &fpnDeterminationAllocInfo, this->impl->fpnDeterminationDescriptorSets.data()));
-
-	// Update FPN determination descriptor sets
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> fpnDescriptorWrites(2);
+		this->impl->fpnDeterminationDescriptorSets[i][0] = fpnDeterminationDescriptorSetsFlat[i * 2 + 0];
+		this->impl->fpnDeterminationDescriptorSets[i][1] = fpnDeterminationDescriptorSetsFlat[i * 2 + 1];
+	}
 
-		// Binding 0: Input buffer (deviceFftBuffer - complex post-IFFT data)
-		VkDescriptorBufferInfo inputInfo = {};
-		inputInfo.buffer = this->impl->deviceFftBuffer;
-		inputInfo.offset = 0;
-		inputInfo.range = VK_WHOLE_SIZE;
-
-		fpnDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		fpnDescriptorWrites[0].dstSet = this->impl->fpnDeterminationDescriptorSets[i];
-		fpnDescriptorWrites[0].dstBinding = 0;
-		fpnDescriptorWrites[0].dstArrayElement = 0;
-		fpnDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		fpnDescriptorWrites[0].descriptorCount = 1;
-		fpnDescriptorWrites[0].pBufferInfo = &inputInfo;
-
-		// Binding 1: Mean A-line output buffer
+	// Update FPN determination descriptor sets (2 variants per command buffer)
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		// Mean A-line buffer info (same for both variants)
 		VkDescriptorBufferInfo meanALineInfo = {};
 		meanALineInfo.buffer = this->impl->meanALineBuffer;
 		meanALineInfo.offset = 0;
 		meanALineInfo.range = VK_WHOLE_SIZE;
 
-		fpnDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		fpnDescriptorWrites[1].dstSet = this->impl->fpnDeterminationDescriptorSets[i];
-		fpnDescriptorWrites[1].dstBinding = 1;
-		fpnDescriptorWrites[1].dstArrayElement = 0;
-		fpnDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		fpnDescriptorWrites[1].descriptorCount = 1;
-		fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
+		// --- Variant 0: Input from deviceFftBuffer ---
+		{
+			std::vector<VkWriteDescriptorSet> fpnDescriptorWrites(2);
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+			// Binding 0: Input buffer (deviceFftBuffer)
+			VkDescriptorBufferInfo inputInfo = {};
+			inputInfo.buffer = this->impl->deviceFftBuffer;
+			inputInfo.offset = 0;
+			inputInfo.range = VK_WHOLE_SIZE;
+
+			fpnDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			fpnDescriptorWrites[0].dstSet = this->impl->fpnDeterminationDescriptorSets[i][0];
+			fpnDescriptorWrites[0].dstBinding = 0;
+			fpnDescriptorWrites[0].dstArrayElement = 0;
+			fpnDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			fpnDescriptorWrites[0].descriptorCount = 1;
+			fpnDescriptorWrites[0].pBufferInfo = &inputInfo;
+
+			// Binding 1: Mean A-line output buffer
+			fpnDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			fpnDescriptorWrites[1].dstSet = this->impl->fpnDeterminationDescriptorSets[i][0];
+			fpnDescriptorWrites[1].dstBinding = 1;
+			fpnDescriptorWrites[1].dstArrayElement = 0;
+			fpnDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			fpnDescriptorWrites[1].descriptorCount = 1;
+			fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
+
+			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+		}
+
+		// --- Variant 1: Input from deviceIntermediateBuffer ---
+		{
+			std::vector<VkWriteDescriptorSet> fpnDescriptorWrites(2);
+
+			// Binding 0: Input buffer (deviceIntermediateBuffer)
+			VkDescriptorBufferInfo inputInfo = {};
+			inputInfo.buffer = this->impl->deviceIntermediateBuffer;
+			inputInfo.offset = 0;
+			inputInfo.range = VK_WHOLE_SIZE;
+
+			fpnDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			fpnDescriptorWrites[0].dstSet = this->impl->fpnDeterminationDescriptorSets[i][1];
+			fpnDescriptorWrites[0].dstBinding = 0;
+			fpnDescriptorWrites[0].dstArrayElement = 0;
+			fpnDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			fpnDescriptorWrites[0].descriptorCount = 1;
+			fpnDescriptorWrites[0].pBufferInfo = &inputInfo;
+
+			// Binding 1: Mean A-line output buffer
+			fpnDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			fpnDescriptorWrites[1].dstSet = this->impl->fpnDeterminationDescriptorSets[i][1];
+			fpnDescriptorWrites[1].dstBinding = 1;
+			fpnDescriptorWrites[1].dstArrayElement = 0;
+			fpnDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			fpnDescriptorWrites[1].descriptorCount = 1;
+			fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
+
+			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+		}
 	}
 
 	// ============================================
