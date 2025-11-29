@@ -9,6 +9,9 @@
 #ifdef OPE_OPENCL_AVAILABLE
 #include "../backends/opencl/opencl_backend.h"
 #endif
+#ifdef OPE_VULKAN_AVAILABLE
+#include "../backends/vulkan/vulkan_backend.h"
+#endif
 #include "callback_manager.h"
 #include <stdexcept>
 #include <fstream>
@@ -119,6 +122,26 @@ public:
 					"OpenCL backend not available. "
 					"OCTproEngine was compiled without OpenCL support. "
 					"Use Backend::CUDA or Backend::CPU instead."
+				);
+#endif
+				break;
+			case Backend::VULKAN:
+#ifdef OPE_VULKAN_AVAILABLE
+				{
+					auto vulkanBackend = std::make_unique<VulkanBackend>();
+
+					// Apply Vulkan settings from config
+					const auto* vulkanConfig = static_cast<const VulkanConfig*>(this->backendConfig.get());
+					vulkanBackend->setDeviceId(vulkanConfig->deviceId);
+					vulkanBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of vulkanConfig
+
+					this->backend = std::move(vulkanBackend);
+				}
+#else
+				throw std::runtime_error(
+					"Vulkan backend not available. "
+					"OCTproEngine was compiled without Vulkan support. "
+					"Use Backend::CUDA, Backend::OPENCL, or Backend::CPU instead."
 				);
 #endif
 				break;

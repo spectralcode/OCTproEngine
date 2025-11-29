@@ -1,0 +1,46 @@
+#version 450
+
+// Merged shader: Dispersion Compensation + Windowing
+// Combines two operations to eliminate intermediate memory transfers
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex input data
+} inputBuf;
+
+layout(binding = 1) buffer DispersionPhaseBuffer {
+	vec2 data[];  // Complex phase for dispersion compensation
+} dispersionPhaseBuf;
+
+layout(binding = 2) buffer WindowBuffer {
+	float data[];  // Window curve
+} windowBuf;
+
+layout(binding = 3) buffer OutputBuffer {
+	vec2 data[];  // Complex output data
+} outputBuf;
+
+layout(push_constant) uniform PushConstants {
+	uint signalLength;  // Width (samples per A-scan)
+	uint samplesPerBuffer;  // Total samples
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+
+	if (index >= params.samplesPerBuffer) {
+		return;
+	}
+
+	// Calculate which sample within A-scan
+	uint lineIndex = index % params.signalLength;
+
+	// Apply windowing to real part
+	float inX = inputBuf.data[index].x * windowBuf.data[lineIndex];
+
+	// Apply dispersion compensation (complex multiplication)
+	vec2 phaseComplex = dispersionPhaseBuf.data[lineIndex];
+	outputBuf.data[index].x = inX * phaseComplex.x;
+	outputBuf.data[index].y = inX * phaseComplex.y;
+}

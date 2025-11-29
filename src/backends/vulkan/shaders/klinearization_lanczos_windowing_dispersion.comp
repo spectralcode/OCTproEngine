@@ -1,0 +1,76 @@
+#version 450
+
+// Merged shader: K-Linearization (Lanczos) + Windowing + Dispersion Compensation
+// Combines three operations to eliminate intermediate memory transfers
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex input data
+} inputBuf;
+
+layout(binding = 1) buffer ResampleCurveBuffer {
+	float data[];  // Resample curve (indices for interpolation)
+} resampleCurveBuf;
+
+layout(binding = 2) buffer WindowBuffer {
+	float data[];  // Window curve
+} windowBuf;
+
+layout(binding = 3) buffer DispersionPhaseBuffer {
+	vec2 data[];  // Complex phase for dispersion compensation
+} dispersionPhaseBuf;
+
+layout(binding = 4) buffer OutputBuffer {
+	vec2 data[];  // Complex output data
+} outputBuf;
+
+layout(push_constant) uniform PushConstants {
+	uint signalLength;  // Width (samples per A-scan)
+	uint samplesPerBuffer;  // Total samples
+} params;
+
+#define PI 3.141592654f
+#define PI_OVER_8 0.3926990817f
+
+// Lanczos kernel matching CUDA implementation
+float lanczosKernel8(float x) {
+	float absX = abs(x);
+	if (absX < 0.00001f) {
+		return 1.0f;
+	}
+	float sincX = sin(PI * absX) / (PI * absX);
+	float sincXOver8 = sin(PI_OVER_8 * absX) / (PI_OVER_8 * absX);
+	return sincX * sincXOver8;
+}
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+
+	if (index >= params.samplesPerBuffer) {
+		return;
+	}
+
+	// Calculate position within current A-scan
+	uint j = index % params.signalLength;
+	uint offset = index - j;
+
+	// Get interpolation position from resample curve
+	float nx = resampleCurveBuf.data[j];
+	int n0 = int(nx);
+	float sum = 0.0f;
+
+	// Lanczos interpolation with 16 samples (from -7 to +8)
+	for (int i = -7; i <= 8; i++) {
+		float y = inputBuf.data[offset + (n0 + i)].x;
+		sum += y * lanczosKernel8(nx - float(n0 + i));
+	}
+
+	// Apply windowing
+	float linearizedAndWindowedInX = sum * windowBuf.data[j];
+
+	// Apply dispersion compensation (complex multiplication)
+	vec2 phaseComplex = dispersionPhaseBuf.data[j];
+	outputBuf.data[index].x = linearizedAndWindowedInX * phaseComplex.x;
+	outputBuf.data[index].y = linearizedAndWindowedInX * phaseComplex.y;
+}

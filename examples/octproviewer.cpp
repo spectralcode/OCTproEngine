@@ -181,7 +181,8 @@ void initializeProcessor(AppState* state) {
 			// Just switch backend to preserve recorded profiles
 			std::cout << "Switching backend to "
 			          << (state->dataParams.backend == ope::Backend::CUDA ? "CUDA" :
-			              (state->dataParams.backend == ope::Backend::CPU ? "CPU" : "OpenCL"))
+			              (state->dataParams.backend == ope::Backend::CPU ? "CPU" :
+			               (state->dataParams.backend == ope::Backend::OPENCL ? "OpenCL" : "Vulkan")))
 			          << " (preserving profiles)..." << std::endl;
 
 			state->processor->setBackend(state->dataParams.backend);
@@ -260,7 +261,8 @@ void initializeProcessor(AppState* state) {
 
 	std::cout << "Processor initialized ("
 			  << (state->dataParams.backend == ope::Backend::CUDA ? "CUDA" :
-			      (state->dataParams.backend == ope::Backend::CPU ? "CPU" : "OpenCL"))
+			      (state->dataParams.backend == ope::Backend::CPU ? "CPU" :
+			       (state->dataParams.backend == ope::Backend::OPENCL ? "OpenCL" : "Vulkan")))
 			  << ")" << std::endl;
 }
 
@@ -475,10 +477,14 @@ void renderDataParametersUI(AppState* state) {
 		dp.hasChanged = true;
 	}
 
-	const char* backends[] = {"CUDA", "CPU", "OpenCL"};
-	int backendIdx = dp.backend == ope::Backend::CUDA ? 0 : (dp.backend == ope::Backend::CPU ? 1 : 2);
-	if (ImGui::Combo("Backend", &backendIdx, backends, 3)) {
-		dp.backend = backendIdx == 0 ? ope::Backend::CUDA : (backendIdx == 1 ? ope::Backend::CPU : ope::Backend::OPENCL);
+	const char* backends[] = {"CUDA", "CPU", "OpenCL", "Vulkan"};
+	int backendIdx = dp.backend == ope::Backend::CUDA ? 0 :
+	                 (dp.backend == ope::Backend::CPU ? 1 :
+	                  (dp.backend == ope::Backend::OPENCL ? 2 : 3));
+	if (ImGui::Combo("Backend", &backendIdx, backends, 4)) {
+		dp.backend = backendIdx == 0 ? ope::Backend::CUDA :
+		             (backendIdx == 1 ? ope::Backend::CPU :
+		              (backendIdx == 2 ? ope::Backend::OPENCL : ope::Backend::VULKAN));
 		dp.hasChanged = true;
 	}
 

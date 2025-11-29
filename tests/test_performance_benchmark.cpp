@@ -26,9 +26,10 @@
 const bool BENCHMARK_CPU = true;
 const bool BENCHMARK_CUDA = true;
 const bool BENCHMARK_OPENCL = true;
+const bool BENCHMARK_VULKAN = true;
 
-const int SIGNAL_LENGTHS[] = {512, 1024, 2048, 4096};
-const int ASCANS_PER_BSCAN[] = {256, 512, 1024, 2048};
+const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
+const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
 const int BSCANS_PER_BUFFER[] = {1};
 const int ITERATIONS = 100;
 
@@ -39,6 +40,7 @@ const int ITERATIONS = 100;
 const bool BENCHMARK_CPU = false;
 const bool BENCHMARK_CUDA = true;
 const bool BENCHMARK_OPENCL = false;
+const bool BENCHMARK_VULKAN = false;
 
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
@@ -50,9 +52,12 @@ const int ITERATIONS = 2000;
 const bool ENABLE_RESAMPLING = true;
 const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
-const bool ENABLE_BACKGROUND_REMOVAL = true;
+const bool ENABLE_DC_REMOVAL = false;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_BSCAN_FLIP = false;
+
+// DC Removal configuration
+const int DC_REMOVAL_WINDOW_SIZE = 64;
 
 // Resampling configuration
 const ope::InterpolationMethod INTERPOLATION_METHOD = ope::InterpolationMethod::CUBIC;
@@ -169,7 +174,10 @@ void configureProcessor(ope::Processor& processor, int signalLength, int ascansP
 		);
 	}
 	
-	processor.enableBackgroundRemoval(ENABLE_BACKGROUND_REMOVAL);
+	processor.enableBackgroundRemoval(ENABLE_DC_REMOVAL);
+	if (ENABLE_DC_REMOVAL) {
+		processor.setBackgroundRemovalWindowSize(DC_REMOVAL_WINDOW_SIZE);
+	}
 	processor.enableLogScaling(ENABLE_LOG_SCALING);
 	processor.setGrayscaleRange(GRAYSCALE_MIN, GRAYSCALE_MAX);
 	processor.enableBscanFlip(ENABLE_BSCAN_FLIP);
@@ -204,7 +212,8 @@ BenchmarkResult runBenchmark(
 	result.ascansPerBscan = ascansPerBscan;
 	result.bscansPerBuffer = bscansPerBuffer;
 	result.backend = (backend == ope::Backend::CPU) ? "CPU" :
-	                 (backend == ope::Backend::CUDA) ? "CUDA" : "OpenCL";
+	                 (backend == ope::Backend::CUDA) ? "CUDA" :
+	                 (backend == ope::Backend::VULKAN) ? "Vulkan" : "OpenCL";
 	result.iterations = ITERATIONS;
 	result.speedup = 1.0;
 	
@@ -357,7 +366,7 @@ void printConfiguration() {
 	}
 	if (ENABLE_WINDOWING) enabled.push_back("Windowing");
 	if (ENABLE_DISPERSION) enabled.push_back("Dispersion");
-	if (ENABLE_BACKGROUND_REMOVAL) enabled.push_back("BG-Removal");
+	if (ENABLE_DC_REMOVAL) enabled.push_back("DC-Removal");
 	if (ENABLE_LOG_SCALING) enabled.push_back("Log-Scale");
 	
 	for (size_t i = 0; i < enabled.size(); ++i) {
@@ -371,6 +380,7 @@ void printConfiguration() {
 	if (BENCHMARK_CPU) std::cout << "CPU ";
 	if (BENCHMARK_CUDA) std::cout << "CUDA ";
 	if (BENCHMARK_OPENCL) std::cout << "OpenCL ";
+	if (BENCHMARK_VULKAN) std::cout << "Vulkan ";
 	std::cout << std::endl;
 	std::cout << std::endl;
 }
@@ -395,14 +405,15 @@ int main() {
 	int numAscans = sizeof(ASCANS_PER_BSCAN) / sizeof(ASCANS_PER_BSCAN[0]);
 	int numBscans = sizeof(BSCANS_PER_BUFFER) / sizeof(BSCANS_PER_BUFFER[0]);
 	int numConfigs = numSignalLengths * numAscans * numBscans;
-	int numBackends = (BENCHMARK_CPU ? 1 : 0) + (BENCHMARK_CUDA ? 1 : 0) + (BENCHMARK_OPENCL ? 1 : 0);
+	int numBackends = (BENCHMARK_CPU ? 1 : 0) + (BENCHMARK_CUDA ? 1 : 0) + (BENCHMARK_OPENCL ? 1 : 0) + (BENCHMARK_VULKAN ? 1 : 0);
 	int totalTests = numConfigs;// * numBackends;
 	int currentTest = 0;
-	
+
 	// Store results per backend
 	std::vector<BenchmarkResult> cpuResults;
 	std::vector<BenchmarkResult> cudaResults;
 	std::vector<BenchmarkResult> openclResults;
+	std::vector<BenchmarkResult> vulkanResults;
 	
 	// Helper lambda to run all configurations for a backend
 	auto runAllConfigs = [&](ope::Backend backend, const std::string& backendName, std::vector<BenchmarkResult>& results) {
@@ -445,7 +456,11 @@ int main() {
 	if (BENCHMARK_OPENCL) {
 		runAllConfigs(ope::Backend::OPENCL, "OpenCL", openclResults);
 	}
-	
+
+	if (BENCHMARK_VULKAN) {
+		runAllConfigs(ope::Backend::VULKAN, "Vulkan", vulkanResults);
+	}
+
 	// Calculate speedups relative to CPU
 	if (BENCHMARK_CPU) {
 		for (size_t i = 0; i < cpuResults.size(); ++i) {
@@ -455,10 +470,13 @@ int main() {
 			if (BENCHMARK_OPENCL && i < openclResults.size()) {
 				openclResults[i].speedup = cpuResults[i].avgTimeMs / openclResults[i].avgTimeMs;
 			}
+			if (BENCHMARK_VULKAN && i < vulkanResults.size()) {
+				vulkanResults[i].speedup = cpuResults[i].avgTimeMs / vulkanResults[i].avgTimeMs;
+			}
 		}
 	}
 	
-	// Merge results grouped by configuration (CPU, CUDA, OpenCL for each config)
+	// Merge results grouped by configuration (CPU, CUDA, OpenCL, Vulkan for each config)
 	std::vector<BenchmarkResult> allResults;
 	for (int i = 0; i < numConfigs; ++i) {
 		if (BENCHMARK_CPU && i < static_cast<int>(cpuResults.size())) {
@@ -469,6 +487,9 @@ int main() {
 		}
 		if (BENCHMARK_OPENCL && i < static_cast<int>(openclResults.size())) {
 			allResults.push_back(openclResults[i]);
+		}
+		if (BENCHMARK_VULKAN && i < static_cast<int>(vulkanResults.size())) {
+			allResults.push_back(vulkanResults[i]);
 		}
 	}
 	

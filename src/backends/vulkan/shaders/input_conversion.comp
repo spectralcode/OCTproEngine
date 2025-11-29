@@ -1,0 +1,56 @@
+#version 450
+
+// Input conversion shader: converts raw input data to complex float
+// Real = input value, Imaginary = 0
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer InputBuffer {
+	uint data[];
+} inputBuf;
+
+layout(binding = 1) buffer OutputBuffer {
+	vec2 data[];  // vec2 = complex float (real, imag)
+} outputBuf;
+
+layout(push_constant) uniform PushConstants {
+	uint samplesPerBuffer;
+	uint inputBitDepth;  // 8, 16, or 32
+	uint bytesPerSample;  // 1, 2, or 4
+} params;
+
+void main() {
+	uint idx = gl_GlobalInvocationID.x;
+
+	if (idx >= params.samplesPerBuffer) {
+		return;
+	}
+
+	float realValue = 0.0;
+
+	if (params.inputBitDepth <= 8) {
+		// UINT8: extract byte from packed uint
+		uint byteOffset = idx;
+		uint uintIndex = byteOffset / 4;
+		uint byteIndex = byteOffset % 4;
+		uint packedValue = inputBuf.data[uintIndex];
+		uint byteValue = (packedValue >> (byteIndex * 8)) & 0xFF;
+		realValue = float(byteValue);
+	}
+	else if (params.inputBitDepth <= 16) {
+		// UINT16: extract short from packed uint
+		uint shortOffset = idx;
+		uint uintIndex = shortOffset / 2;
+		uint shortIndex = shortOffset % 2;
+		uint packedValue = inputBuf.data[uintIndex];
+		uint shortValue = (packedValue >> (shortIndex * 16)) & 0xFFFF;
+		realValue = float(shortValue);
+	}
+	else {
+		// UINT32: direct access
+		realValue = float(inputBuf.data[idx]);
+	}
+
+	// Write complex value (real, imag=0)
+	outputBuf.data[idx] = vec2(realValue, 0.0);
+}

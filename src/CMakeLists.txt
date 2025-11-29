@@ -49,6 +49,10 @@ set(OPENCL_SOURCES
 	backends/opencl/opencl_kernels_source.cpp
 )
 
+set(VULKAN_SOURCES
+	backends/vulkan/vulkan_backend.cpp
+)
+
 # ========================================
 # Build Library
 # ========================================
@@ -65,6 +69,10 @@ endif()
 
 if(BUILD_OPENCL)
 	list(APPEND BACKEND_SOURCES ${OPENCL_SOURCES})
+endif()
+
+if(BUILD_VULKAN)
+	list(APPEND BACKEND_SOURCES ${VULKAN_SOURCES})
 endif()
 
 # Create library
@@ -87,6 +95,37 @@ endif()
 
 if(BUILD_OPENCL)
 	list(APPEND LINK_LIBRARIES OpenCL::OpenCL VkFFT::VkFFT)
+endif()
+
+if(BUILD_VULKAN)
+	# Find glslang libraries (required by VkFFT for runtime shader compilation)
+	find_library(GLSLANG_LIB NAMES glslang
+		PATHS
+			${Vulkan_INCLUDE_DIRS}/../Lib
+			${Vulkan_INCLUDE_DIRS}/../lib
+			/usr/lib
+			/usr/local/lib
+	)
+	find_library(SPIRV_LIB NAMES SPIRV
+		PATHS
+			${Vulkan_INCLUDE_DIRS}/../Lib
+			${Vulkan_INCLUDE_DIRS}/../lib
+			/usr/lib
+			/usr/local/lib
+	)
+
+	list(APPEND LINK_LIBRARIES Vulkan::Vulkan VkFFT::VkFFT ${SHADERC_LIB})
+	if(GLSLANG_LIB)
+		list(APPEND LINK_LIBRARIES ${GLSLANG_LIB})
+		message(STATUS "Found glslang library: ${GLSLANG_LIB}")
+	endif()
+	if(SPIRV_LIB)
+		list(APPEND LINK_LIBRARIES ${SPIRV_LIB})
+		message(STATUS "Found SPIRV library: ${SPIRV_LIB}")
+	endif()
+
+	# Add glslang include directory for VkFFT
+	target_include_directories(octproengine PRIVATE ${GLSLANG_INCLUDE_DIRS})
 endif()
 
 target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES})
@@ -141,6 +180,11 @@ endif()
 if(BUILD_OPENCL)
 	target_compile_definitions(octproengine PUBLIC OPE_OPENCL_AVAILABLE)
 	message(STATUS "Defining OPE_OPENCL_AVAILABLE")
+endif()
+
+if(BUILD_VULKAN)
+	target_compile_definitions(octproengine PUBLIC OPE_VULKAN_AVAILABLE)
+	message(STATUS "Defining OPE_VULKAN_AVAILABLE")
 endif()
 
 # Windows-specific settings

@@ -83,6 +83,26 @@ public:
 	std::string toString() const override;
 };
 
+// Vulkan backend configuration
+class OPE_API VulkanConfig : public BackendConfig {
+public:
+	int deviceId;  // Physical device index
+
+	VulkanConfig() : deviceId(0) {}
+
+	Backend getBackendType() const override { return Backend::VULKAN; }
+
+	std::unique_ptr<BackendConfig> clone() const override {
+		return std::make_unique<VulkanConfig>(*this);
+	}
+
+	bool isValid() const override {
+		return deviceId >= 0;
+	}
+
+	std::string toString() const override;
+};
+
 // CPU backend configuration
 class OPE_API CpuConfig : public BackendConfig {
 public:
@@ -110,11 +130,13 @@ public:
 	// Device enumeration
 	static std::vector<DeviceInfo> getCudaDevices();
 	static std::vector<DeviceInfo> getOpenCLDevices();
+	static std::vector<DeviceInfo> getVulkanDevices();
 	static DeviceInfo getCpuInfo();
 
 	// Backend availability
 	static bool isCudaAvailable();
 	static bool isOpenCLAvailable();
+	static bool isVulkanAvailable();
 	static bool isCpuAvailable();
 
 	// Create default configuration for a backend

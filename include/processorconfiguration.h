@@ -13,7 +13,8 @@ namespace ope {
 enum class Backend {
 	CUDA,
 	CPU,
-	OPENCL
+	OPENCL,
+	VULKAN
 };
 
 enum class InterpolationMethod {

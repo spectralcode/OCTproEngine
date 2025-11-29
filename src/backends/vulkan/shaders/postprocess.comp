@@ -1,0 +1,51 @@
+#version 450
+
+// Post-processing shader: applies log scaling and grayscale normalization
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer InputBuffer {
+	float data[];  // Input magnitude data
+} inputBuf;
+
+layout(binding = 1) buffer OutputBuffer {
+	float data[];  // Output scaled data
+} outputBuf;
+
+layout(push_constant) uniform PushConstants {
+	uint samplesPerBuffer;  // Total samples to process
+	uint logScaling;  // 1 for log scaling, 0 for linear
+	uint outputSignalLength;  // FFT size for normalization (e.g., 1024)
+	float grayscaleMax;  // Maximum grayscale value
+	float grayscaleMin;  // Minimum grayscale value
+	float addend;  // Additive factor
+	float multiplicator;  // Multiplicative factor
+} params;
+
+void main() {
+	uint idx = gl_GlobalInvocationID.x;
+
+	if (idx >= params.samplesPerBuffer) {
+		return;
+	}
+
+	float value = inputBuf.data[idx];
+	float processed;
+
+	if (params.logScaling == 1) {
+		// Log scaling: 10*log10(magnitude²/N) = 20*log10(magnitude) - 10*log10(N)
+		// Note: input is raw magnitude from truncate shader
+		// FFT normalization: subtract 10*log10(outputSignalLength) to match CUDA
+		processed = 20.0f * log(value) / log(10.0f) - 10.0f * log(float(params.outputSignalLength)) / log(10.0f);
+	} else {
+		// Linear scaling with FFT normalization
+		// Divide by FFT size to match CUDA behavior
+		processed = value / float(params.outputSignalLength);
+	}
+
+	// Apply grayscale normalization: (value - min) / (max - min)
+	float normalized = (processed - params.grayscaleMin) / (params.grayscaleMax - params.grayscaleMin);
+
+	// Apply addend and multiplicator
+	outputBuf.data[idx] = params.multiplicator * (normalized + params.addend);
+}

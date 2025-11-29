@@ -22,7 +22,8 @@ const int BSCANS_PER_BUFFER = 1;
 const bool ENABLE_RESAMPLING = true;
 const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
-const bool ENABLE_BACKGROUND_REMOVAL = true;
+const bool ENABLE_DC_REMOVAL = true;  // Testing DC removal with merged pipeline
+const int DC_REMOVAL_WINDOW_SIZE = 64;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_BSCAN_FLIP = false;
 const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = false;
@@ -216,7 +217,8 @@ void configureProcessor(ope::Processor& processor) {
 		);
 	}
 	
-	processor.enableBackgroundRemoval(ENABLE_BACKGROUND_REMOVAL);
+	processor.enableBackgroundRemoval(ENABLE_DC_REMOVAL);
+	processor.setBackgroundRemovalWindowSize(DC_REMOVAL_WINDOW_SIZE);
 	processor.enableLogScaling(ENABLE_LOG_SCALING);
 	processor.setGrayscaleRange(GRAYSCALE_MIN, GRAYSCALE_MAX);
 	processor.enableBscanFlip(ENABLE_BSCAN_FLIP);
@@ -239,13 +241,14 @@ void configureProcessor(ope::Processor& processor) {
 
 int main() {
 	std::cout << "========================================" << std::endl;
-	std::cout << "Backend Comparison Test (CPU/CUDA/OpenCL)" << std::endl;
+	std::cout << "Backend Comparison Test (CPU/CUDA/OpenCL/Vulkan)" << std::endl;
 	std::cout << "========================================" << std::endl;
 	std::cout << std::endl;
 	
 	// Print configuration
 	std::cout << "Configuration:" << std::endl;
 	std::cout << "  Dimensions: " << SIGNAL_LENGTH << " x " << ASCANS_PER_BSCAN << " x " << BSCANS_PER_BUFFER << std::endl;
+	std::cout << "  DC Removal(" << DC_REMOVAL_WINDOW_SIZE <<  "): " << (ENABLE_DC_REMOVAL ? "ON" : "OFF");
 	std::cout << "  Resampling: " << (ENABLE_RESAMPLING ? "ON" : "OFF");
 	if (ENABLE_RESAMPLING) {
 		std::cout << " (" << (INTERPOLATION_METHOD == ope::InterpolationMethod::LINEAR ? "LINEAR" : 
@@ -403,6 +406,59 @@ int main() {
 #endif
 
 	// ============================================
+	// Vulkan Backend
+	// ============================================
+	std::cout << "Processing with Vulkan backend..." << std::endl;
+
+#ifdef OPE_VULKAN_AVAILABLE
+	ProcessingResult vulkanResult;
+
+	try {
+		ope::Processor vulkanProcessor(ope::Backend::VULKAN);
+		configureProcessor(vulkanProcessor);
+		vulkanProcessor.initialize();
+
+		vulkanProcessor.setOutputCallback([&vulkanResult](const ope::IOBuffer& output) {
+			std::lock_guard<std::mutex> lock(vulkanResult.mutex);
+			vulkanResult.endTime = std::chrono::high_resolution_clock::now();
+
+			size_t numFloats = output.getSizeInBytes() / sizeof(float);
+			vulkanResult.output.resize(numFloats);
+			std::memcpy(vulkanResult.output.data(), output.getDataPointer(), output.getSizeInBytes());
+
+			vulkanResult.received = true;
+			vulkanResult.cv.notify_one();
+		});
+
+		vulkanResult.startTime = std::chrono::high_resolution_clock::now();
+		ope::IOBuffer& vulkanInputBuf = vulkanProcessor.getNextAvailableInputBuffer();
+		std::memcpy(vulkanInputBuf.getDataPointer(), testData.data(), dataSizeBytes);
+		vulkanProcessor.process(vulkanInputBuf);
+
+		vulkanResult.waitForCompletion();
+
+		if (!vulkanResult.received || vulkanResult.output.empty()) {
+			std::cerr << "  ERROR: No output from Vulkan backend!" << std::endl;
+			return 1;
+		}
+
+		std::cout << "  Output size: " << vulkanResult.output.size() << " samples" << std::endl;
+		std::cout << "  Processing time: " << std::fixed << std::setprecision(3)
+		          << vulkanResult.getDurationMs() << " ms" << std::endl;
+		std::cout << std::endl;
+	}
+	catch (const std::exception& e) {
+		std::cerr << "  ERROR: " << e.what() << std::endl;
+		std::cout << "  Vulkan backend skipped due to errors." << std::endl;
+		std::cout << std::endl;
+	}
+#else
+	std::cout << "  SKIPPED (Vulkan backend not available)" << std::endl;
+	std::cout << std::endl;
+	ProcessingResult vulkanResult;  // Empty result for compilation
+#endif
+
+	// ============================================
 	// Performance Comparison
 	// ============================================
 	std::cout << "Performance:" << std::endl;
@@ -413,6 +469,12 @@ int main() {
 	if (openclResult.received) {
 		std::cout << "  OpenCL: " << std::setprecision(3) << openclResult.getDurationMs() << " ms (Speedup: "
 		          << std::setprecision(2) << (cpuResult.getDurationMs() / openclResult.getDurationMs()) << "x)" << std::endl;
+	}
+#endif
+#ifdef OPE_VULKAN_AVAILABLE
+	if (vulkanResult.received) {
+		std::cout << "  Vulkan: " << std::setprecision(3) << vulkanResult.getDurationMs() << " ms (Speedup: "
+		          << std::setprecision(2) << (cpuResult.getDurationMs() / vulkanResult.getDurationMs()) << "x)" << std::endl;
 	}
 #endif
 	std::cout << std::endl;
@@ -526,7 +588,65 @@ int main() {
 		std::cout << std::endl;
 	}
 #endif
-	
+
+#ifdef OPE_VULKAN_AVAILABLE
+	if (vulkanResult.received && !vulkanResult.output.empty()) {
+		// CPU vs Vulkan comparison
+		std::cout << "CPU vs Vulkan:" << std::endl;
+		auto cpuVulkanComparison = compareBuffers(
+			cpuResult.output.data(),
+			vulkanResult.output.data(),
+			cpuResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+		std::cout << "  Max absolute difference: " << std::scientific << std::setprecision(6)
+		          << cpuVulkanComparison.maxAbsDiff << std::endl;
+		std::cout << "  Mean absolute difference: " << cpuVulkanComparison.meanAbsDiff << std::endl;
+		std::cout << "  RMS error: " << cpuVulkanComparison.rmsError << std::endl;
+		std::cout << "  Differing samples: " << cpuVulkanComparison.differingSamples
+		          << " / " << cpuVulkanComparison.totalSamples;
+		if (cpuVulkanComparison.totalSamples > 0) {
+			std::cout << " (" << std::fixed << std::setprecision(2)
+			          << (100.0 * cpuVulkanComparison.differingSamples / cpuVulkanComparison.totalSamples) << "%)";
+		}
+		std::cout << std::endl;
+		std::cout << "  First A-scan max diff: " << std::scientific << std::setprecision(6)
+		          << cpuVulkanComparison.maxDiffPerAscan[0] << std::endl;
+		if (cpuVulkanComparison.maxDiffPerAscan.size() > 1) {
+			std::cout << "  Last A-scan max diff: " << cpuVulkanComparison.maxDiffPerAscan.back() << std::endl;
+		}
+		std::cout << std::endl;
+
+		// CUDA vs Vulkan comparison
+		std::cout << "CUDA vs Vulkan:" << std::endl;
+		auto cudaVulkanComparison = compareBuffers(
+			cudaResult.output.data(),
+			vulkanResult.output.data(),
+			cudaResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+		std::cout << "  Max absolute difference: " << std::scientific << std::setprecision(6)
+		          << cudaVulkanComparison.maxAbsDiff << std::endl;
+		std::cout << "  Mean absolute difference: " << cudaVulkanComparison.meanAbsDiff << std::endl;
+		std::cout << "  RMS error: " << cudaVulkanComparison.rmsError << std::endl;
+		std::cout << "  Differing samples: " << cudaVulkanComparison.differingSamples
+		          << " / " << cudaVulkanComparison.totalSamples;
+		if (cudaVulkanComparison.totalSamples > 0) {
+			std::cout << " (" << std::fixed << std::setprecision(2)
+			          << (100.0 * cudaVulkanComparison.differingSamples / cudaVulkanComparison.totalSamples) << "%)";
+		}
+		std::cout << std::endl;
+		std::cout << "  First A-scan max diff: " << std::scientific << std::setprecision(6)
+		          << cudaVulkanComparison.maxDiffPerAscan[0] << std::endl;
+		if (cudaVulkanComparison.maxDiffPerAscan.size() > 1) {
+			std::cout << "  Last A-scan max diff: " << cudaVulkanComparison.maxDiffPerAscan.back() << std::endl;
+		}
+		std::cout << std::endl;
+	}
+#endif
+
 	// ============================================
 	// Save Outputs
 	// ============================================
@@ -541,6 +661,13 @@ int main() {
 		if (openclResult.received && !openclResult.output.empty()) {
 			saveRawData("output_opencl.raw", openclResult.output.data(), openclResult.output.size() * sizeof(float));
 			std::cout << "  Saved: output_opencl.raw" << std::endl;
+		}
+#endif
+
+#ifdef OPE_VULKAN_AVAILABLE
+		if (vulkanResult.received && !vulkanResult.output.empty()) {
+			saveRawData("output_vulkan.raw", vulkanResult.output.data(), vulkanResult.output.size() * sizeof(float));
+			std::cout << "  Saved: output_vulkan.raw" << std::endl;
 		}
 #endif
 		std::cout << std::endl;
@@ -568,6 +695,26 @@ int main() {
 			TOLERANCE
 		);
 		allTestsPassed = allTestsPassed && cpuOpenclComparison.match && cudaOpenclComparison.match;
+	}
+#endif
+
+#ifdef OPE_VULKAN_AVAILABLE
+	if (vulkanResult.received && !vulkanResult.output.empty()) {
+		auto cpuVulkanComparison = compareBuffers(
+			cpuResult.output.data(),
+			vulkanResult.output.data(),
+			cpuResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+		auto cudaVulkanComparison = compareBuffers(
+			cudaResult.output.data(),
+			vulkanResult.output.data(),
+			cudaResult.output.size(),
+			samplesPerAscan,
+			TOLERANCE
+		);
+		allTestsPassed = allTestsPassed && cpuVulkanComparison.match && cudaVulkanComparison.match;
 	}
 #endif
 

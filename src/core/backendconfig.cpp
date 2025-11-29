@@ -44,6 +44,16 @@ std::string OpenCLConfig::toString() const {
 }
 
 //	========================================
+//	VulkanConfig Implementation
+//	========================================
+
+std::string VulkanConfig::toString() const {
+	std::ostringstream oss;
+	oss << "VulkanConfig(device=" << deviceId << ")";
+	return oss.str();
+}
+
+//	========================================
 //	CpuConfig Implementation
 //	========================================
 
@@ -174,6 +184,16 @@ std::vector<DeviceInfo> BackendUtils::getOpenCLDevices() {
 	return devices;
 }
 
+std::vector<DeviceInfo> BackendUtils::getVulkanDevices() {
+	std::vector<DeviceInfo> devices;
+
+#ifdef OPE_VULKAN_AVAILABLE
+	//	todo: enumerate Vulkan physical devices
+#endif
+
+	return devices;
+}
+
 DeviceInfo BackendUtils::getCpuInfo() {
 	DeviceInfo info;
 	info.id = 0;
@@ -217,6 +237,15 @@ bool BackendUtils::isOpenCLAvailable() {
 #endif
 }
 
+bool BackendUtils::isVulkanAvailable() {
+#ifdef OPE_VULKAN_AVAILABLE
+	//	todo: ceck if Vulkan runtime is available
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool BackendUtils::isCpuAvailable() {
 #ifdef OPE_CPU_AVAILABLE
 	return true;
@@ -231,6 +260,8 @@ std::unique_ptr<BackendConfig> BackendUtils::createDefaultConfig(Backend backend
 		return std::make_unique<CudaConfig>();
 	case Backend::OPENCL:
 		return std::make_unique<OpenCLConfig>();
+	case Backend::VULKAN:
+		return std::make_unique<VulkanConfig>();
 	case Backend::CPU:
 		return std::make_unique<CpuConfig>();
 	default:
@@ -288,6 +319,24 @@ std::unique_ptr<BackendConfig> BackendUtils::parseConfig(const std::string& conf
 			}
 		}
 		return config;
+	} else if (backendName == "vulkan") {
+		auto config = std::make_unique<VulkanConfig>();
+		std::string params;
+		if (std::getline(iss, params)) {
+			std::istringstream paramStream(params);
+			std::string param;
+			while (std::getline(paramStream, param, ',')) {
+				size_t pos = param.find('=');
+				if (pos != std::string::npos) {
+					std::string key = param.substr(0, pos);
+					std::string value = param.substr(pos + 1);
+					if (key == "device") {
+						config->deviceId = std::stoi(value);
+					}
+				}
+			}
+		}
+		return config;
 	} else if (backendName == "cpu") {
 		auto config = std::make_unique<CpuConfig>();
 		std::string params;
@@ -330,6 +379,11 @@ std::string BackendUtils::serializeConfig(const BackendConfig& config) {
 		oss << "opencl:platform=" << openclConfig.platformId
 			<< ",device=" << openclConfig.deviceId
 			<< ",prefer_gpu=" << (openclConfig.preferGpu ? "true" : "false");
+		break;
+	}
+	case Backend::VULKAN: {
+		const auto& vulkanConfig = static_cast<const VulkanConfig&>(config);
+		oss << "vulkan:device=" << vulkanConfig.deviceId;
 		break;
 	}
 	case Backend::CPU: {

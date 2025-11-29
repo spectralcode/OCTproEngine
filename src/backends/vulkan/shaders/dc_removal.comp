@@ -1,0 +1,68 @@
+#version 450
+
+// DC Removal (Rolling Average Background Subtraction)
+// Removes DC component by subtracting a rolling average from each spectrum (spectrum = raw A-scan)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex input data
+} inputBuf;
+
+layout(binding = 1) buffer OutputBuffer {
+	vec2 data[];  // Complex output data (DC removed)
+} outputBuf;
+
+layout(push_constant) uniform PushConstants {
+	uint rollingAverageWindowSize;
+	uint signalLength;  // width (samples per A-scan)
+	uint ascansPerBscan;  // height (lines per B-scan)
+	uint samplesPerBuffer;  // Total samples
+} params;
+
+// Shared memory for rolling average computation
+shared float s_data[512];  // Adjust size based on max block size + window
+
+void main() {
+	uint globalIdx = gl_GlobalInvocationID.x;
+	uint localIdx = gl_LocalInvocationID.x;
+	uint groupIdx = gl_WorkGroupID.x;
+	uint localSize = gl_WorkGroupSize.x;
+
+	if (globalIdx < params.samplesPerBuffer) {
+		// Calculate current position in the data
+		uint currentLine = (globalIdx / params.signalLength) % params.ascansPerBscan;
+		uint firstIndexOfCurrentLine = currentLine * params.signalLength;
+		uint lastIndexOfCurrentLine = firstIndexOfCurrentLine + params.signalLength - 1;
+
+		// Calculate window bounds (constrained to current line)
+		int startIdx = max(int(firstIndexOfCurrentLine), int(globalIdx) - int(params.rollingAverageWindowSize) + 1);
+		int endIdx = min(int(lastIndexOfCurrentLine), int(globalIdx) + int(params.rollingAverageWindowSize));
+		int windowSize = endIdx - startIdx + 1;
+
+		// Load data into shared memory
+		uint blockFirstIdx = groupIdx * localSize;
+		int blockStartIdx = max(0, int(blockFirstIdx) - int(params.rollingAverageWindowSize) + 1);
+		int blockEndIdx = min(int(params.samplesPerBuffer) - 1, int(blockFirstIdx + localSize - 1) + int(params.rollingAverageWindowSize));
+
+		// Cooperative loading of shared memory
+		for (int i = blockStartIdx + int(localIdx); i <= blockEndIdx; i += int(localSize)) {
+			s_data[i - blockStartIdx] = inputBuf.data[i].x;  // Only need real component
+		}
+
+		// Synchronize workgroup
+		barrier();
+		memoryBarrierShared();
+
+		// Compute rolling average
+		float rollingSum = 0.0f;
+		for (int i = startIdx; i <= endIdx; i++) {
+			rollingSum += s_data[i - blockStartIdx];
+		}
+
+		float rollingAverage = rollingSum / float(windowSize);
+
+		// Subtract rolling average from input and write to output
+		outputBuf.data[globalIdx] = vec2(inputBuf.data[globalIdx].x - rollingAverage, 0.0f);
+	}
+}
