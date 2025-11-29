@@ -167,7 +167,11 @@ struct VulkanBackend::Impl {
 	// Post-processing background
 	VkBuffer postProcBackgroundBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory postProcBackgroundMemory = VK_NULL_HANDLE;
+	VkBuffer postProcBackgroundStagingBuffer = VK_NULL_HANDLE;  // For copying profile back to host
+	VkDeviceMemory postProcBackgroundStagingMemory = VK_NULL_HANDLE;
+	void* postProcBackgroundStagingMapped = nullptr;  // Mapped pointer for readback
 	bool postProcessBackgroundRecordingRequested = false;
+	bool hasValidBackgroundProfile = false;  // Track whether background profile has been set
 	std::vector<float> recordedPostProcessBackground;
 
 	// Compute pipelines (will be created later)
@@ -223,6 +227,18 @@ struct VulkanBackend::Impl {
 	VkPipelineLayout fpnDeterminationPipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout fpnDeterminationDescriptorSetLayout = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> fpnDeterminationDescriptorSets;
+
+	// Background subtraction pipeline resources
+	VkPipelineLayout backgroundSubtractionPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout backgroundSubtractionDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline backgroundSubtractionPipeline = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> backgroundSubtractionDescriptorSets;
+
+	// Background recording pipeline resources
+	VkPipelineLayout backgroundRecordingPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout backgroundRecordingDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline backgroundRecordingPipeline = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> backgroundRecordingDescriptorSets;
 
 	// Shader modules (will be created later)
 	std::vector<VkShaderModule> shaderModules;
@@ -294,6 +310,23 @@ struct VulkanBackend::Impl {
 			std::memcpy(work.outputBuffer->getDataPointer(),
 			            this->stagingOutputMapped[work.commandBufferIdx],
 			            work.outputSize);
+
+			// If background recording was requested, copy the recorded profile from staging buffer
+			if (this->postProcessBackgroundRecordingRequested) {
+				size_t bgProfileSize = work.outputSignalLength;  // Number of floats in background profile
+				this->recordedPostProcessBackground.resize(bgProfileSize);
+				std::memcpy(this->recordedPostProcessBackground.data(),
+				            this->postProcBackgroundStagingMapped,
+				            bgProfileSize * sizeof(float));
+
+				// Mark as valid and clear the request flag
+				this->hasValidBackgroundProfile = true;
+				this->postProcessBackgroundRecordingRequested = false;
+
+				// Re-record command buffers to now apply background subtraction (if enabled)
+				// This must be done on the main thread or with proper synchronization
+				// For now, just mark the profile as recorded; it will be applied on next call to process()
+			}
 
 			// Invoke callback if registered
 			if (this->callback) {
@@ -573,6 +606,20 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 
 	// Pre-record all command buffers for maximum performance
 	this->recordCommandBuffers();
+
+	// Load recorded profiles from configuration (if backend was switched)
+	if (config.hasCustomPostProcessBackgroundProfile()) {
+		const std::vector<float>& profileVec = config.getBackgroundProfile();
+		// Use setPostProcessBackgroundProfile to upload and configure
+		this->setPostProcessBackgroundProfile(profileVec.data(), profileVec.size());
+	}
+
+	if (config.hasCustomFixedPatternNoiseProfile()) {
+		const std::vector<float>& profileVec = config.getFixedPatternNoiseProfile();
+		size_t complexPairs = profileVec.size() / 2;
+		// Use setFixedPatternNoiseProfile to upload and configure
+		this->setFixedPatternNoiseProfile(profileVec.data(), complexPairs);
+	}
 
 	// Start async completion thread (handles fence polling and callbacks)
 	this->impl->completionThreadRunning = true;
@@ -1234,25 +1281,169 @@ void VulkanBackend::process(IOBuffer& input) {
 	uint32_t universalPostFFTWorkgroups = (this->impl->samplesPerBuffer + 127) / 128;
 	vkCmdDispatch(cmd, universalPostFFTWorkgroups, 1, 1);
 
-	// Barrier after universal post-FFT (wait for writes to complete before copy)
-	VkBufferMemoryBarrier postprocessOutputBarrier = {};
-	postprocessOutputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	postprocessOutputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	postprocessOutputBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	postprocessOutputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	postprocessOutputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	postprocessOutputBarrier.buffer = this->impl->deviceProcessedBuffer;
-	postprocessOutputBarrier.offset = 0;
-	postprocessOutputBarrier.size = VK_WHOLE_SIZE;
+	// Barrier after universal post-FFT (wait for writes to complete before next stage)
+	VkBufferMemoryBarrier postFFTBarrier = {};
+	postFFTBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	postFFTBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	postFFTBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // Background subtraction reads and writes
+	postFFTBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	postFFTBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	postFFTBarrier.buffer = this->impl->deviceProcessedBuffer;
+	postFFTBarrier.offset = 0;
+	postFFTBarrier.size = VK_WHOLE_SIZE;
 
 	vkCmdPipelineBarrier(cmd,
 	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 	                     0,
 	                     0, nullptr,
-	                     1, &postprocessOutputBarrier,
+	                     1, &postFFTBarrier,
 	                     0, nullptr);
 
+	// ============================================
+	// Background Recording (if requested)
+	// ============================================
+
+	if (this->impl->postProcessBackgroundRecordingRequested) {
+		// Bind background recording pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundRecordingPipeline);
+
+		// Bind background recording descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundRecordingPipelineLayout,
+		                        0, 1, &this->impl->backgroundRecordingDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: samplesPerAscan, ascansPerBuffer
+		struct BackgroundRecordingPushConstants {
+			uint32_t samplesPerAscan;
+			uint32_t ascansPerBuffer;
+		} bgRecPush;
+
+		bgRecPush.samplesPerAscan = static_cast<uint32_t>(outputSignalLength);
+		bgRecPush.ascansPerBuffer = static_cast<uint32_t>(this->impl->ascansPerBscan * this->impl->bscansPerBuffer);
+
+		vkCmdPushConstants(cmd, this->impl->backgroundRecordingPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(bgRecPush), &bgRecPush);
+
+		// Dispatch background recording shader (one thread per sample in background profile)
+		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + 127) / 128;
+		vkCmdDispatch(cmd, bgRecWorkgroups, 1, 1);
+
+		// Barrier after background recording (wait for writes to complete before subtraction or copy)
+		VkBufferMemoryBarrier bgRecBarrier = {};
+		bgRecBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgRecBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		bgRecBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		bgRecBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgRecBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgRecBarrier.buffer = this->impl->postProcBackgroundBuffer;
+		bgRecBarrier.offset = 0;
+		bgRecBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &bgRecBarrier,
+		                     0, nullptr);
+
+		// Copy recorded background profile from device to staging buffer for host readback
+		VkBufferCopy bgCopyRegion = {};
+		bgCopyRegion.size = static_cast<VkDeviceSize>(outputSignalLength * sizeof(float));
+		vkCmdCopyBuffer(cmd, this->impl->postProcBackgroundBuffer, this->impl->postProcBackgroundStagingBuffer, 1, &bgCopyRegion);
+
+		// Barrier after copy (ensure copy completes before host reads)
+		VkBufferMemoryBarrier bgCopyBarrier = {};
+		bgCopyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgCopyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		bgCopyBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		bgCopyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgCopyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgCopyBarrier.buffer = this->impl->postProcBackgroundStagingBuffer;
+		bgCopyBarrier.offset = 0;
+		bgCopyBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_HOST_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &bgCopyBarrier,
+		                     0, nullptr);
+	}
+
+	// ============================================
+	// Background Subtraction (Post-Processing)
+	// ============================================
+
+	// Apply subtraction if we have a valid profile OR if we just recorded one (same behavior as CUDA)
+	if (this->impl->config.processingParams.background.enabled &&
+	    (this->impl->hasValidBackgroundProfile || this->impl->postProcessBackgroundRecordingRequested)) {
+		// Bind background subtraction pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundSubtractionPipeline);
+
+		// Bind background subtraction descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundSubtractionPipelineLayout,
+		                        0, 1, &this->impl->backgroundSubtractionDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: backgroundWeight, backgroundOffset, samplesPerAscan, samplesPerBuffer
+		struct BackgroundSubtractionPushConstants {
+			float backgroundWeight;
+			float backgroundOffset;
+			uint32_t samplesPerAscan;
+			uint32_t samplesPerBuffer;
+		} bgPush;
+
+		bgPush.backgroundWeight = this->impl->config.processingParams.background.weight;
+		bgPush.backgroundOffset = this->impl->config.processingParams.background.offset;
+		bgPush.samplesPerAscan = static_cast<uint32_t>(outputSignalLength);
+		bgPush.samplesPerBuffer = static_cast<uint32_t>(outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer);
+
+		vkCmdPushConstants(cmd, this->impl->backgroundSubtractionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(bgPush), &bgPush);
+
+		// Dispatch background subtraction shader
+		uint32_t bgWorkgroups = (bgPush.samplesPerBuffer + 127) / 128;
+		vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
+
+		// Barrier after background subtraction (wait for writes to complete before copy)
+		VkBufferMemoryBarrier bgBarrier = {};
+		bgBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		bgBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		bgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgBarrier.buffer = this->impl->deviceProcessedBuffer;
+		bgBarrier.offset = 0;
+		bgBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &bgBarrier,
+		                     0, nullptr);
+	} else {
+		// No background subtraction, add barrier for transfer
+		VkBufferMemoryBarrier transferBarrier = {};
+		transferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		transferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		transferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		transferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		transferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		transferBarrier.buffer = this->impl->deviceProcessedBuffer;
+		transferBarrier.offset = 0;
+		transferBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &transferBarrier,
+		                     0, nullptr);
+	}
 
 	// ============================================
 	// Copy Truncated Output to Staging
@@ -1517,8 +1708,85 @@ void VulkanBackend::requestPostProcessBackgroundRecording() {
 }
 
 void VulkanBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
+	if (!background || length == 0) {
+		throw std::invalid_argument("Invalid background profile pointer or size");
+	}
+
+	// Expect length == outputSignalLength (signalLength/2)
+	size_t expectedLength = static_cast<size_t>(this->impl->signalLength / 2);
+	if (length != expectedLength) {
+		throw std::invalid_argument("Invalid background profile size. Expected " + std::to_string(expectedLength) + " floats but got " + std::to_string(length));
+	}
+
+	// Store profile locally
 	this->impl->recordedPostProcessBackground.assign(background, background + length);
-	// TODO: Upload to device buffer
+
+	// Upload to GPU
+	if (this->impl->postProcBackgroundBuffer == VK_NULL_HANDLE) {
+		throw std::runtime_error("Background buffer not initialized");
+	}
+
+	// Create staging buffer for upload
+	VkBuffer stagingBuffer;
+	VkDeviceMemory stagingMemory;
+	VkDeviceSize bufferSize = length * sizeof(float);
+
+	createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
+	             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             stagingBuffer, stagingMemory);
+
+	// Copy profile data to staging buffer
+	void* mappedMemory;
+	vkMapMemory(this->impl->device, stagingMemory, 0, bufferSize, 0, &mappedMemory);
+	memcpy(mappedMemory, background, bufferSize);
+	vkUnmapMemory(this->impl->device, stagingMemory);
+
+	// Copy from staging to device buffer using a temporary command buffer
+	VkCommandBufferAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = this->impl->commandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+
+	VkCommandBuffer cmdBuffer;
+	vkAllocateCommandBuffers(this->impl->device, &allocInfo, &cmdBuffer);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+	vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+
+	VkBufferCopy copyRegion = {};
+	copyRegion.size = bufferSize;
+	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->postProcBackgroundBuffer, 1, &copyRegion);
+
+	vkEndCommandBuffer(cmdBuffer);
+
+	// Submit and wait
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &cmdBuffer;
+
+	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(this->impl->computeQueue);
+
+	// Cleanup
+	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
+	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
+	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
+
+	// Mark background profile as valid
+	this->impl->hasValidBackgroundProfile = true;
+
+	// Re-record command buffers to include background subtraction
+	// First, wait for all in-flight work to complete
+	vkDeviceWaitIdle(this->impl->device);
+
+	// Re-record all command buffers with background subtraction enabled
+	this->recordCommandBuffers();
 }
 
 const std::vector<float>& VulkanBackend::getPostProcessBackgroundProfile() const {
@@ -2366,6 +2634,52 @@ void VulkanBackend::allocateDeviceBuffers() {
 	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 	             this->impl->meanALineBuffer, this->impl->meanALineMemory);
+
+	// Background buffer for post-processing background subtraction (float, outputSignalLength size)
+	size_t backgroundSize = outputSignalLength * sizeof(float);
+	createBuffer(this->impl->device, this->impl->physicalDevice, backgroundSize,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	             this->impl->postProcBackgroundBuffer, this->impl->postProcBackgroundMemory);
+
+	// Staging buffer for background profile readback (host-visible)
+	createBuffer(this->impl->device, this->impl->physicalDevice, backgroundSize,
+	             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             this->impl->postProcBackgroundStagingBuffer, this->impl->postProcBackgroundStagingMemory);
+
+	// Map staging buffer for persistent access
+	vkMapMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory, 0, backgroundSize, 0, &this->impl->postProcBackgroundStagingMapped);
+
+	// Initialize background buffer to zeros (so background subtraction works even without recording)
+	VkCommandBufferAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = this->impl->commandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+
+	VkCommandBuffer initCmdBuffer;
+	vkAllocateCommandBuffers(this->impl->device, &allocInfo, &initCmdBuffer);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+	vkBeginCommandBuffer(initCmdBuffer, &beginInfo);
+	vkCmdFillBuffer(initCmdBuffer, this->impl->postProcBackgroundBuffer, 0, VK_WHOLE_SIZE, 0);  // Fill with zeros
+	vkEndCommandBuffer(initCmdBuffer);
+
+	// Submit and wait for initialization
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &initCmdBuffer;
+
+	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(this->impl->computeQueue);
+
+	// Cleanup
+	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &initCmdBuffer);
 }
 
 void VulkanBackend::releaseDeviceBuffers() {
@@ -2453,6 +2767,26 @@ void VulkanBackend::releaseDeviceBuffers() {
 	}
 	if (this->impl->meanALineMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(this->impl->device, this->impl->meanALineMemory, nullptr);
+	}
+
+	// Background buffer for post-processing background subtraction
+	if (this->impl->postProcBackgroundBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->postProcBackgroundBuffer, nullptr);
+	}
+	if (this->impl->postProcBackgroundMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->postProcBackgroundMemory, nullptr);
+	}
+
+	// Unmap and cleanup staging buffer for background profile
+	if (this->impl->postProcBackgroundStagingMapped != nullptr) {
+		vkUnmapMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory);
+		this->impl->postProcBackgroundStagingMapped = nullptr;
+	}
+	if (this->impl->postProcBackgroundStagingBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->postProcBackgroundStagingBuffer, nullptr);
+	}
+	if (this->impl->postProcBackgroundStagingMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory, nullptr);
 	}
 }
 
@@ -2734,13 +3068,13 @@ void VulkanBackend::createComputePipelines() {
 
 	VkDescriptorPoolSize poolSize = {};
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 30);  // 2 (input conv) + 3 (windowing) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 7 (universal pre-FFT) + 3 (universal post-FFT) + 2 (FPN determination) + 5 (merged klinear+windowing+dispersion) per command buffer
+	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 34);  // 2 (input conv) + 3 (windowing) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 7 (universal pre-FFT) + 3 (universal post-FFT) + 2 (FPN determination) + 5 (merged klinear+windowing+dispersion) + 2 (background subtraction) + 2 (background recording) per command buffer
 
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
-	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 10);  // 10 descriptor sets per command buffer (including merged, universal, and FPN pipelines)
+	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 12);  // 12 descriptor sets per command buffer (including merged, universal, FPN, background subtraction, and background recording pipelines)
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Allow individual descriptor sets to be freed
 
 	checkVulkanErrors(vkCreateDescriptorPool(this->impl->device, &poolInfo, nullptr, &this->impl->descriptorPool));
@@ -3385,6 +3719,132 @@ void VulkanBackend::createComputePipelines() {
 	this->impl->computePipelines.push_back(fpnDeterminationPipeline);
 
 	// ============================================
+	// Create Background Subtraction Shader Pipeline
+	// ============================================
+
+	// Create descriptor set layout for background subtraction (2 storage buffers: data in/out, background profile)
+	std::vector<VkDescriptorSetLayoutBinding> backgroundSubtractionBindings(2);
+
+	// Binding 0: Data buffer (magnitude data, in-place processing)
+	backgroundSubtractionBindings[0].binding = 0;
+	backgroundSubtractionBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	backgroundSubtractionBindings[0].descriptorCount = 1;
+	backgroundSubtractionBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	backgroundSubtractionBindings[0].pImmutableSamplers = nullptr;
+
+	// Binding 1: Background profile buffer
+	backgroundSubtractionBindings[1].binding = 1;
+	backgroundSubtractionBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	backgroundSubtractionBindings[1].descriptorCount = 1;
+	backgroundSubtractionBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	backgroundSubtractionBindings[1].pImmutableSamplers = nullptr;
+
+	VkDescriptorSetLayoutCreateInfo backgroundSubtractionLayoutInfo = {};
+	backgroundSubtractionLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	backgroundSubtractionLayoutInfo.bindingCount = static_cast<uint32_t>(backgroundSubtractionBindings.size());
+	backgroundSubtractionLayoutInfo.pBindings = backgroundSubtractionBindings.data();
+
+	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &backgroundSubtractionLayoutInfo, nullptr, &this->impl->backgroundSubtractionDescriptorSetLayout));
+
+	// Create pipeline layout for background subtraction
+	VkPushConstantRange backgroundSubtractionPushConstantRange = {};
+	backgroundSubtractionPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	backgroundSubtractionPushConstantRange.offset = 0;
+	backgroundSubtractionPushConstantRange.size = sizeof(float) * 2 + sizeof(uint32_t) * 2;  // backgroundWeight, backgroundOffset, samplesPerAscan, samplesPerBuffer
+
+	VkPipelineLayoutCreateInfo backgroundSubtractionPipelineLayoutInfo = {};
+	backgroundSubtractionPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	backgroundSubtractionPipelineLayoutInfo.setLayoutCount = 1;
+	backgroundSubtractionPipelineLayoutInfo.pSetLayouts = &this->impl->backgroundSubtractionDescriptorSetLayout;
+	backgroundSubtractionPipelineLayoutInfo.pushConstantRangeCount = 1;
+	backgroundSubtractionPipelineLayoutInfo.pPushConstantRanges = &backgroundSubtractionPushConstantRange;
+
+	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &backgroundSubtractionPipelineLayoutInfo, nullptr, &this->impl->backgroundSubtractionPipelineLayout));
+
+	// Load and compile background subtraction shader
+	std::string backgroundSubtractionShaderPath = "src/backends/vulkan/shaders/background_subtraction.comp";
+	std::string backgroundSubtractionShaderSource = loadShaderSource(backgroundSubtractionShaderPath);
+	std::vector<uint32_t> backgroundSubtractionSPIRV = compileGLSLToSPIRV(backgroundSubtractionShaderSource, backgroundSubtractionShaderPath, shaderc_compute_shader);
+
+	VkShaderModule backgroundSubtractionShader = createShaderModule(this->impl->device, backgroundSubtractionSPIRV);
+	this->impl->shaderModules.push_back(backgroundSubtractionShader);
+
+	// Create background subtraction compute pipeline
+	VkPipelineShaderStageCreateInfo backgroundSubtractionShaderStageInfo = {};
+	backgroundSubtractionShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	backgroundSubtractionShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	backgroundSubtractionShaderStageInfo.module = backgroundSubtractionShader;
+	backgroundSubtractionShaderStageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo backgroundSubtractionPipelineInfo = {};
+	backgroundSubtractionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	backgroundSubtractionPipelineInfo.stage = backgroundSubtractionShaderStageInfo;
+	backgroundSubtractionPipelineInfo.layout = this->impl->backgroundSubtractionPipelineLayout;
+
+	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &backgroundSubtractionPipelineInfo, nullptr, &this->impl->backgroundSubtractionPipeline));
+
+	// ============================================
+	// Background Recording Pipeline
+	// ============================================
+	// Records background profile by averaging all A-scans
+
+	// Create descriptor set layout for background recording (2 storage buffers)
+	std::vector<VkDescriptorSetLayoutBinding> backgroundRecordingBindings(2);
+
+	// Binding 0: Input buffer (magnitude data from deviceProcessedBuffer)
+	backgroundRecordingBindings[0].binding = 0;
+	backgroundRecordingBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	backgroundRecordingBindings[0].descriptorCount = 1;
+	backgroundRecordingBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+	// Binding 1: Background buffer (output: averaged background profile)
+	backgroundRecordingBindings[1].binding = 1;
+	backgroundRecordingBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	backgroundRecordingBindings[1].descriptorCount = 1;
+	backgroundRecordingBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+	VkDescriptorSetLayoutCreateInfo backgroundRecordingLayoutInfo = {};
+	backgroundRecordingLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	backgroundRecordingLayoutInfo.bindingCount = static_cast<uint32_t>(backgroundRecordingBindings.size());
+	backgroundRecordingLayoutInfo.pBindings = backgroundRecordingBindings.data();
+
+	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &backgroundRecordingLayoutInfo, nullptr, &this->impl->backgroundRecordingDescriptorSetLayout));
+
+	// Create pipeline layout with push constants (samplesPerAscan, ascansPerBuffer)
+	VkPushConstantRange backgroundRecordingPushConstantRange = {};
+	backgroundRecordingPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	backgroundRecordingPushConstantRange.offset = 0;
+	backgroundRecordingPushConstantRange.size = sizeof(uint32_t) * 2;  // samplesPerAscan, ascansPerBuffer
+
+	VkPipelineLayoutCreateInfo backgroundRecordingPipelineLayoutInfo = {};
+	backgroundRecordingPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	backgroundRecordingPipelineLayoutInfo.setLayoutCount = 1;
+	backgroundRecordingPipelineLayoutInfo.pSetLayouts = &this->impl->backgroundRecordingDescriptorSetLayout;
+	backgroundRecordingPipelineLayoutInfo.pushConstantRangeCount = 1;
+	backgroundRecordingPipelineLayoutInfo.pPushConstantRanges = &backgroundRecordingPushConstantRange;
+
+	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &backgroundRecordingPipelineLayoutInfo, nullptr, &this->impl->backgroundRecordingPipelineLayout));
+
+	// Load and compile shader
+	std::string backgroundRecordingShaderPath = "src/backends/vulkan/shaders/get_background.comp";
+	std::string backgroundRecordingShaderSource = loadShaderSource(backgroundRecordingShaderPath);
+	std::vector<uint32_t> backgroundRecordingSPIRV = compileGLSLToSPIRV(backgroundRecordingShaderSource, backgroundRecordingShaderPath, shaderc_compute_shader);
+	VkShaderModule backgroundRecordingShader = createShaderModule(this->impl->device, backgroundRecordingSPIRV);
+
+	// Create compute pipeline
+	VkComputePipelineCreateInfo backgroundRecordingPipelineInfo = {};
+	backgroundRecordingPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	backgroundRecordingPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	backgroundRecordingPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	backgroundRecordingPipelineInfo.stage.module = backgroundRecordingShader;
+	backgroundRecordingPipelineInfo.stage.pName = "main";
+	backgroundRecordingPipelineInfo.layout = this->impl->backgroundRecordingPipelineLayout;
+
+	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &backgroundRecordingPipelineInfo, nullptr, &this->impl->backgroundRecordingPipeline));
+
+	vkDestroyShaderModule(this->impl->device, backgroundRecordingShader, nullptr);
+
+	// ============================================
 	// Universal Pre-FFT Processing Shader
 	// ============================================
 	// This shader combines DC removal, k-linearization, windowing, and dispersion
@@ -3848,6 +4308,106 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
+	// Allocate and Update Background Subtraction Descriptor Sets
+	// ============================================
+
+	std::vector<VkDescriptorSetLayout> backgroundSubtractionLayouts(this->impl->numCommandBuffers, this->impl->backgroundSubtractionDescriptorSetLayout);
+
+	VkDescriptorSetAllocateInfo backgroundSubtractionAllocInfo = {};
+	backgroundSubtractionAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	backgroundSubtractionAllocInfo.descriptorPool = this->impl->descriptorPool;
+	backgroundSubtractionAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
+	backgroundSubtractionAllocInfo.pSetLayouts = backgroundSubtractionLayouts.data();
+
+	this->impl->backgroundSubtractionDescriptorSets.resize(this->impl->numCommandBuffers);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &backgroundSubtractionAllocInfo, this->impl->backgroundSubtractionDescriptorSets.data()));
+
+	// Update background subtraction descriptor sets
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		std::vector<VkWriteDescriptorSet> bgDescriptorWrites(2);
+
+		// Binding 0: Data buffer (deviceProcessedBuffer - magnitude data)
+		VkDescriptorBufferInfo dataInfo = {};
+		dataInfo.buffer = this->impl->deviceProcessedBuffer;
+		dataInfo.offset = 0;
+		dataInfo.range = VK_WHOLE_SIZE;
+
+		bgDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		bgDescriptorWrites[0].dstSet = this->impl->backgroundSubtractionDescriptorSets[i];
+		bgDescriptorWrites[0].dstBinding = 0;
+		bgDescriptorWrites[0].dstArrayElement = 0;
+		bgDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bgDescriptorWrites[0].descriptorCount = 1;
+		bgDescriptorWrites[0].pBufferInfo = &dataInfo;
+
+		// Binding 1: Background profile buffer
+		VkDescriptorBufferInfo backgroundInfo = {};
+		backgroundInfo.buffer = this->impl->postProcBackgroundBuffer;
+		backgroundInfo.offset = 0;
+		backgroundInfo.range = VK_WHOLE_SIZE;
+
+		bgDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		bgDescriptorWrites[1].dstSet = this->impl->backgroundSubtractionDescriptorSets[i];
+		bgDescriptorWrites[1].dstBinding = 1;
+		bgDescriptorWrites[1].dstArrayElement = 0;
+		bgDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bgDescriptorWrites[1].descriptorCount = 1;
+		bgDescriptorWrites[1].pBufferInfo = &backgroundInfo;
+
+		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(bgDescriptorWrites.size()), bgDescriptorWrites.data(), 0, nullptr);
+	}
+
+	// ============================================
+	// Allocate and Update Background Recording Descriptor Sets
+	// ============================================
+
+	std::vector<VkDescriptorSetLayout> backgroundRecordingLayouts(this->impl->numCommandBuffers, this->impl->backgroundRecordingDescriptorSetLayout);
+
+	VkDescriptorSetAllocateInfo backgroundRecordingAllocInfo = {};
+	backgroundRecordingAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	backgroundRecordingAllocInfo.descriptorPool = this->impl->descriptorPool;
+	backgroundRecordingAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
+	backgroundRecordingAllocInfo.pSetLayouts = backgroundRecordingLayouts.data();
+
+	this->impl->backgroundRecordingDescriptorSets.resize(this->impl->numCommandBuffers);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &backgroundRecordingAllocInfo, this->impl->backgroundRecordingDescriptorSets.data()));
+
+	// Update background recording descriptor sets
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		std::vector<VkWriteDescriptorSet> bgRecDescriptorWrites(2);
+
+		// Binding 0: Input buffer (deviceProcessedBuffer - magnitude data)
+		VkDescriptorBufferInfo inputInfo = {};
+		inputInfo.buffer = this->impl->deviceProcessedBuffer;
+		inputInfo.offset = 0;
+		inputInfo.range = VK_WHOLE_SIZE;
+
+		bgRecDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		bgRecDescriptorWrites[0].dstSet = this->impl->backgroundRecordingDescriptorSets[i];
+		bgRecDescriptorWrites[0].dstBinding = 0;
+		bgRecDescriptorWrites[0].dstArrayElement = 0;
+		bgRecDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bgRecDescriptorWrites[0].descriptorCount = 1;
+		bgRecDescriptorWrites[0].pBufferInfo = &inputInfo;
+
+		// Binding 1: Background buffer (output: averaged background profile)
+		VkDescriptorBufferInfo backgroundInfo = {};
+		backgroundInfo.buffer = this->impl->postProcBackgroundBuffer;
+		backgroundInfo.offset = 0;
+		backgroundInfo.range = VK_WHOLE_SIZE;
+
+		bgRecDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		bgRecDescriptorWrites[1].dstSet = this->impl->backgroundRecordingDescriptorSets[i];
+		bgRecDescriptorWrites[1].dstBinding = 1;
+		bgRecDescriptorWrites[1].dstArrayElement = 0;
+		bgRecDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bgRecDescriptorWrites[1].descriptorCount = 1;
+		bgRecDescriptorWrites[1].pBufferInfo = &backgroundInfo;
+
+		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(bgRecDescriptorWrites.size()), bgRecDescriptorWrites.data(), 0, nullptr);
+	}
+
+	// ============================================
 	// Validate Pipeline Creation
 	// ============================================
 
@@ -3949,6 +4509,38 @@ void VulkanBackend::destroyComputePipelines() {
 	if (this->impl->fpnDeterminationPipelineLayout != VK_NULL_HANDLE) {
 		vkDestroyPipelineLayout(this->impl->device, this->impl->fpnDeterminationPipelineLayout, nullptr);
 		this->impl->fpnDeterminationPipelineLayout = VK_NULL_HANDLE;
+	}
+
+	// Destroy background subtraction pipeline resources
+	if (this->impl->backgroundSubtractionPipeline != VK_NULL_HANDLE) {
+		vkDestroyPipeline(this->impl->device, this->impl->backgroundSubtractionPipeline, nullptr);
+		this->impl->backgroundSubtractionPipeline = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->backgroundSubtractionDescriptorSetLayout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->backgroundSubtractionDescriptorSetLayout, nullptr);
+		this->impl->backgroundSubtractionDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->backgroundSubtractionPipelineLayout != VK_NULL_HANDLE) {
+		vkDestroyPipelineLayout(this->impl->device, this->impl->backgroundSubtractionPipelineLayout, nullptr);
+		this->impl->backgroundSubtractionPipelineLayout = VK_NULL_HANDLE;
+	}
+
+	// Destroy background recording pipeline resources
+	if (this->impl->backgroundRecordingPipeline != VK_NULL_HANDLE) {
+		vkDestroyPipeline(this->impl->device, this->impl->backgroundRecordingPipeline, nullptr);
+		this->impl->backgroundRecordingPipeline = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->backgroundRecordingDescriptorSetLayout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->backgroundRecordingDescriptorSetLayout, nullptr);
+		this->impl->backgroundRecordingDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->backgroundRecordingPipelineLayout != VK_NULL_HANDLE) {
+		vkDestroyPipelineLayout(this->impl->device, this->impl->backgroundRecordingPipelineLayout, nullptr);
+		this->impl->backgroundRecordingPipelineLayout = VK_NULL_HANDLE;
 	}
 
 	// Destroy universal pre-FFT pipeline resources

@@ -1,0 +1,48 @@
+#version 450
+
+// Background Subtraction Shader (Post-Processing)
+// Subtracts a background profile from magnitude data with configurable weight and offset
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer DataBuffer {
+	float data[];  // Input/output magnitude data (in-place processing)
+} dataBuf;
+
+layout(binding = 1) buffer BackgroundBuffer {
+	float data[];  // Background profile (size: samplesPerAscan)
+} backgroundBuf;
+
+// ============================================
+// Push Constants (runtime)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	float backgroundWeight;  // Weight for background subtraction (default: 1.0)
+	float backgroundOffset;  // Offset to add after weighting (default: 0.0)
+	uint samplesPerAscan;  // Width of background profile
+	uint samplesPerBuffer;  // Total samples to process
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+
+	if (index >= params.samplesPerBuffer) {
+		return;
+	}
+
+	// Load input value
+	float value = dataBuf.data[index];
+
+	// Load background value (tiled across all A-scans using modulo)
+	uint bgIndex = index % params.samplesPerAscan;
+	float background = backgroundBuf.data[bgIndex];
+
+	// Apply background subtraction: output = input - (weight * background + offset)
+	float result = value - (params.backgroundWeight * background + params.backgroundOffset);
+
+	// Write result back (in-place)
+	dataBuf.data[index] = result;
+}

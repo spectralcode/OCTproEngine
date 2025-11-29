@@ -1,0 +1,42 @@
+#version 450
+
+// Get Background Profile Shader
+// Computes average of all A-scans to create background profile for subtraction
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer InputBuffer {
+	float data[];  // Input magnitude data (post-processed)
+} inputBuf;
+
+layout(binding = 1) buffer BackgroundBuffer {
+	float data[];  // Output: background profile (size: samplesPerAscan)
+} backgroundBuf;
+
+// ============================================
+// Push Constants (runtime)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint samplesPerAscan;  // Samples per A-scan (width)
+	uint ascansPerBuffer;  // Number of A-scans to average
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+
+	if (index >= params.samplesPerAscan) {
+		return;
+	}
+
+	// Sum this sample index across all A-scans
+	float sum = 0.0f;
+	for (uint i = 0; i < params.ascansPerBuffer; i++) {
+		sum += inputBuf.data[index + i * params.samplesPerAscan];
+	}
+
+	// Compute average and write to background profile
+	backgroundBuf.data[index] = sum / float(params.ascansPerBuffer);
+}
