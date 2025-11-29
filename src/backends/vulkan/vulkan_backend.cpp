@@ -80,11 +80,9 @@ struct VulkanBackend::Impl {
 		DcRemoval = 4,             // Rolling average background removal
 		KLinearization = 5,        // K-space linearization (resampling)
 		Dispersion = 6,            // Dispersion compensation
-		MergedKLinearWindowDispCubic = 7,    // Combined k-linear + window + dispersion (cubic interpolation)
-		MergedKLinearWindowDispLinear = 8,   // Combined k-linear + window + dispersion (linear interpolation)
-		MergedKLinearWindowDispLanczos = 9,  // Combined k-linear + window + dispersion (lanczos interpolation)
+		// NOTE: Universal pre-FFT pipeline variants are stored separately in universalPipelines[] array
 
-		Count = 10  // Total number of pipelines
+		Count = 7  // Total number of pipelines (universal variants not included)
 	};
 
 	// Helper function to get pipeline with type-safe indexing
@@ -207,30 +205,17 @@ struct VulkanBackend::Impl {
 	VkDescriptorSetLayout dispersionDescriptorSetLayout = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> dispersionDescriptorSets;
 
-	// Merged K-linearization+Windowing+Dispersion pipeline resources (cubic variant)
-	VkPipelineLayout klinearCubicWindowingDispersionPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout klinearCubicWindowingDispersionDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> klinearCubicWindowingDispersionDescriptorSets;
+	// Universal pre-FFT processing pipeline resources
+	VkPipelineLayout universalPreFFTPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout universalPreFFTDescriptorSetLayout = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> universalPreFFTDescriptorSets;
 
-	// Individual pipeline objects for each interpolation method
-	VkPipeline mergedKlinearCubicWindowingDispersionPipeline = VK_NULL_HANDLE;
-	VkPipeline mergedKlinearLinearWindowingDispersionPipeline = VK_NULL_HANDLE;
-	VkPipeline mergedKlinearLanczosWindowingDispersionPipeline = VK_NULL_HANDLE;
-
-	// Merged K-linearization+Windowing pipeline resources (cubic variant, no dispersion)
-	VkPipelineLayout klinearCubicWindowingPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout klinearCubicWindowingDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> klinearCubicWindowingDescriptorSets;
-
-	// Merged Dispersion+Windowing pipeline resources
-	VkPipelineLayout dispersionWindowingPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout dispersionWindowingDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> dispersionWindowingDescriptorSets;
-
-	// Individual merged pipelines (not stored in computePipelines vector)
-	VkPipeline klinearCubicWindowingDispersionPipeline = VK_NULL_HANDLE;
-	VkPipeline klinearLinearWindowingDispersionPipeline = VK_NULL_HANDLE;
-	VkPipeline klinearLanczosWindowingDispersionPipeline = VK_NULL_HANDLE;
+	// Universal pipeline variants (with different specialization constants)
+	// Linear index: useIntermediateBuffer * 3 + interpolation_method
+	//   useIntermediateBuffer: 0=read from fftBuffer, 1=read from intermediateBuffer (after DC removal)
+	//   interpolation_method: 0=cubic, 1=linear, 2=lanczos
+	// DC removal is now a separate pass
+	VkPipeline universalPipelines[6];  // [useIntermediate][interpolation] flattened
 
 	// Shader modules (will be created later)
 	std::vector<VkShaderModule> shaderModules;
@@ -785,9 +770,17 @@ void VulkanBackend::process(IOBuffer& input) {
 	const ProcessorConfiguration& config = this->impl->config;
 	bool dataInFftBuffer = true;  // Track final data location
 
-	// Step 1: DC Removal (if enabled)
-	//   Input: deviceFftBuffer, Output: deviceIntermediateBuffer
-	if (config.processingParams.dcRemoval.enabled) {
+	// Determine which operations are enabled
+	bool dcRemoval = config.processingParams.dcRemoval.enabled;
+	bool resampling = config.processingParams.resampling.enabled && (this->impl->resampleCurveBuffer != VK_NULL_HANDLE);
+	bool windowing = config.processingParams.windowing.enabled && (this->impl->windowCurveBuffer != VK_NULL_HANDLE);
+	bool dispersion = config.processingParams.dispersion.enabled && (this->impl->dispersionCurveBuffer != VK_NULL_HANDLE);
+	InterpolationMethod interpMethod = config.processingParams.resampling.method;
+
+	bool usedMergedPipeline = false;
+
+	// Step 1: DC Removal (if enabled) - separate pass
+	if (dcRemoval) {
 		// Bind DC removal pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::DcRemoval));
 
@@ -795,15 +788,15 @@ void VulkanBackend::process(IOBuffer& input) {
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->dcRemovalPipelineLayout,
 		                        0, 1, &this->impl->dcRemovalDescriptorSets[idx], 0, nullptr);
 
-		// Push constants: windowSize, signalLength, ascansPerBscan, samplesPerBuffer
-		uint32_t dcRemovalPushConstants[4] = {
+		// Push constants: rollingAverageWindowSize, signalLength, ascansPerBscan, samplesPerBuffer
+		uint32_t dcPushConstants[4] = {
 			static_cast<uint32_t>(config.processingParams.dcRemoval.windowSize),
 			static_cast<uint32_t>(this->impl->signalLength),
 			static_cast<uint32_t>(this->impl->ascansPerBscan),
 			static_cast<uint32_t>(this->impl->samplesPerBuffer)
 		};
 		vkCmdPushConstants(cmd, this->impl->dcRemovalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(dcRemovalPushConstants), dcRemovalPushConstants);
+		                   0, sizeof(dcPushConstants), dcPushConstants);
 
 		// Dispatch DC removal shader
 		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
@@ -816,85 +809,43 @@ void VulkanBackend::process(IOBuffer& input) {
 		vkCmdPipelineBarrier(cmd,
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &preprocessBarrier,
-		                     0, nullptr);
+		                     0, 0, nullptr, 1, &preprocessBarrier, 0, nullptr);
 
-		// Data is now in deviceIntermediateBuffer
-		dataInFftBuffer = false;
+		dataInFftBuffer = false;  // DC removal outputs to intermediateBuffer
 	}
 
-	// Step 2-4: K-Linearization, Windowing, and Dispersion Compensation (use merged pipelines when possible)
-	// Determine which operations are enabled
-	bool resampling = config.processingParams.resampling.enabled && (this->impl->resampleCurveBuffer != VK_NULL_HANDLE);
-	bool windowing = config.processingParams.windowing.enabled && (this->impl->windowCurveBuffer != VK_NULL_HANDLE);
-	bool dispersion = config.processingParams.dispersion.enabled && (this->impl->dispersionCurveBuffer != VK_NULL_HANDLE);
-	InterpolationMethod interpMethod = config.processingParams.resampling.method;
-
-	bool usedMergedPipeline = false;
-
-	// Use merged pipelines when possible to eliminate intermediate memory transfers
+	// Step 2-4: Use Universal Pre-FFT Shader (K-Linearization + Windowing + Dispersion)
+	// This shader combines k-linear + windowing + dispersion in one optimized pass
 	if (resampling && windowing && dispersion) {
-		// 3-operation merge: klinearization + windowing + dispersion
-		// Input: deviceFftBuffer, Output: deviceIntermediateBuffer
+		// Select the appropriate pipeline variant
+		int useIntermediate = dcRemoval ? 1 : 0;  // Read from intermediateBuffer if DC was applied
+		int interpIdx = (interpMethod == InterpolationMethod::CUBIC) ? 0 :
+		                (interpMethod == InterpolationMethod::LINEAR) ? 1 : 2;
+		int pipelineIdx = useIntermediate * 3 + interpIdx;
 
-		// If DC removal ran, data is in deviceIntermediateBuffer - copy it back to deviceFftBuffer
-		// since the merged pipeline descriptor sets are hardcoded to read from deviceFftBuffer
-		if (!dataInFftBuffer) {
-			VkBufferCopy copyRegion = {};
-			copyRegion.srcOffset = 0;
-			copyRegion.dstOffset = 0;
-			copyRegion.size = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float
+		VkPipeline universalPipeline = this->impl->universalPipelines[pipelineIdx];
 
-			vkCmdCopyBuffer(cmd, this->impl->deviceIntermediateBuffer, this->impl->deviceFftBuffer, 1, &copyRegion);
+		// Bind universal pre-FFT pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPipeline);
 
-			// Barrier after copy
-			VkBufferMemoryBarrier copyBarrier = {};
-			copyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			copyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-			copyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			copyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			copyBarrier.buffer = this->impl->deviceFftBuffer;
-			copyBarrier.offset = 0;
-			copyBarrier.size = VK_WHOLE_SIZE;
+		// Bind universal pre-FFT descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->universalPreFFTPipelineLayout,
+		                        0, 1, &this->impl->universalPreFFTDescriptorSets[idx], 0, nullptr);
 
-			vkCmdPipelineBarrier(cmd,
-			                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0,
-			                     0, nullptr,
-			                     1, &copyBarrier,
-			                     0, nullptr);
-
-			dataInFftBuffer = true;  // Data is now back in FFT buffer
-		}
-
-		// Select the appropriate merged pipeline based on interpolation method
-		VkPipeline mergedPipeline;
-		if (interpMethod == InterpolationMethod::CUBIC) {
-			mergedPipeline = this->impl->klinearCubicWindowingDispersionPipeline;
-		} else if (interpMethod == InterpolationMethod::LINEAR) {
-			mergedPipeline = this->impl->klinearLinearWindowingDispersionPipeline;
-		} else {  // LANCZOS
-			mergedPipeline = this->impl->klinearLanczosWindowingDispersionPipeline;
-		}
-
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mergedPipeline);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->klinearCubicWindowingDispersionPipelineLayout,
-		                        0, 1, &this->impl->klinearCubicWindowingDispersionDescriptorSets[idx], 0, nullptr);
-
-		uint32_t pushConstants[2] = {
+		// Push constants: signalLength, samplesPerBuffer
+		uint32_t universalPushConstants[2] = {
 			static_cast<uint32_t>(this->impl->signalLength),
 			static_cast<uint32_t>(this->impl->samplesPerBuffer)
 		};
-		vkCmdPushConstants(cmd, this->impl->klinearCubicWindowingDispersionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(pushConstants), pushConstants);
+		vkCmdPushConstants(cmd, this->impl->universalPreFFTPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(universalPushConstants), universalPushConstants);
+
+		// Dispatch universal pre-FFT shader
 		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
 
-		// Barrier after merged operation
-		preprocessBarrier.buffer = this->impl->deviceIntermediateBuffer;
+		// Barrier after universal pre-FFT operation
+		// Output buffer depends on input: if reading from intermediate (DC enabled), writes to fft
+		preprocessBarrier.buffer = dcRemoval ? this->impl->deviceFftBuffer : this->impl->deviceIntermediateBuffer;
 		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 		vkCmdPipelineBarrier(cmd,
@@ -902,7 +853,10 @@ void VulkanBackend::process(IOBuffer& input) {
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 0, nullptr, 1, &preprocessBarrier, 0, nullptr);
 
-		dataInFftBuffer = false;
+		// Universal shader output location (ping-pong to avoid read-write hazard):
+		// DC enabled: reads from intermediateBuffer, writes to fftBuffer
+		// DC disabled: reads from fftBuffer, writes to intermediateBuffer
+		dataInFftBuffer = dcRemoval;  // true if DC enabled (data in fftBuffer), false otherwise
 		usedMergedPipeline = true;
 	}
 
@@ -2716,13 +2670,13 @@ void VulkanBackend::createComputePipelines() {
 
 	VkDescriptorPoolSize poolSize = {};
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 22);  // 2 (input conv) + 2 (truncate) + 3 (windowing) + 2 (postprocess) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 5 (merged klinear+windowing+dispersion) per command buffer
+	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 29);  // 2 (input conv) + 2 (truncate) + 3 (windowing) + 2 (postprocess) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 5 (merged klinear+windowing+dispersion) + 7 (universal pre-FFT) per command buffer
 
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
-	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 8);  // 8 descriptor sets per command buffer (including merged pipeline)
+	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 9);  // 9 descriptor sets per command buffer (including merged and universal pipelines)
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Allow individual descriptor sets to be freed
 
 	checkVulkanErrors(vkCreateDescriptorPool(this->impl->device, &poolInfo, nullptr, &this->impl->descriptorPool));
@@ -3469,233 +3423,255 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
-	// Create Merged K-Linearization+Windowing+Dispersion Shader Pipeline (Cubic)
+	// Universal Pre-FFT Processing Shader
 	// ============================================
+	// This shader combines DC removal, k-linearization, windowing, and dispersion
+	// Uses specialization constants for compile-time optimization
+	// Supports dual input buffer selection to eliminate buffer copies
 
-	// Create descriptor set layout for merged k-linearization+windowing+dispersion (5 storage buffers)
-	std::vector<VkDescriptorSetLayoutBinding> klinearCubicWindowingDispersionBindings(5);
+	// Create descriptor set layout for universal shader (7 bindings)
+	// DC removal is now a separate pass, universal shader only does k-linear + windowing + dispersion
+	// Needs dual output buffers to avoid read-write hazard
+	std::vector<VkDescriptorSetLayoutBinding> universalPreFFTBindings(7);
 
-	// Binding 0: Input buffer (complex data from FFT buffer)
-	klinearCubicWindowingDispersionBindings[0].binding = 0;
-	klinearCubicWindowingDispersionBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearCubicWindowingDispersionBindings[0].descriptorCount = 1;
-	klinearCubicWindowingDispersionBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionBindings[0].pImmutableSamplers = nullptr;
+	// Binding 0: Input buffer A (deviceFftBuffer)
+	universalPreFFTBindings[0].binding = 0;
+	universalPreFFTBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[0].descriptorCount = 1;
+	universalPreFFTBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	// Binding 1: Resample curve buffer
-	klinearCubicWindowingDispersionBindings[1].binding = 1;
-	klinearCubicWindowingDispersionBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearCubicWindowingDispersionBindings[1].descriptorCount = 1;
-	klinearCubicWindowingDispersionBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionBindings[1].pImmutableSamplers = nullptr;
+	// Binding 1: Input buffer B (deviceIntermediateBuffer)
+	universalPreFFTBindings[1].binding = 1;
+	universalPreFFTBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[1].descriptorCount = 1;
+	universalPreFFTBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	// Binding 2: Window curve buffer
-	klinearCubicWindowingDispersionBindings[2].binding = 2;
-	klinearCubicWindowingDispersionBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearCubicWindowingDispersionBindings[2].descriptorCount = 1;
-	klinearCubicWindowingDispersionBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionBindings[2].pImmutableSamplers = nullptr;
+	// Binding 2: Resample curve buffer
+	universalPreFFTBindings[2].binding = 2;
+	universalPreFFTBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[2].descriptorCount = 1;
+	universalPreFFTBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	// Binding 3: Dispersion phase buffer
-	klinearCubicWindowingDispersionBindings[3].binding = 3;
-	klinearCubicWindowingDispersionBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearCubicWindowingDispersionBindings[3].descriptorCount = 1;
-	klinearCubicWindowingDispersionBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionBindings[3].pImmutableSamplers = nullptr;
+	// Binding 3: Window curve buffer
+	universalPreFFTBindings[3].binding = 3;
+	universalPreFFTBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[3].descriptorCount = 1;
+	universalPreFFTBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	// Binding 4: Output buffer (complex data to intermediate buffer)
-	klinearCubicWindowingDispersionBindings[4].binding = 4;
-	klinearCubicWindowingDispersionBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearCubicWindowingDispersionBindings[4].descriptorCount = 1;
-	klinearCubicWindowingDispersionBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionBindings[4].pImmutableSamplers = nullptr;
+	// Binding 4: Dispersion phase buffer
+	universalPreFFTBindings[4].binding = 4;
+	universalPreFFTBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[4].descriptorCount = 1;
+	universalPreFFTBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	VkDescriptorSetLayoutCreateInfo klinearCubicWindowingDispersionLayoutInfo = {};
-	klinearCubicWindowingDispersionLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	klinearCubicWindowingDispersionLayoutInfo.bindingCount = static_cast<uint32_t>(klinearCubicWindowingDispersionBindings.size());
-	klinearCubicWindowingDispersionLayoutInfo.pBindings = klinearCubicWindowingDispersionBindings.data();
+	// Binding 5: Output buffer A (deviceIntermediateBuffer)
+	universalPreFFTBindings[5].binding = 5;
+	universalPreFFTBindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[5].descriptorCount = 1;
+	universalPreFFTBindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &klinearCubicWindowingDispersionLayoutInfo, nullptr, &this->impl->klinearCubicWindowingDispersionDescriptorSetLayout));
+	// Binding 6: Output buffer B (deviceFftBuffer)
+	universalPreFFTBindings[6].binding = 6;
+	universalPreFFTBindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	universalPreFFTBindings[6].descriptorCount = 1;
+	universalPreFFTBindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-	// Create pipeline layout for merged k-linearization+windowing+dispersion
-	VkPushConstantRange klinearCubicWindowingDispersionPushConstantRange = {};
-	klinearCubicWindowingDispersionPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionPushConstantRange.offset = 0;
-	klinearCubicWindowingDispersionPushConstantRange.size = sizeof(uint32_t) * 2;  // signalLength, samplesPerBuffer
+	VkDescriptorSetLayoutCreateInfo universalPreFFTDescriptorSetLayoutInfo = {};
+	universalPreFFTDescriptorSetLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	universalPreFFTDescriptorSetLayoutInfo.bindingCount = static_cast<uint32_t>(universalPreFFTBindings.size());
+	universalPreFFTDescriptorSetLayoutInfo.pBindings = universalPreFFTBindings.data();
 
-	VkPipelineLayoutCreateInfo klinearCubicWindowingDispersionPipelineLayoutInfo = {};
-	klinearCubicWindowingDispersionPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	klinearCubicWindowingDispersionPipelineLayoutInfo.setLayoutCount = 1;
-	klinearCubicWindowingDispersionPipelineLayoutInfo.pSetLayouts = &this->impl->klinearCubicWindowingDispersionDescriptorSetLayout;
-	klinearCubicWindowingDispersionPipelineLayoutInfo.pushConstantRangeCount = 1;
-	klinearCubicWindowingDispersionPipelineLayoutInfo.pPushConstantRanges = &klinearCubicWindowingDispersionPushConstantRange;
+	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &universalPreFFTDescriptorSetLayoutInfo, nullptr, &this->impl->universalPreFFTDescriptorSetLayout));
 
-	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &klinearCubicWindowingDispersionPipelineLayoutInfo, nullptr, &this->impl->klinearCubicWindowingDispersionPipelineLayout));
+	// Create pipeline layout for universal shader
+	VkPushConstantRange universalPreFFTPushConstantRange = {};
+	universalPreFFTPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	universalPreFFTPushConstantRange.offset = 0;
+	universalPreFFTPushConstantRange.size = sizeof(uint32_t) * 4;  // signalLength, samplesPerBuffer, ascansPerBscan, rollingAverageWindowSize
 
-	// Load and compile merged k-linearization+windowing+dispersion shader (cubic)
-	std::string klinearCubicWindowingDispersionShaderPath = "src/backends/vulkan/shaders/klinearization_cubic_windowing_dispersion.comp";
-	std::string klinearCubicWindowingDispersionShaderSource = loadShaderSource(klinearCubicWindowingDispersionShaderPath);
-	std::vector<uint32_t> klinearCubicWindowingDispersionSPIRV = compileGLSLToSPIRV(klinearCubicWindowingDispersionShaderSource, klinearCubicWindowingDispersionShaderPath, shaderc_compute_shader);
+	VkPipelineLayoutCreateInfo universalPreFFTPipelineLayoutInfo = {};
+	universalPreFFTPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	universalPreFFTPipelineLayoutInfo.setLayoutCount = 1;
+	universalPreFFTPipelineLayoutInfo.pSetLayouts = &this->impl->universalPreFFTDescriptorSetLayout;
+	universalPreFFTPipelineLayoutInfo.pushConstantRangeCount = 1;
+	universalPreFFTPipelineLayoutInfo.pPushConstantRanges = &universalPreFFTPushConstantRange;
 
-	VkShaderModule klinearCubicWindowingDispersionShader = createShaderModule(this->impl->device, klinearCubicWindowingDispersionSPIRV);
-	this->impl->shaderModules.push_back(klinearCubicWindowingDispersionShader);
+	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &universalPreFFTPipelineLayoutInfo, nullptr, &this->impl->universalPreFFTPipelineLayout));
 
-	// Create merged k-linearization+windowing+dispersion compute pipeline
-	VkPipelineShaderStageCreateInfo klinearCubicWindowingDispersionShaderStageInfo = {};
-	klinearCubicWindowingDispersionShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	klinearCubicWindowingDispersionShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearCubicWindowingDispersionShaderStageInfo.module = klinearCubicWindowingDispersionShader;
-	klinearCubicWindowingDispersionShaderStageInfo.pName = "main";
+	// Load and compile universal pre-FFT shader
+	std::string universalShaderPath = "src/backends/vulkan/shaders/universal_prefft_processing.comp";
+	std::string universalShaderSource = loadShaderSource(universalShaderPath);
+	std::vector<uint32_t> universalSPIRV = compileGLSLToSPIRV(universalShaderSource, universalShaderPath, shaderc_compute_shader);
 
-	VkComputePipelineCreateInfo klinearCubicWindowingDispersionPipelineInfo = {};
-	klinearCubicWindowingDispersionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	klinearCubicWindowingDispersionPipelineInfo.stage = klinearCubicWindowingDispersionShaderStageInfo;
-	klinearCubicWindowingDispersionPipelineInfo.layout = this->impl->klinearCubicWindowingDispersionPipelineLayout;
+	VkShaderModule universalShader = createShaderModule(this->impl->device, universalSPIRV);
+	this->impl->shaderModules.push_back(universalShader);
 
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &klinearCubicWindowingDispersionPipelineInfo, nullptr, &this->impl->klinearCubicWindowingDispersionPipeline));
-	this->impl->computePipelines.push_back(this->impl->klinearCubicWindowingDispersionPipeline);
+	// Create pipeline variants with different specialization constants
+	// We create variants for: interpolation (cubic/linear/lanczos) × input buffer (fft/intermediate)
+	// Input buffer selection: 0=fftBuffer (no DC removal), 1=intermediateBuffer (after DC removal)
+	for (int useIntermediate = 0; useIntermediate <= 1; ++useIntermediate) {
+		for (int interpolation = 0; interpolation < 3; ++interpolation) {
+			// Setup specialization constants
+			struct SpecializationData {
+				uint32_t enableKLinear;
+				uint32_t enableWindowing;
+				uint32_t enableDispersion;
+				uint32_t interpolationMethod;
+				uint32_t useIntermediateBuffer;
+			} specData;
 
-	// Load and compile merged k-linearization+windowing+dispersion shader (linear)
-	std::string klinearLinearWindowingDispersionShaderPath = "src/backends/vulkan/shaders/klinearization_linear_windowing_dispersion.comp";
-	std::string klinearLinearWindowingDispersionShaderSource = loadShaderSource(klinearLinearWindowingDispersionShaderPath);
-	std::vector<uint32_t> klinearLinearWindowingDispersionSPIRV = compileGLSLToSPIRV(klinearLinearWindowingDispersionShaderSource, klinearLinearWindowingDispersionShaderPath, shaderc_compute_shader);
+			specData.enableKLinear = 1;  // Always enable k-linearization
+			specData.enableWindowing = 1;  // Always enable windowing
+			specData.enableDispersion = 1;  // Always enable dispersion
+			specData.interpolationMethod = interpolation;  // 0=cubic, 1=linear, 2=lanczos
+			specData.useIntermediateBuffer = useIntermediate;  // 0=fftBuffer, 1=intermediateBuffer
 
-	VkShaderModule klinearLinearWindowingDispersionShader = createShaderModule(this->impl->device, klinearLinearWindowingDispersionSPIRV);
-	this->impl->shaderModules.push_back(klinearLinearWindowingDispersionShader);
+			VkSpecializationMapEntry specEntries[5];
+			for (int i = 0; i < 5; ++i) {
+				specEntries[i].constantID = i;
+				specEntries[i].offset = i * sizeof(uint32_t);
+				specEntries[i].size = sizeof(uint32_t);
+			}
 
-	VkPipelineShaderStageCreateInfo klinearLinearWindowingDispersionShaderStageInfo = {};
-	klinearLinearWindowingDispersionShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	klinearLinearWindowingDispersionShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearLinearWindowingDispersionShaderStageInfo.module = klinearLinearWindowingDispersionShader;
-	klinearLinearWindowingDispersionShaderStageInfo.pName = "main";
+			VkSpecializationInfo specInfo = {};
+			specInfo.mapEntryCount = 5;
+			specInfo.pMapEntries = specEntries;
+			specInfo.dataSize = sizeof(SpecializationData);
+			specInfo.pData = &specData;
 
-	VkComputePipelineCreateInfo klinearLinearWindowingDispersionPipelineInfo = {};
-	klinearLinearWindowingDispersionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	klinearLinearWindowingDispersionPipelineInfo.stage = klinearLinearWindowingDispersionShaderStageInfo;
-	klinearLinearWindowingDispersionPipelineInfo.layout = this->impl->klinearCubicWindowingDispersionPipelineLayout;
+			VkPipelineShaderStageCreateInfo shaderStageInfo = {};
+			shaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+			shaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+			shaderStageInfo.module = universalShader;
+			shaderStageInfo.pName = "main";
+			shaderStageInfo.pSpecializationInfo = &specInfo;
 
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &klinearLinearWindowingDispersionPipelineInfo, nullptr, &this->impl->klinearLinearWindowingDispersionPipeline));
-	this->impl->computePipelines.push_back(this->impl->klinearLinearWindowingDispersionPipeline);
+			VkComputePipelineCreateInfo pipelineInfo = {};
+			pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+			pipelineInfo.stage = shaderStageInfo;
+			pipelineInfo.layout = this->impl->universalPreFFTPipelineLayout;
 
-	// Load and compile merged k-linearization+windowing+dispersion shader (lanczos)
-	std::string klinearLanczosWindowingDispersionShaderPath = "src/backends/vulkan/shaders/klinearization_lanczos_windowing_dispersion.comp";
-	std::string klinearLanczosWindowingDispersionShaderSource = loadShaderSource(klinearLanczosWindowingDispersionShaderPath);
-	std::vector<uint32_t> klinearLanczosWindowingDispersionSPIRV = compileGLSLToSPIRV(klinearLanczosWindowingDispersionShaderSource, klinearLanczosWindowingDispersionShaderPath, shaderc_compute_shader);
-
-	VkShaderModule klinearLanczosWindowingDispersionShader = createShaderModule(this->impl->device, klinearLanczosWindowingDispersionSPIRV);
-	this->impl->shaderModules.push_back(klinearLanczosWindowingDispersionShader);
-
-	VkPipelineShaderStageCreateInfo klinearLanczosWindowingDispersionShaderStageInfo = {};
-	klinearLanczosWindowingDispersionShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	klinearLanczosWindowingDispersionShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearLanczosWindowingDispersionShaderStageInfo.module = klinearLanczosWindowingDispersionShader;
-	klinearLanczosWindowingDispersionShaderStageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo klinearLanczosWindowingDispersionPipelineInfo = {};
-	klinearLanczosWindowingDispersionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	klinearLanczosWindowingDispersionPipelineInfo.stage = klinearLanczosWindowingDispersionShaderStageInfo;
-	klinearLanczosWindowingDispersionPipelineInfo.layout = this->impl->klinearCubicWindowingDispersionPipelineLayout;
-
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &klinearLanczosWindowingDispersionPipelineInfo, nullptr, &this->impl->klinearLanczosWindowingDispersionPipeline));
-	this->impl->computePipelines.push_back(this->impl->klinearLanczosWindowingDispersionPipeline);
-
-	// Allocate and Update Merged K-Linearization+Windowing+Dispersion Descriptor Sets
-	// (Shared by all 3 interpolation variants: cubic, linear, lanczos)
-	std::vector<VkDescriptorSetLayout> klinearCubicWindowingDispersionLayouts(this->impl->numCommandBuffers, this->impl->klinearCubicWindowingDispersionDescriptorSetLayout);
-
-	VkDescriptorSetAllocateInfo klinearCubicWindowingDispersionAllocInfo = {};
-	klinearCubicWindowingDispersionAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	klinearCubicWindowingDispersionAllocInfo.descriptorPool = this->impl->descriptorPool;
-	klinearCubicWindowingDispersionAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
-	klinearCubicWindowingDispersionAllocInfo.pSetLayouts = klinearCubicWindowingDispersionLayouts.data();
-
-	this->impl->klinearCubicWindowingDispersionDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &klinearCubicWindowingDispersionAllocInfo, this->impl->klinearCubicWindowingDispersionDescriptorSets.data()));
-
-	// Update merged k-linearization+windowing+dispersion descriptor sets
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> klinearCubicWindowingDispersionDescriptorWrites(5);
-
-		// Binding 0: Input buffer (FFT buffer)
-		VkDescriptorBufferInfo klinearCubicWindowingDispersionInputInfo = {};
-		klinearCubicWindowingDispersionInputInfo.buffer = this->impl->deviceFftBuffer;
-		klinearCubicWindowingDispersionInputInfo.offset = 0;
-		klinearCubicWindowingDispersionInputInfo.range = VK_WHOLE_SIZE;
-
-		klinearCubicWindowingDispersionDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearCubicWindowingDispersionDescriptorWrites[0].dstSet = this->impl->klinearCubicWindowingDispersionDescriptorSets[i];
-		klinearCubicWindowingDispersionDescriptorWrites[0].dstBinding = 0;
-		klinearCubicWindowingDispersionDescriptorWrites[0].dstArrayElement = 0;
-		klinearCubicWindowingDispersionDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearCubicWindowingDispersionDescriptorWrites[0].descriptorCount = 1;
-		klinearCubicWindowingDispersionDescriptorWrites[0].pBufferInfo = &klinearCubicWindowingDispersionInputInfo;
-
-		// Binding 1: Resample curve buffer
-		VkDescriptorBufferInfo resampleCurveInfo = {};
-		resampleCurveInfo.buffer = this->impl->resampleCurveBuffer;
-		resampleCurveInfo.offset = 0;
-		resampleCurveInfo.range = VK_WHOLE_SIZE;
-
-		klinearCubicWindowingDispersionDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearCubicWindowingDispersionDescriptorWrites[1].dstSet = this->impl->klinearCubicWindowingDispersionDescriptorSets[i];
-		klinearCubicWindowingDispersionDescriptorWrites[1].dstBinding = 1;
-		klinearCubicWindowingDispersionDescriptorWrites[1].dstArrayElement = 0;
-		klinearCubicWindowingDispersionDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearCubicWindowingDispersionDescriptorWrites[1].descriptorCount = 1;
-		klinearCubicWindowingDispersionDescriptorWrites[1].pBufferInfo = &resampleCurveInfo;
-
-		// Binding 2: Window curve buffer
-		VkDescriptorBufferInfo windowCurveInfo = {};
-		windowCurveInfo.buffer = this->impl->windowCurveBuffer;
-		windowCurveInfo.offset = 0;
-		windowCurveInfo.range = VK_WHOLE_SIZE;
-
-		klinearCubicWindowingDispersionDescriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearCubicWindowingDispersionDescriptorWrites[2].dstSet = this->impl->klinearCubicWindowingDispersionDescriptorSets[i];
-		klinearCubicWindowingDispersionDescriptorWrites[2].dstBinding = 2;
-		klinearCubicWindowingDispersionDescriptorWrites[2].dstArrayElement = 0;
-		klinearCubicWindowingDispersionDescriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearCubicWindowingDispersionDescriptorWrites[2].descriptorCount = 1;
-		klinearCubicWindowingDispersionDescriptorWrites[2].pBufferInfo = &windowCurveInfo;
-
-		// Binding 3: Dispersion phase buffer
-		VkDescriptorBufferInfo dispersionPhaseInfo = {};
-		dispersionPhaseInfo.buffer = this->impl->dispersionCurveBuffer;
-		dispersionPhaseInfo.offset = 0;
-		dispersionPhaseInfo.range = VK_WHOLE_SIZE;
-
-		klinearCubicWindowingDispersionDescriptorWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearCubicWindowingDispersionDescriptorWrites[3].dstSet = this->impl->klinearCubicWindowingDispersionDescriptorSets[i];
-		klinearCubicWindowingDispersionDescriptorWrites[3].dstBinding = 3;
-		klinearCubicWindowingDispersionDescriptorWrites[3].dstArrayElement = 0;
-		klinearCubicWindowingDispersionDescriptorWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearCubicWindowingDispersionDescriptorWrites[3].descriptorCount = 1;
-		klinearCubicWindowingDispersionDescriptorWrites[3].pBufferInfo = &dispersionPhaseInfo;
-
-		// Binding 4: Output buffer (Intermediate buffer)
-		VkDescriptorBufferInfo klinearCubicWindowingDispersionOutputInfo = {};
-		klinearCubicWindowingDispersionOutputInfo.buffer = this->impl->deviceIntermediateBuffer;
-		klinearCubicWindowingDispersionOutputInfo.offset = 0;
-		klinearCubicWindowingDispersionOutputInfo.range = VK_WHOLE_SIZE;
-
-		klinearCubicWindowingDispersionDescriptorWrites[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearCubicWindowingDispersionDescriptorWrites[4].dstSet = this->impl->klinearCubicWindowingDispersionDescriptorSets[i];
-		klinearCubicWindowingDispersionDescriptorWrites[4].dstBinding = 4;
-		klinearCubicWindowingDispersionDescriptorWrites[4].dstArrayElement = 0;
-		klinearCubicWindowingDispersionDescriptorWrites[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearCubicWindowingDispersionDescriptorWrites[4].descriptorCount = 1;
-		klinearCubicWindowingDispersionDescriptorWrites[4].pBufferInfo = &klinearCubicWindowingDispersionOutputInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(klinearCubicWindowingDispersionDescriptorWrites.size()), klinearCubicWindowingDispersionDescriptorWrites.data(), 0, nullptr);
+			int pipelineIdx = useIntermediate * 3 + interpolation;  // Linear index: 0-5
+			checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &this->impl->universalPipelines[pipelineIdx]));
+		}
 	}
 
-	// ============================================
-	// ============================================
-	// NOTE: K-Linearization+Windowing (no dispersion) merged shader (and similar ones) are not used
-	// We only use the full 3-operation merge for now
-	// ============================================
-	// 	// ============================================
+	// Allocate universal pre-FFT descriptor sets
+	std::vector<VkDescriptorSetLayout> universalLayouts(this->impl->numCommandBuffers, this->impl->universalPreFFTDescriptorSetLayout);
 
+	VkDescriptorSetAllocateInfo universalAllocInfo = {};
+	universalAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	universalAllocInfo.descriptorPool = this->impl->descriptorPool;
+	universalAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
+	universalAllocInfo.pSetLayouts = universalLayouts.data();
+
+	this->impl->universalPreFFTDescriptorSets.resize(this->impl->numCommandBuffers);
+	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &universalAllocInfo, this->impl->universalPreFFTDescriptorSets.data()));
+
+	// Update universal pre-FFT descriptor sets
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		std::vector<VkWriteDescriptorSet> descriptorWrites(7);
+
+		// Binding 0: Input buffer A (deviceFftBuffer)
+		VkDescriptorBufferInfo inputBufferAInfo = {};
+		inputBufferAInfo.buffer = this->impl->deviceFftBuffer;
+		inputBufferAInfo.offset = 0;
+		inputBufferAInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[0].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[0].dstBinding = 0;
+		descriptorWrites[0].dstArrayElement = 0;
+		descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[0].descriptorCount = 1;
+		descriptorWrites[0].pBufferInfo = &inputBufferAInfo;
+
+		// Binding 1: Input buffer B (deviceIntermediateBuffer)
+		VkDescriptorBufferInfo inputBufferBInfo = {};
+		inputBufferBInfo.buffer = this->impl->deviceIntermediateBuffer;
+		inputBufferBInfo.offset = 0;
+		inputBufferBInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[1].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[1].dstBinding = 1;
+		descriptorWrites[1].dstArrayElement = 0;
+		descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[1].descriptorCount = 1;
+		descriptorWrites[1].pBufferInfo = &inputBufferBInfo;
+
+		// Binding 2: Resample curve buffer
+		VkDescriptorBufferInfo resampleInfo = {};
+		resampleInfo.buffer = this->impl->resampleCurveBuffer;
+		resampleInfo.offset = 0;
+		resampleInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[2].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[2].dstBinding = 2;
+		descriptorWrites[2].dstArrayElement = 0;
+		descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[2].descriptorCount = 1;
+		descriptorWrites[2].pBufferInfo = &resampleInfo;
+
+		// Binding 3: Window curve buffer
+		VkDescriptorBufferInfo windowInfo = {};
+		windowInfo.buffer = this->impl->windowCurveBuffer;
+		windowInfo.offset = 0;
+		windowInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[3].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[3].dstBinding = 3;
+		descriptorWrites[3].dstArrayElement = 0;
+		descriptorWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[3].descriptorCount = 1;
+		descriptorWrites[3].pBufferInfo = &windowInfo;
+
+		// Binding 4: Dispersion phase buffer
+		VkDescriptorBufferInfo dispersionInfo = {};
+		dispersionInfo.buffer = this->impl->dispersionCurveBuffer;
+		dispersionInfo.offset = 0;
+		dispersionInfo.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[4].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[4].dstBinding = 4;
+		descriptorWrites[4].dstArrayElement = 0;
+		descriptorWrites[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[4].descriptorCount = 1;
+		descriptorWrites[4].pBufferInfo = &dispersionInfo;
+
+		// Binding 5: Output buffer A (deviceIntermediateBuffer)
+		VkDescriptorBufferInfo outputInfoA = {};
+		outputInfoA.buffer = this->impl->deviceIntermediateBuffer;
+		outputInfoA.offset = 0;
+		outputInfoA.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[5].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[5].dstBinding = 5;
+		descriptorWrites[5].dstArrayElement = 0;
+		descriptorWrites[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[5].descriptorCount = 1;
+		descriptorWrites[5].pBufferInfo = &outputInfoA;
+
+		// Binding 6: Output buffer B (deviceFftBuffer)
+		VkDescriptorBufferInfo outputInfoB = {};
+		outputInfoB.buffer = this->impl->deviceFftBuffer;
+		outputInfoB.offset = 0;
+		outputInfoB.range = VK_WHOLE_SIZE;
+
+		descriptorWrites[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[6].dstSet = this->impl->universalPreFFTDescriptorSets[i];
+		descriptorWrites[6].dstBinding = 6;
+		descriptorWrites[6].dstArrayElement = 0;
+		descriptorWrites[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[6].descriptorCount = 1;
+		descriptorWrites[6].pBufferInfo = &outputInfoB;
+
+		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+	}
 
 	// ============================================
 	// Validate Pipeline Creation
@@ -3812,15 +3788,22 @@ void VulkanBackend::destroyComputePipelines() {
 		this->impl->dispersionPipelineLayout = VK_NULL_HANDLE;
 	}
 
-	// Destroy merged k-linearization+windowing+dispersion pipeline resources
-	if (this->impl->klinearCubicWindowingDispersionDescriptorSetLayout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->klinearCubicWindowingDispersionDescriptorSetLayout, nullptr);
-		this->impl->klinearCubicWindowingDispersionDescriptorSetLayout = VK_NULL_HANDLE;
+	// Destroy universal pre-FFT pipeline resources
+	for (int i = 0; i < 6; ++i) {
+		if (this->impl->universalPipelines[i] != VK_NULL_HANDLE) {
+			vkDestroyPipeline(this->impl->device, this->impl->universalPipelines[i], nullptr);
+			this->impl->universalPipelines[i] = VK_NULL_HANDLE;
+		}
 	}
 
-	if (this->impl->klinearCubicWindowingDispersionPipelineLayout != VK_NULL_HANDLE) {
-		vkDestroyPipelineLayout(this->impl->device, this->impl->klinearCubicWindowingDispersionPipelineLayout, nullptr);
-		this->impl->klinearCubicWindowingDispersionPipelineLayout = VK_NULL_HANDLE;
+	if (this->impl->universalPreFFTDescriptorSetLayout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->universalPreFFTDescriptorSetLayout, nullptr);
+		this->impl->universalPreFFTDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+
+	if (this->impl->universalPreFFTPipelineLayout != VK_NULL_HANDLE) {
+		vkDestroyPipelineLayout(this->impl->device, this->impl->universalPreFFTPipelineLayout, nullptr);
+		this->impl->universalPreFFTPipelineLayout = VK_NULL_HANDLE;
 	}
 
 }

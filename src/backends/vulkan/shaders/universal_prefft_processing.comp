@@ -1,0 +1,212 @@
+#version 450
+
+// Universal Pre-FFT Processing Shader (K-Linearization + Windowing + Dispersion)
+// DC Removal is handled separately
+// Uses specialization constants for compile-time optimization
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Specialization Constants (compile-time)
+// ============================================
+layout(constant_id = 0) const uint ENABLE_KLINEAR = 0;
+layout(constant_id = 1) const uint ENABLE_WINDOWING = 0;
+layout(constant_id = 2) const uint ENABLE_DISPERSION = 0;
+layout(constant_id = 3) const uint INTERPOLATION_METHOD = 0;  // 0=cubic, 1=linear, 2=lanczos
+layout(constant_id = 4) const uint USE_INTERMEDIATE_BUFFER = 0;  // 0=fftBuffer, 1=intermediateBuffer (after DC removal)
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer InputBufferA {
+	vec2 data[];  // deviceFftBuffer
+} fftBuffer;
+
+layout(binding = 1) buffer InputBufferB {
+	vec2 data[];  // deviceIntermediateBuffer
+} intermediateBuffer;
+
+layout(binding = 2) buffer ResampleCurveBuffer {
+	float data[];  // Resample curve (for k-linearization)
+} resampleCurveBuf;
+
+layout(binding = 3) buffer WindowBuffer {
+	float data[];  // Window curve
+} windowBuf;
+
+layout(binding = 4) buffer DispersionPhaseBuffer {
+	vec2 data[];  // Complex phase for dispersion compensation
+} dispersionPhaseBuf;
+
+layout(binding = 5) buffer OutputBufferA {
+	vec2 data[];  // Output buffer A (deviceIntermediateBuffer)
+} outputBufA;
+
+layout(binding = 6) buffer OutputBufferB {
+	vec2 data[];  // Output buffer B (deviceFftBuffer)
+} outputBufB;
+
+// ============================================
+// Push Constants (runtime)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint signalLength;  // Samples per A-scan
+	uint samplesPerBuffer;  // Total samples
+} params;
+
+// ============================================
+// Interpolation Functions
+// ============================================
+#define PI 3.141592654f
+#define PI_OVER_8 0.3926990817f
+
+// Cubic Hermite interpolation
+float cubicHermiteInterpolation(float y0, float y1, float y2, float y3, float pos) {
+	float a = -y0 + 3.0f * (y1 - y2) + y3;
+	float b = 2.0f * y0 - 5.0f * y1 + 4.0f * y2 - y3;
+	float c = -y0 + y2;
+	float pos2 = pos * pos;
+	return 0.5f * pos * (a * pos2 + b * pos + c) + y1;
+}
+
+// Lanczos kernel
+float lanczosKernel8(float x) {
+	float absX = abs(x);
+	if (absX < 0.00001f) {
+		return 1.0f;
+	}
+	float sincX = sin(PI * absX) / (PI * absX);
+	float sincXOver8 = sin(PI_OVER_8 * absX) / (PI_OVER_8 * absX);
+	return sincX * sincXOver8;
+}
+
+// ============================================
+// Main Processing
+// ============================================
+void main() {
+	uint globalIdx = gl_GlobalInvocationID.x;
+
+	if (globalIdx >= params.samplesPerBuffer) {
+		return;
+	}
+
+	// Select input buffer based on whether DC removal was applied
+	vec2 inputData;
+	if (USE_INTERMEDIATE_BUFFER == 1) {
+		inputData = intermediateBuffer.data[globalIdx];  // After DC removal
+	} else {
+		inputData = fftBuffer.data[globalIdx];  // Original data
+	}
+
+	float processedReal = inputData.x;
+	float processedImag = inputData.y;
+
+	// ============================================
+	// Step 1: K-Linearization (if enabled)
+	// ============================================
+	if (ENABLE_KLINEAR == 1) {
+		// Calculate position within current A-scan
+		uint j = globalIdx % params.signalLength;
+		uint offset = globalIdx - j;
+
+		// Get interpolation position from resample curve
+		float nx = resampleCurveBuf.data[j];
+
+		float interpolatedValue = 0.0f;
+
+		if (INTERPOLATION_METHOD == 0) {
+			// Cubic interpolation
+			int n1 = int(nx);
+			int n0 = abs(n1 - 1);
+			int n2 = n1 + 1;
+			int n3 = n2 + 1;
+
+			float y0, y1, y2, y3;
+			if (USE_INTERMEDIATE_BUFFER == 1) {
+				y0 = intermediateBuffer.data[offset + n0].x;
+				y1 = intermediateBuffer.data[offset + n1].x;
+				y2 = intermediateBuffer.data[offset + n2].x;
+				y3 = intermediateBuffer.data[offset + n3].x;
+			} else {
+				y0 = fftBuffer.data[offset + n0].x;
+				y1 = fftBuffer.data[offset + n1].x;
+				y2 = fftBuffer.data[offset + n2].x;
+				y3 = fftBuffer.data[offset + n3].x;
+			}
+
+			float pos = nx - float(n1);
+			interpolatedValue = cubicHermiteInterpolation(y0, y1, y2, y3, pos);
+
+		} else if (INTERPOLATION_METHOD == 1) {
+			// Linear interpolation
+			int n1 = int(nx);
+			int n2 = n1 + 1;
+
+			float inN1, inN2;
+			if (USE_INTERMEDIATE_BUFFER == 1) {
+				inN1 = intermediateBuffer.data[offset + n1].x;
+				inN2 = intermediateBuffer.data[offset + n2].x;
+			} else {
+				inN1 = fftBuffer.data[offset + n1].x;
+				inN2 = fftBuffer.data[offset + n2].x;
+			}
+
+			interpolatedValue = inN1 + (inN2 - inN1) * (nx - n1);
+
+		} else {
+			// Lanczos interpolation
+			int n0 = int(nx);
+			float sum = 0.0f;
+
+			for (int i = -7; i <= 8; i++) {
+				float y;
+				if (USE_INTERMEDIATE_BUFFER == 1) {
+					y = intermediateBuffer.data[offset + (n0 + i)].x;
+				} else {
+					y = fftBuffer.data[offset + (n0 + i)].x;
+				}
+				sum += y * lanczosKernel8(nx - float(n0 + i));
+			}
+
+			interpolatedValue = sum;
+		}
+
+		// After k-linearization, use interpolated value
+		processedReal = interpolatedValue;
+	}
+
+	// ============================================
+	// Step 2: Windowing (if enabled)
+	// ============================================
+	if (ENABLE_WINDOWING == 1) {
+		uint j = globalIdx % params.signalLength;
+		processedReal *= windowBuf.data[j];
+	}
+
+	// ============================================
+	// Step 3: Dispersion Compensation (if enabled)
+	// ============================================
+	if (ENABLE_DISPERSION == 1) {
+		uint j = globalIdx % params.signalLength;
+		vec2 phaseComplex = dispersionPhaseBuf.data[j];
+
+		// Complex multiplication: (processedReal + i*processedImag) * (phaseComplex.x + i*phaseComplex.y)
+		float real = processedReal * phaseComplex.x - processedImag * phaseComplex.y;
+		float imag = processedReal * phaseComplex.y + processedImag * phaseComplex.x;
+
+		processedReal = real;
+		processedImag = imag;
+	}
+
+	// ============================================
+	// Write final result
+	// ============================================
+	// Select output buffer to avoid read-write hazard:
+	// When reading from intermediateBuffer (after DC removal), write to fftBuffer
+	// When reading from fftBuffer (no DC removal), write to intermediateBuffer
+	if (USE_INTERMEDIATE_BUFFER == 1) {
+		outputBufB.data[globalIdx] = vec2(processedReal, processedImag);  // Write to fftBuffer
+	} else {
+		outputBufA.data[globalIdx] = vec2(processedReal, processedImag);  // Write to intermediateBuffer
+	}
+}

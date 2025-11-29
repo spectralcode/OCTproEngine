@@ -52,7 +52,7 @@ const int ITERATIONS = 2000;
 const bool ENABLE_RESAMPLING = true;
 const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
-const bool ENABLE_DC_REMOVAL = false;
+const bool ENABLE_DC_REMOVAL = true;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_BSCAN_FLIP = false;
 
