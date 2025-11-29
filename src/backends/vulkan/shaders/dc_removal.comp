@@ -21,7 +21,9 @@ layout(push_constant) uniform PushConstants {
 } params;
 
 // Shared memory for rolling average computation
-shared float s_data[512];  // Adjust size based on max block size + window
+// Size is set via specialization constant to support variable window sizes
+layout(constant_id = 0) const uint SHARED_MEM_SIZE = 512;
+shared float s_data[SHARED_MEM_SIZE];
 
 void main() {
 	uint globalIdx = gl_GlobalInvocationID.x;
@@ -31,7 +33,7 @@ void main() {
 
 	if (globalIdx < params.samplesPerBuffer) {
 		// Calculate current position in the data
-		uint currentLine = (globalIdx / params.signalLength) % params.ascansPerBscan;
+		uint currentLine = globalIdx / params.signalLength;
 		uint firstIndexOfCurrentLine = currentLine * params.signalLength;
 		uint lastIndexOfCurrentLine = firstIndexOfCurrentLine + params.signalLength - 1;
 

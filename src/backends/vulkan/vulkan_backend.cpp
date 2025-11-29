@@ -921,6 +921,37 @@ void VulkanBackend::process(IOBuffer& input) {
 		// Step 2: K-Linearization (if enabled)
 		//   Input: deviceFftBuffer, Output: deviceIntermediateBuffer
 		if (config.processingParams.resampling.enabled) {
+			// If data is in intermediate buffer (from DC removal), copy it to FFT buffer first
+			if (!dataInFftBuffer) {
+				VkBufferCopy copyRegion = {};
+				copyRegion.srcOffset = 0;
+				copyRegion.dstOffset = 0;
+				copyRegion.size = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float
+
+				vkCmdCopyBuffer(cmd, this->impl->deviceIntermediateBuffer, this->impl->deviceFftBuffer, 1, &copyRegion);
+
+				// Barrier after copy
+				VkBufferMemoryBarrier copyBarrier = {};
+				copyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+				copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				copyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+				copyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				copyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				copyBarrier.buffer = this->impl->deviceFftBuffer;
+				copyBarrier.offset = 0;
+				copyBarrier.size = VK_WHOLE_SIZE;
+
+				vkCmdPipelineBarrier(cmd,
+				                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0,
+				                     0, nullptr,
+				                     1, &copyBarrier,
+				                     0, nullptr);
+
+				dataInFftBuffer = true;
+			}
+
 			// Bind k-linearization pipeline
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::KLinearization));
 
@@ -3318,12 +3349,44 @@ void VulkanBackend::createComputePipelines() {
 	VkShaderModule dcRemovalShader = createShaderModule(this->impl->device, dcRemovalSPIRV);
 	this->impl->shaderModules.push_back(dcRemovalShader);
 
+	// Calculate required shared memory size for DC removal
+	// Shared memory needs to hold: localSize + 2 * maxWindowSize
+	// maxWindowSize can be as large as signalLength
+	uint32_t dcRemovalLocalSize = 128;  // From shader local_size_x
+	uint32_t maxWindowSize = static_cast<uint32_t>(this->impl->signalLength);
+	uint32_t requiredSharedMemSize = dcRemovalLocalSize + 2 * maxWindowSize;
+
+	// Query device limits to ensure we don't exceed maximum shared memory size
+	VkPhysicalDeviceProperties deviceProps;
+	vkGetPhysicalDeviceProperties(this->impl->physicalDevice, &deviceProps);
+	uint32_t maxSharedMemSize = deviceProps.limits.maxComputeSharedMemorySize / sizeof(float);  // Convert bytes to float count
+
+	// Clamp to device limit if needed
+	if (requiredSharedMemSize > maxSharedMemSize) {
+		requiredSharedMemSize = maxSharedMemSize;
+		std::cerr << "Warning: DC removal shared memory size clamped to device limit: "
+		          << maxSharedMemSize << " floats (" << (maxSharedMemSize * sizeof(float)) << " bytes)" << std::endl;
+	}
+
+	// Set up specialization constant for shared memory size
+	VkSpecializationMapEntry dcRemovalSpecEntry = {};
+	dcRemovalSpecEntry.constantID = 0;  // Matches layout(constant_id = 0) in shader
+	dcRemovalSpecEntry.offset = 0;
+	dcRemovalSpecEntry.size = sizeof(uint32_t);
+
+	VkSpecializationInfo dcRemovalSpecInfo = {};
+	dcRemovalSpecInfo.mapEntryCount = 1;
+	dcRemovalSpecInfo.pMapEntries = &dcRemovalSpecEntry;
+	dcRemovalSpecInfo.dataSize = sizeof(uint32_t);
+	dcRemovalSpecInfo.pData = &requiredSharedMemSize;
+
 	// Create DC removal compute pipeline
 	VkPipelineShaderStageCreateInfo dcRemovalShaderStageInfo = {};
 	dcRemovalShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	dcRemovalShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
 	dcRemovalShaderStageInfo.module = dcRemovalShader;
 	dcRemovalShaderStageInfo.pName = "main";
+	dcRemovalShaderStageInfo.pSpecializationInfo = &dcRemovalSpecInfo;
 
 	VkComputePipelineCreateInfo dcRemovalPipelineInfo = {};
 	dcRemovalPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
