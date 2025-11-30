@@ -74,8 +74,7 @@ void main() {
 		// Step 3: Calculate magnitude
 		// ============================================
 		// magnitude = sqrt(real^2 + imag^2)
-		float magnitudeSquared = dot(complexValue, complexValue);
-		float magnitude = sqrt(magnitudeSquared);
+		float magnitude = length(complexValue);
 
 		// ============================================
 		// Step 4: Apply log or linear scaling with FFT normalization
