@@ -2511,39 +2511,39 @@ void VulkanBackend::recordCommandBuffers() {
 // Shader Compilation Helpers
 // ============================================
 
-// Helper function to find shader file in multiple possible locations
-std::string findShaderPath(const std::string& relativePathFromRoot) {
-	// Try multiple possible locations:
+// Helper function to load shader source from file
+std::string loadShaderSource(const std::string& filepath) {
+	// Search paths relative to current working directory
+	// Covers: executable directory, parent directories (development), and project root
 	std::vector<std::string> searchPaths = {
-		relativePathFromRoot,                               // 1. From project root (current directory)
-		"../" + relativePathFromRoot,                       // 2. One directory up
-		"../../" + relativePathFromRoot,                    // 3. Two directories up
-		"../../../" + relativePathFromRoot,                 // 4. Three directories up (e.g., from build/tests/Release)
+		filepath,                                      // Next to executable (normal case)
+		"../" + filepath,                              // One directory up
+		"../../" + filepath,                           // Two directories up
+		"../../../" + filepath,                        // Three directories up
+		"tests/Release/" + filepath,                   // From build dir to test dir (Windows)
+		"tests/" + filepath,                           // From build dir to test dir (Linux)
+		"examples/Release/" + filepath,                // From build dir to examples dir (Windows)
+		"examples/" + filepath,                        // From build dir to examples dir (Linux)
+		"src/backends/vulkan/shaders/" + filepath.substr(filepath.find_last_of('/') + 1)  // Source tree fallback
 	};
 
+	// Try each path
 	for (const auto& path : searchPaths) {
-		std::ifstream test(path);
-		if (test.good()) {
-			return path;
+		std::ifstream file(path);
+		if (file.is_open()) {
+			std::stringstream buffer;
+			buffer << file.rdbuf();
+			return buffer.str();
 		}
 	}
 
-	// If not found in any location, return original path (will fail with helpful error)
-	return relativePathFromRoot;
-}
-
-// Helper function to load shader source from file
-std::string loadShaderSource(const std::string& filepath) {
-	std::string actualPath = findShaderPath(filepath);
-	std::ifstream file(actualPath);
-	if (!file.is_open()) {
-		throw std::runtime_error("Failed to open shader file: " + actualPath +
-		                         " (searched from: " + filepath + ")");
+	// Build error message with all attempted paths
+	std::stringstream errorMsg;
+	errorMsg << "Failed to open shader file: " << filepath << "\nSearched in:\n";
+	for (const auto& path : searchPaths) {
+		errorMsg << "  - " << path << "\n";
 	}
-
-	std::stringstream buffer;
-	buffer << file.rdbuf();
-	return buffer.str();
+	throw std::runtime_error(errorMsg.str());
 }
 
 // Helper function to compile GLSL to SPIR-V using shaderc
@@ -2635,7 +2635,7 @@ void VulkanBackend::createComputePipelines() {
 	// Load and Compile Input Conversion Shader
 	// ============================================
 
-	std::string shaderPath = "src/backends/vulkan/shaders/input_conversion.comp";
+	std::string shaderPath = "shaders/input_conversion.comp";
 	std::string shaderSource = loadShaderSource(shaderPath);
 	std::vector<uint32_t> spirv = compileGLSLToSPIRV(shaderSource, shaderPath, shaderc_compute_shader);
 
@@ -2776,7 +2776,7 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &dcRemovalPipelineLayoutInfo, nullptr, &this->impl->dcRemovalPipelineLayout));
 
 	// Load and compile DC removal shader
-	std::string dcRemovalShaderPath = "src/backends/vulkan/shaders/dc_removal.comp";
+	std::string dcRemovalShaderPath = "shaders/dc_removal.comp";
 	std::string dcRemovalShaderSource = loadShaderSource(dcRemovalShaderPath);
 	std::vector<uint32_t> dcRemovalSPIRV = compileGLSLToSPIRV(dcRemovalShaderSource, dcRemovalShaderPath, shaderc_compute_shader);
 
@@ -2922,7 +2922,7 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &fpnDeterminationPipelineLayoutInfo, nullptr, &this->impl->fpnDeterminationPipelineLayout));
 
 	// Load and compile FPN determination shader
-	std::string fpnDeterminationShaderPath = "src/backends/vulkan/shaders/fixed_pattern_noise_determination.comp";
+	std::string fpnDeterminationShaderPath = "shaders/fixed_pattern_noise_determination.comp";
 	std::string fpnDeterminationShaderSource = loadShaderSource(fpnDeterminationShaderPath);
 	std::vector<uint32_t> fpnDeterminationSPIRV = compileGLSLToSPIRV(fpnDeterminationShaderSource, fpnDeterminationShaderPath, shaderc_compute_shader);
 
@@ -2989,7 +2989,7 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &backgroundSubtractionPipelineLayoutInfo, nullptr, &this->impl->backgroundSubtractionPipelineLayout));
 
 	// Load and compile background subtraction shader
-	std::string backgroundSubtractionShaderPath = "src/backends/vulkan/shaders/background_subtraction.comp";
+	std::string backgroundSubtractionShaderPath = "shaders/background_subtraction.comp";
 	std::string backgroundSubtractionShaderSource = loadShaderSource(backgroundSubtractionShaderPath);
 	std::vector<uint32_t> backgroundSubtractionSPIRV = compileGLSLToSPIRV(backgroundSubtractionShaderSource, backgroundSubtractionShaderPath, shaderc_compute_shader);
 
@@ -3053,7 +3053,7 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &backgroundRecordingPipelineLayoutInfo, nullptr, &this->impl->backgroundRecordingPipelineLayout));
 
 	// Load and compile shader
-	std::string backgroundRecordingShaderPath = "src/backends/vulkan/shaders/get_background.comp";
+	std::string backgroundRecordingShaderPath = "shaders/get_background.comp";
 	std::string backgroundRecordingShaderSource = loadShaderSource(backgroundRecordingShaderPath);
 	std::vector<uint32_t> backgroundRecordingSPIRV = compileGLSLToSPIRV(backgroundRecordingShaderSource, backgroundRecordingShaderPath, shaderc_compute_shader);
 	VkShaderModule backgroundRecordingShader = createShaderModule(this->impl->device, backgroundRecordingSPIRV);
@@ -3148,7 +3148,7 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &universalPreFFTPipelineLayoutInfo, nullptr, &this->impl->universalPreFFTPipelineLayout));
 
 	// Load and compile universal pre-FFT shader
-	std::string universalShaderPath = "src/backends/vulkan/shaders/universal_prefft_processing.comp";
+	std::string universalShaderPath = "shaders/universal_prefft_processing.comp";
 	std::string universalShaderSource = loadShaderSource(universalShaderPath);
 	std::vector<uint32_t> universalSPIRV = compileGLSLToSPIRV(universalShaderSource, universalShaderPath, shaderc_compute_shader);
 
@@ -3373,7 +3373,7 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &universalPostFFTPipelineLayoutInfo, nullptr, &this->impl->universalPostFFTPipelineLayout));
 
 	// Load and compile universal post-FFT shader
-	std::string universalPostFFTShaderPath = "src/backends/vulkan/shaders/universal_postfft_processing.comp";
+	std::string universalPostFFTShaderPath = "shaders/universal_postfft_processing.comp";
 	std::string universalPostFFTShaderSource = loadShaderSource(universalPostFFTShaderPath);
 	std::vector<uint32_t> universalPostFFTSPIRV = compileGLSLToSPIRV(universalPostFFTShaderSource, universalPostFFTShaderPath, shaderc_compute_shader);
 

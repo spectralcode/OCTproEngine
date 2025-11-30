@@ -203,6 +203,45 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # ========================================
+# Copy Vulkan Shaders to Build Directory
+# ========================================
+if(BUILD_VULKAN)
+	# Copy Vulkan shaders to build directory (next to DLL/so)
+	add_custom_command(TARGET octproengine POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory
+			$<TARGET_FILE_DIR:octproengine>/shaders
+		COMMAND ${CMAKE_COMMAND} -E copy_directory
+			${CMAKE_CURRENT_SOURCE_DIR}/backends/vulkan/shaders
+			$<TARGET_FILE_DIR:octproengine>/shaders
+		COMMENT "Copying Vulkan shaders to build directory"
+	)
+
+	# Copy shaders to test directory
+	if(BUILD_TESTS)
+		add_custom_command(TARGET octproengine POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory
+				${CMAKE_BINARY_DIR}/tests/$<CONFIG>/shaders
+			COMMAND ${CMAKE_COMMAND} -E copy_directory
+				${CMAKE_CURRENT_SOURCE_DIR}/backends/vulkan/shaders
+				${CMAKE_BINARY_DIR}/tests/$<CONFIG>/shaders
+			COMMENT "Copying Vulkan shaders to test directory"
+		)
+	endif()
+
+	# Copy shaders to examples directory
+	if(BUILD_EXAMPLES)
+		add_custom_command(TARGET octproengine POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory
+				${CMAKE_BINARY_DIR}/examples/$<CONFIG>/shaders
+			COMMAND ${CMAKE_COMMAND} -E copy_directory
+				${CMAKE_CURRENT_SOURCE_DIR}/backends/vulkan/shaders
+				${CMAKE_BINARY_DIR}/examples/$<CONFIG>/shaders
+			COMMENT "Copying Vulkan shaders to examples directory"
+		)
+	endif()
+endif()
+
+# ========================================
 # Install Rules (Phase 5)
 # ========================================
 
