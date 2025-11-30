@@ -489,7 +489,10 @@ void CudaBackend::process(IOBuffer& input) {
 	if (!this->impl->cudaInitialized) {
 		throw std::runtime_error("CUDA backend not initialized");
 	}
-	
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
 	// Round-robin stream selection
 	this->impl->currentStream = (this->impl->currentStream + 1) % this->impl->numStreams;
 	cudaStream_t stream = this->impl->streams[this->impl->currentStream];
@@ -894,7 +897,10 @@ void CudaBackend::updateResamplingCurve(const float* curve, size_t length) {
 	if (this->impl->d_resampleCurve == nullptr || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
-	
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
 	checkCudaErrors(cudaMemcpyAsync(
 		this->impl->d_resampleCurve,
 		curve,
@@ -909,6 +915,9 @@ void CudaBackend::updateDispersionCurve(const float* curve, size_t length) {
     if (this->impl->d_phaseCartesian == nullptr) {
         return;
     }
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
 
     checkCudaErrors(cudaMemcpyAsync(
         this->impl->d_phaseCartesian,
@@ -925,7 +934,10 @@ void CudaBackend::updateWindowCurve(const float* curve, size_t length) {
 	if (this->impl->d_windowCurve == nullptr || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
-	
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
 	checkCudaErrors(cudaMemcpyAsync(
 		this->impl->d_windowCurve,
 		curve,
@@ -958,6 +970,9 @@ void CudaBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, s
 	if (complexPairs != expectedPairs) {
 		throw std::invalid_argument("Invalid fixed pattern noise profile size. Expected " + std::to_string(expectedPairs));
 	}
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
 
 	// Copy interleaved floats into device cufftComplex d_meanALine (only positive half)
 	// Allocate temporary host buffer of cufftComplex size signalLength and zero it, then fill first half
@@ -996,14 +1011,17 @@ void CudaBackend::setPostProcessBackgroundProfile(const float* background, size_
 	if (!background) {
 		throw std::invalid_argument("Background curve data is null");
 	}
-	
+
 	size_t expectedSize = static_cast<size_t>(this->impl->signalLength / 2);
 	if (this->impl->d_postProcBackgroundLine == nullptr || length != expectedSize) {
-		throw std::invalid_argument("Invalid background buffer size. Expected " + 
-		                            std::to_string(expectedSize) + " but got " + 
+		throw std::invalid_argument("Invalid background buffer size. Expected " +
+		                            std::to_string(expectedSize) + " but got " +
 		                            std::to_string(length));
 	}
-	
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
 	// Copy to device
 	checkCudaErrors(cudaMemcpyAsync(
 		this->impl->d_postProcBackgroundLine,

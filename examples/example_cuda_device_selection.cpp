@@ -1,17 +1,22 @@
 /**
- * Minimal example demonstrating CUDA device enumeration and selection
- * using the unified backend configuration API
+ * Example demonstrating CUDA multi-device support
+ *
+ * Shows how to:
+ * 1. Enumerate available CUDA devices
+ * 2. Create multiple Processor instances on different GPUs
+ * 3. Process data simultaneously on multiple devices
  */
 
 #include "../include/processor.h"
 #include "../include/backendconfig.h"
 #include <iostream>
+#include <vector>
 
 using namespace ope;
 
 int main() {
 	std::cout << "========================================" << std::endl;
-	std::cout << "CUDA Device Selection Example" << std::endl;
+	std::cout << "CUDA Multi-Device Example" << std::endl;
 	std::cout << "========================================" << std::endl;
 	std::cout << std::endl;
 
@@ -45,57 +50,94 @@ int main() {
 		std::cout << std::endl;
 	}
 
-	// Step 3: Select a specific device
-	int selectedDevice = 0;  // Select first device
-
-	if (devices.size() > 1) {
-		std::cout << "Multiple devices available. Selecting device " << selectedDevice << "." << std::endl;
-	}
-
-	std::cout << "Creating processor with CUDA device " << selectedDevice << "..." << std::endl;
-
-	// Step 4: Create processor with specific CUDA device
+	// Step 3: Create processors on different devices
 	try {
-		// Create processor (can start with any backend)
-		Processor processor(Backend::CPU);
+		if (devices.size() == 1) {
+			std::cout << "Single device system - creating one processor..." << std::endl;
+			std::cout << std::endl;
 
-		// Create CUDA configuration
-		CudaConfig cudaConfig;
-		cudaConfig.deviceId = selectedDevice;
-		cudaConfig.enableZeroCopy = false;  // Optional: configure zero-copy mode, only for Jetson devices
+			// Single device example
+			Processor processor(Backend::CUDA);
 
-		// Apply configuration (this will switch to CUDA backend)
-		processor.setBackendConfig(cudaConfig);
+			CudaConfig config;
+			config.deviceId = 0;
+			processor.setBackendConfig(config);
 
-		// Verify the configuration
-		auto currentConfig = processor.getBackendConfig();
-		if (currentConfig) {
-			std::cout << "Processor configured with: " << currentConfig->toString() << std::endl;
+			processor.setInputParameters(
+				2048,  // samplesPerRawAscan
+				512,   // ascansPerBscan
+				1,     // bscansPerBuffer
+				DataType::UINT16
+			);
+
+			processor.initialize();
+			std::cout << "Processor initialized successfully on device 0" << std::endl;
+
+			processor.cleanup();
+
+		} else {
+			std::cout << "Multi-device system - creating processors on devices 0 and 1..." << std::endl;
+			std::cout << std::endl;
+
+			// Multi-device example: Create two processors on different GPUs
+			Processor processor1(Backend::CUDA);
+			Processor processor2(Backend::CUDA);
+
+			// Configure first processor to use device 0
+			CudaConfig config1;
+			config1.deviceId = 0;
+			processor1.setBackendConfig(config1);
+
+			// Configure second processor to use device 1
+			CudaConfig config2;
+			config2.deviceId = 1;
+			processor2.setBackendConfig(config2);
+
+			std::cout << "Configured processor1 for device 0" << std::endl;
+			std::cout << "Configured processor2 for device 1" << std::endl;
+			std::cout << std::endl;
+
+			// Set same parameters for both processors
+			processor1.setInputParameters(
+				2048,  // samplesPerRawAscan
+				512,   // ascansPerBscan
+				1,     // bscansPerBuffer
+				DataType::UINT16
+			);
+
+			processor2.setInputParameters(
+				2048,  // samplesPerRawAscan
+				512,   // ascansPerBscan
+				1,     // bscansPerBuffer
+				DataType::UINT16
+			);
+
+			// Initialize both processors
+			processor1.initialize();
+			std::cout << "Processor 1 initialized on GPU " << config1.deviceId << std::endl;
+
+			processor2.initialize();
+			std::cout << "Processor 2 initialized on GPU " << config2.deviceId << std::endl;
+			std::cout << std::endl;
+
+			std::cout << "Both processors can now process data simultaneously!" << std::endl;
+			std::cout << "Each processor will use its configured GPU device." << std::endl;
+			std::cout << std::endl;
+
+			// Note: Each processor maintains its device selection throughout its lifetime
+			// You can call process() on both processors and they will run on their
+			// respective GPUs without interfering with each other
+
+			// Cleanup
+			processor1.cleanup();
+			processor2.cleanup();
 		}
-
-		// Step 5: Initialize and use the processor
-		processor.setInputParameters(
-			2048,  // samplesPerRawAscan
-			512,   // ascansPerBscan
-			1,     // bscansPerBuffer
-			DataType::UINT16
-		);
-
-		processor.initialize();
-		std::cout << "Processor initialized successfully on CUDA device " << selectedDevice << std::endl;
-
-		// Processor is now ready to use with the selected CUDA device
-		// ... your processing code here ...
-
-		// Cleanup
-		processor.cleanup();
 
 	} catch (const std::exception& e) {
 		std::cerr << "Error: " << e.what() << std::endl;
 		return 1;
 	}
 
-	std::cout << std::endl;
 	std::cout << "========================================" << std::endl;
 	std::cout << "Example completed successfully!" << std::endl;
 	std::cout << "========================================" << std::endl;
