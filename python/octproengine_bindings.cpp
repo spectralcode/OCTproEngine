@@ -434,6 +434,7 @@ PYBIND11_MODULE(octproengine, m) {
 		.value("CUDA", ope::Backend::CUDA, "NVIDIA CUDA GPU backend")
 		.value("CPU", ope::Backend::CPU, "CPU backend")
 		.value("OPENCL", ope::Backend::OPENCL, "OpenCL GPU backend")
+		.value("VULKAN", ope::Backend::VULKAN, "Vulkan GPU backend")
 		.export_values();
 	
 	py::enum_<ope::DataType>(m, "DataType")
@@ -844,7 +845,7 @@ PYBIND11_MODULE(octproengine, m) {
 		.def(py::init<ope::Backend>(), py::arg("backend") = ope::Backend::CPU,
 			"Create a new Processor instance\n\n"
 			"Args:\n"
-			"    backend: Backend to use (Backend.CUDA or Backend.CPU)")
+			"    backend: Backend to use (Backend.VULKAN, Backend.CUDA, Backend.CPU, or Backend.OPENCL)")
 		
 		// Lifecycle
 		.def("initialize", &ProcessorWrapper::initialize,
@@ -888,7 +889,7 @@ PYBIND11_MODULE(octproengine, m) {
 		.def("set_backend", [](ProcessorWrapper& self, ope::Backend backend) {
 			py::gil_scoped_release release;
 			self.processor.setBackend(backend);
-		}, py::arg("backend"), "Switch backend (CUDA <-> CPU <-> OpenCL)")
+		}, py::arg("backend"), "Switch backend (VULKAN <-> CUDA <-> CPU <-> OpenCL)")
 		.def("get_backend", [](const ProcessorWrapper& self) {
 			return self.processor.getBackend();
 		}, "Get current backend")
@@ -1248,7 +1249,8 @@ PYBIND11_MODULE(octproengine, m) {
 		// String representation
 		.def("__repr__", [](const ProcessorWrapper& self) {
 			std::string backend_str = (self.processor.getBackend() == ope::Backend::CUDA) ? "CUDA" :
-			                          (self.processor.getBackend() == ope::Backend::OPENCL) ? "OpenCL" : "CPU";
+			                          (self.processor.getBackend() == ope::Backend::OPENCL) ? "OpenCL" :
+			                          (self.processor.getBackend() == ope::Backend::VULKAN) ? "Vulkan" : "CPU";
 			return "<Processor(backend=" + backend_str + ")>";
 		});
 
