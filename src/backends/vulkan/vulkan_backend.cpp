@@ -318,7 +318,548 @@ struct VulkanBackend::Impl {
 			}
 		}
 	}
+
+	// Record all command buffers with current configuration
+	// Called when commandBuffersValid is false (first run or after config change)
+	void recordAllCommandBuffers();
 };
+
+// ============================================
+// Command Buffer Recording
+// ============================================
+
+void VulkanBackend::Impl::recordAllCommandBuffers() {
+	vkDeviceWaitIdle(this->device);  // Wait for all GPU work to complete before re-recording
+
+	// Calculate input size (used in all command buffers)
+	size_t inputSize = this->samplesPerBuffer * this->bytesPerSample;
+	uint32_t numWorkgroups = (this->samplesPerBuffer + 127) / 128;
+
+	// Loop through and record ALL command buffers (not just current frame's buffer)
+	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
+		VkCommandBuffer cmd = this->commandBuffers[idx];
+
+		VkCommandBufferBeginInfo beginInfo = {};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = 0;  // Reusable command buffer
+
+		checkVulkanErrors(vkBeginCommandBuffer(cmd, &beginInfo));
+
+	// Copy from staging to device buffer
+	VkBufferCopy copyRegion = {};
+	copyRegion.size = inputSize;
+	vkCmdCopyBuffer(cmd, this->stagingInputBuffers[idx], this->deviceInputBuffers[idx], 1, &copyRegion);
+
+	// Add memory barrier (ensure copy completes before any compute operations)
+	VkBufferMemoryBarrier barrier = {};
+	barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = this->deviceInputBuffers[idx];
+	barrier.offset = 0;
+	barrier.size = inputSize;
+
+	vkCmdPipelineBarrier(cmd,
+	                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0,
+	                     0, nullptr,
+	                     1, &barrier,
+	                     0, nullptr);
+
+	// ============================================
+	// Dispatch Input Conversion Shader
+	// ============================================
+
+	// Bind the input conversion pipeline
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->getPipeline(Impl::PipelineIndex::InputConversion));
+
+	// Bind descriptor set for this command buffer
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->pipelineLayout,
+	                        0, 1, &this->descriptorSets[idx], 0, nullptr);
+
+	// Push constants: samplesPerBuffer, inputBitDepth, bytesPerSample
+	uint32_t pushConstants[3] = {
+		static_cast<uint32_t>(this->samplesPerBuffer),
+		static_cast<uint32_t>(this->config.dataParams.getBitDepth()),
+		static_cast<uint32_t>(this->bytesPerSample)
+	};
+	vkCmdPushConstants(cmd, this->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   0, sizeof(pushConstants), pushConstants);
+
+	// Dispatch compute shader (256 threads per workgroup, as defined in shader)
+	uint32_t numWorkgroups = (this->samplesPerBuffer + 127) / 128;
+	vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+
+	// Barrier after input conversion
+	VkBufferMemoryBarrier preprocessBarrier = {};
+	preprocessBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	preprocessBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	preprocessBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	preprocessBarrier.buffer = this->deviceFftBuffer;
+	preprocessBarrier.offset = 0;
+	preprocessBarrier.size = VK_WHOLE_SIZE;
+
+	vkCmdPipelineBarrier(cmd,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0,
+	                     0, nullptr,
+	                     1, &preprocessBarrier,
+	                     0, nullptr);
+
+	// ============================================
+	// Preprocessing Pipeline (before FFT)
+	// ============================================
+	// Note: Descriptor sets enforce fixed buffer routing:
+	//   K-linearization: deviceFftBuffer → deviceIntermediateBuffer
+	//   Windowing: deviceIntermediateBuffer → deviceFftBuffer
+	//   Dispersion: deviceFftBuffer → deviceIntermediateBuffer
+	// Data ends in deviceIntermediateBuffer if dispersion is enabled, deviceFftBuffer otherwise
+
+	const ProcessorConfiguration& config = this->config;
+	bool dataInFftBuffer = true;  // Track final data location
+
+	// Determine which operations are enabled
+	bool dcRemoval = config.processingParams.dcRemoval.enabled;
+	InterpolationMethod interpMethod = config.processingParams.resampling.method;
+
+	// Step 1: DC Removal (if enabled) - separate pass
+	if (dcRemoval) {
+		// Bind DC removal pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->getPipeline(Impl::PipelineIndex::DcRemoval));
+
+		// Bind DC removal descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->dcRemovalPipelineLayout,
+		                        0, 1, &this->dcRemovalDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: rollingAverageWindowSize, signalLength, ascansPerBscan, samplesPerBuffer
+		uint32_t dcPushConstants[4] = {
+			static_cast<uint32_t>(config.processingParams.dcRemoval.windowSize),
+			static_cast<uint32_t>(this->signalLength),
+			static_cast<uint32_t>(this->ascansPerBscan),
+			static_cast<uint32_t>(this->samplesPerBuffer)
+		};
+		vkCmdPushConstants(cmd, this->dcRemovalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(dcPushConstants), dcPushConstants);
+
+		// Dispatch DC removal shader
+		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+
+		// Barrier after DC removal
+		preprocessBarrier.buffer = this->deviceIntermediateBuffer;
+		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 0, nullptr, 1, &preprocessBarrier, 0, nullptr);
+
+		dataInFftBuffer = false;  // DC removal outputs to intermediateBuffer
+	}
+
+	// Step 2-4: Use Universal Pre-FFT Shader (K-Linearization + Windowing + Dispersion)
+	// This shader combines k-linear + windowing + dispersion in one optimized pass
+	// When features are disabled, identity/neutral curves are used (see curve initialization)
+	{
+		// Select the appropriate pipeline variant
+		int useIntermediate = dcRemoval ? 1 : 0;  // Read from intermediateBuffer if DC was applied
+		int interpIdx = (interpMethod == InterpolationMethod::CUBIC) ? 0 :
+		                (interpMethod == InterpolationMethod::LINEAR) ? 1 : 2;
+		int pipelineIdx = useIntermediate * 3 + interpIdx;
+
+		VkPipeline universalPipeline = this->universalPipelines[pipelineIdx];
+
+		// Bind universal pre-FFT pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPipeline);
+
+		// Bind universal pre-FFT descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->universalPreFFTPipelineLayout,
+		                        0, 1, &this->universalPreFFTDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: signalLength, samplesPerBuffer
+		uint32_t universalPushConstants[2] = {
+			static_cast<uint32_t>(this->signalLength),
+			static_cast<uint32_t>(this->samplesPerBuffer)
+		};
+		vkCmdPushConstants(cmd, this->universalPreFFTPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(universalPushConstants), universalPushConstants);
+
+		// Dispatch universal pre-FFT shader
+		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+
+		// Barrier after universal pre-FFT operation
+		// Output buffer depends on input: if reading from intermediate (DC enabled), writes to fft
+		preprocessBarrier.buffer = dcRemoval ? this->deviceFftBuffer : this->deviceIntermediateBuffer;
+		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 0, nullptr, 1, &preprocessBarrier, 0, nullptr);
+
+		// Universal shader output location (ping-pong to avoid read-write hazard):
+		// DC enabled: reads from intermediateBuffer, writes to fftBuffer
+		// DC disabled: reads from fftBuffer, writes to intermediateBuffer
+		dataInFftBuffer = dcRemoval;  // true if DC enabled (data in fftBuffer), false otherwise
+	}
+
+
+	// Select FFT buffer dynamically based on where data is (eliminates unnecessary buffer copy)
+	VkBuffer* fftBuffer = dataInFftBuffer ? &this->deviceFftBuffer : &this->deviceIntermediateBuffer;
+
+	// Final barrier before FFT
+	VkBufferMemoryBarrier fftInputBarrier = {};
+	fftInputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	fftInputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	fftInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	fftInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	fftInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	fftInputBarrier.buffer = *fftBuffer;
+	fftInputBarrier.offset = 0;
+	fftInputBarrier.size = VK_WHOLE_SIZE;
+
+	vkCmdPipelineBarrier(cmd,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0,
+	                     0, nullptr,
+	                     1, &fftInputBarrier,
+	                     0, nullptr);
+
+	// ============================================
+	// Execute VkFFT (Inverse FFT)
+	// ============================================
+
+	VkFFTLaunchParams fftLaunchParams = {};
+	fftLaunchParams.commandBuffer = &cmd;
+	fftLaunchParams.buffer = fftBuffer;  // Use dynamic buffer selection (CUDA-style pointer swap)
+
+	checkVkFFTErrors(VkFFTAppend(&this->fftApp, 1, &fftLaunchParams));  // +1 = inverse FFT
+
+	// Barrier after FFT (wait for FFT to complete before post-FFT processing)
+	VkBufferMemoryBarrier fftOutputBarrier = {};
+	fftOutputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	fftOutputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	fftOutputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	fftOutputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	fftOutputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	fftOutputBarrier.buffer = *fftBuffer;  // Use same dynamic buffer
+	fftOutputBarrier.offset = 0;
+	fftOutputBarrier.size = VK_WHOLE_SIZE;
+
+	vkCmdPipelineBarrier(cmd,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0,
+	                     0, nullptr,
+	                     1, &fftOutputBarrier,
+	                     0, nullptr);
+
+	// ============================================
+	// Fixed Pattern Noise Determination (if needed)
+	// ============================================
+
+	// Calculate required and available A-scans for FPN determination
+	int requiredAscans = this->config.processingParams.fixedPatternNoise.bscanAverageCount * this->ascansPerBscan;
+	int availableAscans = this->ascansPerBscan * this->bscansPerBuffer;
+
+	if (this->config.processingParams.fixedPatternNoise.enabled &&
+	    !this->fixedPatternNoiseDetermined &&
+	    requiredAscans <= availableAscans) {
+		// Dispatch FPN determination shader to compute mean A-line
+		// This happens once when FPN is first requested, using the current frame's data
+
+		// Bind FPN determination pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->getPipeline(Impl::PipelineIndex::FpnDetermination));
+
+		// Bind FPN determination descriptor set (select variant based on which buffer was used for FFT)
+		int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->fpnDeterminationPipelineLayout,
+		                        0, 1, &this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant], 0, nullptr);
+
+		// Push constants: width, height, segments, stride, outputSignalLength
+		struct FpnDeterminationPushConstants {
+			uint32_t width;         // outputSignalLength (samples per A-scan after truncation)
+			uint32_t height;        // Number of A-scans to use for FPN (bscanAverageCount * ascansPerBscan)
+			uint32_t segments;      // Number of segments for minimum variance calculation
+			uint32_t stride;        // fullSignalLength (stride between A-scans in input)
+			uint32_t outputSignalLength;  // Same as width
+		} fpnPush;
+
+		int outputSignalLength = this->signalLength / 2;
+		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
+		fpnPush.height = static_cast<uint32_t>(requiredAscans);  // Use bscanAverageCount * ascansPerBscan (like CUDA/OpenCL)
+		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
+		fpnPush.stride = static_cast<uint32_t>(this->signalLength);
+		fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
+
+		vkCmdPushConstants(cmd, this->fpnDeterminationPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(fpnPush), &fpnPush);
+
+		// Dispatch FPN determination shader (one thread per sample in the output A-scan)
+		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + 127) / 128;
+		vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
+
+		// Barrier: wait for FPN profile to be written before using it
+		VkBufferMemoryBarrier fpnBarrier = {};
+		fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		fpnBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		fpnBarrier.buffer = this->meanALineBuffer;
+		fpnBarrier.offset = 0;
+		fpnBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &fpnBarrier,
+		                     0, nullptr);
+
+		// Mark as determined for subsequent frames
+		this->fixedPatternNoiseDetermined = true;
+	}
+
+	// ============================================
+	// Dispatch Universal Post-FFT Shader
+	// Merges: Fixed Pattern Noise Removal + Magnitude + Log/Linear Scaling + Normalization
+	// ============================================
+
+	// Select the appropriate universal post-FFT pipeline variant
+	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled && this->fixedPatternNoiseDetermined;
+	bool logScaling = this->config.processingParams.intensity.logScale;
+	int fpnIdx = fpnEnabled ? 1 : 0;
+	int logIdx = logScaling ? 1 : 0;
+	int postFFTPipelineIdx = fpnIdx * 2 + logIdx;  // Linear index: 0-3
+
+	VkPipeline universalPostFFTPipeline = this->universalPostFFTPipelines[postFFTPipelineIdx];
+
+	// Bind universal post-FFT pipeline
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPostFFTPipeline);
+
+	// Bind universal post-FFT descriptor set (select variant based on which buffer was used for FFT)
+	int postFFTDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->universalPostFFTPipelineLayout,
+	                        0, 1, &this->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant], 0, nullptr);
+
+	// Push constants: fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
+	int outputSignalLength = this->signalLength / 2;
+	size_t truncatedSamples = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer;
+
+	struct UniversalPostFFTPushConstants {
+		uint32_t fullSignalLength;
+		uint32_t outputSignalLength;
+		uint32_t samplesPerBuffer;
+		float grayscaleMax;
+		float grayscaleMin;
+		float addend;
+		float multiplicator;
+	} universalPostFFTPush;
+
+	universalPostFFTPush.fullSignalLength = static_cast<uint32_t>(this->signalLength);
+	universalPostFFTPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
+	universalPostFFTPush.samplesPerBuffer = static_cast<uint32_t>(this->samplesPerBuffer);
+	universalPostFFTPush.grayscaleMax = this->config.processingParams.intensity.rangeMax;
+	universalPostFFTPush.grayscaleMin = this->config.processingParams.intensity.rangeMin;
+	universalPostFFTPush.addend = this->config.processingParams.intensity.postOffset;
+	universalPostFFTPush.multiplicator = this->config.processingParams.intensity.preScale;
+
+	vkCmdPushConstants(cmd, this->universalPostFFTPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   0, sizeof(universalPostFFTPush), &universalPostFFTPush);
+
+	// Dispatch universal post-FFT shader
+	uint32_t universalPostFFTWorkgroups = (this->samplesPerBuffer + 127) / 128;
+	vkCmdDispatch(cmd, universalPostFFTWorkgroups, 1, 1);
+
+	// Barrier after universal post-FFT (wait for writes to complete before next stage)
+	VkBufferMemoryBarrier postFFTBarrier = {};
+	postFFTBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	postFFTBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	postFFTBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // Background subtraction reads and writes
+	postFFTBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	postFFTBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	postFFTBarrier.buffer = this->deviceProcessedBuffer;
+	postFFTBarrier.offset = 0;
+	postFFTBarrier.size = VK_WHOLE_SIZE;
+
+	vkCmdPipelineBarrier(cmd,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0,
+	                     0, nullptr,
+	                     1, &postFFTBarrier,
+	                     0, nullptr);
+
+	// ============================================
+	// Background Recording (if requested)
+	// ============================================
+
+	if (this->postProcessBackgroundRecordingRequested) {
+		// Bind background recording pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundRecordingPipeline);
+
+		// Bind background recording descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundRecordingPipelineLayout,
+		                        0, 1, &this->backgroundRecordingDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: samplesPerAscan, ascansPerBuffer
+		struct BackgroundRecordingPushConstants {
+			uint32_t samplesPerAscan;
+			uint32_t ascansPerBuffer;
+		} bgRecPush;
+
+		bgRecPush.samplesPerAscan = static_cast<uint32_t>(outputSignalLength);
+		bgRecPush.ascansPerBuffer = static_cast<uint32_t>(this->ascansPerBscan * this->bscansPerBuffer);
+
+		vkCmdPushConstants(cmd, this->backgroundRecordingPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(bgRecPush), &bgRecPush);
+
+		// Dispatch background recording shader (one thread per sample in background profile)
+		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + 127) / 128;
+		vkCmdDispatch(cmd, bgRecWorkgroups, 1, 1);
+
+		// Barrier after background recording (wait for writes to complete before subtraction or copy)
+		VkBufferMemoryBarrier bgRecBarrier = {};
+		bgRecBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgRecBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		bgRecBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		bgRecBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgRecBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgRecBarrier.buffer = this->postProcBackgroundBuffer;
+		bgRecBarrier.offset = 0;
+		bgRecBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &bgRecBarrier,
+		                     0, nullptr);
+
+		// Copy recorded background profile from device to staging buffer for host readback
+		VkBufferCopy bgCopyRegion = {};
+		bgCopyRegion.size = static_cast<VkDeviceSize>(outputSignalLength * sizeof(float));
+		vkCmdCopyBuffer(cmd, this->postProcBackgroundBuffer, this->postProcBackgroundStagingBuffer, 1, &bgCopyRegion);
+
+		// Barrier after copy (ensure copy completes before host reads)
+		VkBufferMemoryBarrier bgCopyBarrier = {};
+		bgCopyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgCopyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		bgCopyBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		bgCopyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgCopyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgCopyBarrier.buffer = this->postProcBackgroundStagingBuffer;
+		bgCopyBarrier.offset = 0;
+		bgCopyBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_HOST_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &bgCopyBarrier,
+		                     0, nullptr);
+	}
+
+	// ============================================
+	// Background Subtraction (Post-Processing)
+	// ============================================
+
+	// Apply subtraction if we have a valid profile OR if we just recorded one (same behavior as CUDA)
+	if (this->config.processingParams.background.enabled &&
+	    (this->hasValidBackgroundProfile || this->postProcessBackgroundRecordingRequested)) {
+		// Bind background subtraction pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundSubtractionPipeline);
+
+		// Bind background subtraction descriptor set
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundSubtractionPipelineLayout,
+		                        0, 1, &this->backgroundSubtractionDescriptorSets[idx], 0, nullptr);
+
+		// Push constants: backgroundWeight, backgroundOffset, samplesPerAscan, samplesPerBuffer
+		struct BackgroundSubtractionPushConstants {
+			float backgroundWeight;
+			float backgroundOffset;
+			uint32_t samplesPerAscan;
+			uint32_t samplesPerBuffer;
+		} bgPush;
+
+		bgPush.backgroundWeight = this->config.processingParams.background.weight;
+		bgPush.backgroundOffset = this->config.processingParams.background.offset;
+		bgPush.samplesPerAscan = static_cast<uint32_t>(outputSignalLength);
+		bgPush.samplesPerBuffer = static_cast<uint32_t>(outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer);
+
+		vkCmdPushConstants(cmd, this->backgroundSubtractionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(bgPush), &bgPush);
+
+		// Dispatch background subtraction shader
+		uint32_t bgWorkgroups = (bgPush.samplesPerBuffer + 127) / 128;
+		vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
+
+		// Barrier after background subtraction (wait for writes to complete before copy)
+		VkBufferMemoryBarrier bgBarrier = {};
+		bgBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		bgBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		bgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgBarrier.buffer = this->deviceProcessedBuffer;
+		bgBarrier.offset = 0;
+		bgBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &bgBarrier,
+		                     0, nullptr);
+	} else {
+		// No background subtraction, add barrier for transfer
+		VkBufferMemoryBarrier transferBarrier = {};
+		transferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		transferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		transferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		transferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		transferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		transferBarrier.buffer = this->deviceProcessedBuffer;
+		transferBarrier.offset = 0;
+		transferBarrier.size = VK_WHOLE_SIZE;
+
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &transferBarrier,
+		                     0, nullptr);
+	}
+
+	// ============================================
+	// Copy Truncated Output to Staging
+	// ============================================
+
+	// Copy processed buffer (truncated) to staging output (GPU → CPU transfer)
+	size_t truncatedOutputSize = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
+	VkBufferCopy finalCopy = {};
+	finalCopy.size = truncatedOutputSize;
+	vkCmdCopyBuffer(cmd, this->deviceProcessedBuffer, this->stagingOutputBuffers[idx], 1, &finalCopy);
+
+	checkVulkanErrors(vkEndCommandBuffer(cmd));
+	}  // End of loop through all command buffers
+
+	this->commandBuffersValid = true;
+}
+
 
 // ============================================
 // Constructor / Destructor
@@ -744,540 +1285,13 @@ void VulkanBackend::process(IOBuffer& input) {
 	IOBuffer* outputBuf = &this->impl->outputBuffers[idx];
 	outputBuf->setBufferId(input.getBufferId());  // Correlation ID
 
-	#if 1  // Re-enable command recording
-//static bool recorded = false;
-if (!this->impl->commandBuffersValid) {
-	        vkDeviceWaitIdle(this->impl->device); //wait for all gpu work to complete before re-recording command buffers
-
-	// Loop through and record ALL command buffers (not just current frame's buffer)
-	for (int idx = 0; idx < this->impl->numCommandBuffers; idx++) {
-		cmd = this->impl->commandBuffers[idx];
-
-		VkCommandBufferBeginInfo beginInfo = {};
-		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		beginInfo.flags = 0;  // Reusable command buffer
-
-		checkVulkanErrors(vkBeginCommandBuffer(cmd, &beginInfo));
-
-	// Copy from staging to device buffer
-	VkBufferCopy copyRegion = {};
-	copyRegion.size = inputSize;
-	vkCmdCopyBuffer(cmd, this->impl->stagingInputBuffers[idx], this->impl->deviceInputBuffers[idx], 1, &copyRegion);
-
-	// Add memory barrier (ensure copy completes before any compute operations)
-	VkBufferMemoryBarrier barrier = {};
-	barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer = this->impl->deviceInputBuffers[idx];
-	barrier.offset = 0;
-	barrier.size = inputSize;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &barrier,
-	                     0, nullptr);
-
-	// ============================================
-	// Dispatch Input Conversion Shader
-	// ============================================
-
-	// Bind the input conversion pipeline
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::InputConversion));
-
-	// Bind descriptor set for this command buffer
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->pipelineLayout,
-	                        0, 1, &this->impl->descriptorSets[idx], 0, nullptr);
-
-	// Push constants: samplesPerBuffer, inputBitDepth, bytesPerSample
-	uint32_t pushConstants[3] = {
-		static_cast<uint32_t>(this->impl->samplesPerBuffer),
-		static_cast<uint32_t>(this->impl->config.dataParams.getBitDepth()),
-		static_cast<uint32_t>(this->impl->bytesPerSample)
-	};
-	vkCmdPushConstants(cmd, this->impl->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-	                   0, sizeof(pushConstants), pushConstants);
-
-	// Dispatch compute shader (256 threads per workgroup, as defined in shader)
-	uint32_t numWorkgroups = (this->impl->samplesPerBuffer + 127) / 128;
-	vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-	// Barrier after input conversion
-	VkBufferMemoryBarrier preprocessBarrier = {};
-	preprocessBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	preprocessBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	preprocessBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	preprocessBarrier.buffer = this->impl->deviceFftBuffer;
-	preprocessBarrier.offset = 0;
-	preprocessBarrier.size = VK_WHOLE_SIZE;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &preprocessBarrier,
-	                     0, nullptr);
-
-	// ============================================
-	// Preprocessing Pipeline (before FFT)
-	// ============================================
-	// Note: Descriptor sets enforce fixed buffer routing:
-	//   K-linearization: deviceFftBuffer → deviceIntermediateBuffer
-	//   Windowing: deviceIntermediateBuffer → deviceFftBuffer
-	//   Dispersion: deviceFftBuffer → deviceIntermediateBuffer
-	// Data ends in deviceIntermediateBuffer if dispersion is enabled, deviceFftBuffer otherwise
-
-	const ProcessorConfiguration& config = this->impl->config;
-	bool dataInFftBuffer = true;  // Track final data location
-
-	// Determine which operations are enabled
-	bool dcRemoval = config.processingParams.dcRemoval.enabled;
-	InterpolationMethod interpMethod = config.processingParams.resampling.method;
-
-	// Step 1: DC Removal (if enabled) - separate pass
-	if (dcRemoval) {
-		// Bind DC removal pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::DcRemoval));
-
-		// Bind DC removal descriptor set
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->dcRemovalPipelineLayout,
-		                        0, 1, &this->impl->dcRemovalDescriptorSets[idx], 0, nullptr);
-
-		// Push constants: rollingAverageWindowSize, signalLength, ascansPerBscan, samplesPerBuffer
-		uint32_t dcPushConstants[4] = {
-			static_cast<uint32_t>(config.processingParams.dcRemoval.windowSize),
-			static_cast<uint32_t>(this->impl->signalLength),
-			static_cast<uint32_t>(this->impl->ascansPerBscan),
-			static_cast<uint32_t>(this->impl->samplesPerBuffer)
-		};
-		vkCmdPushConstants(cmd, this->impl->dcRemovalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(dcPushConstants), dcPushConstants);
-
-		// Dispatch DC removal shader
-		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-		// Barrier after DC removal
-		preprocessBarrier.buffer = this->impl->deviceIntermediateBuffer;
-		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 0, nullptr, 1, &preprocessBarrier, 0, nullptr);
-
-		dataInFftBuffer = false;  // DC removal outputs to intermediateBuffer
+	// Record all command buffers if needed (first call or after config change)
+	if (!this->impl->commandBuffersValid) {
+		this->impl->recordAllCommandBuffers();
+		cmd = this->impl->commandBuffers[idx];  // Restore cmd to current frame buffer
 	}
 
-	// Step 2-4: Use Universal Pre-FFT Shader (K-Linearization + Windowing + Dispersion)
-	// This shader combines k-linear + windowing + dispersion in one optimized pass
-	// When features are disabled, identity/neutral curves are used (see curve initialization)
-	{
-		// Select the appropriate pipeline variant
-		int useIntermediate = dcRemoval ? 1 : 0;  // Read from intermediateBuffer if DC was applied
-		int interpIdx = (interpMethod == InterpolationMethod::CUBIC) ? 0 :
-		                (interpMethod == InterpolationMethod::LINEAR) ? 1 : 2;
-		int pipelineIdx = useIntermediate * 3 + interpIdx;
-
-		VkPipeline universalPipeline = this->impl->universalPipelines[pipelineIdx];
-
-		// Bind universal pre-FFT pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPipeline);
-
-		// Bind universal pre-FFT descriptor set
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->universalPreFFTPipelineLayout,
-		                        0, 1, &this->impl->universalPreFFTDescriptorSets[idx], 0, nullptr);
-
-		// Push constants: signalLength, samplesPerBuffer
-		uint32_t universalPushConstants[2] = {
-			static_cast<uint32_t>(this->impl->signalLength),
-			static_cast<uint32_t>(this->impl->samplesPerBuffer)
-		};
-		vkCmdPushConstants(cmd, this->impl->universalPreFFTPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(universalPushConstants), universalPushConstants);
-
-		// Dispatch universal pre-FFT shader
-		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-		// Barrier after universal pre-FFT operation
-		// Output buffer depends on input: if reading from intermediate (DC enabled), writes to fft
-		preprocessBarrier.buffer = dcRemoval ? this->impl->deviceFftBuffer : this->impl->deviceIntermediateBuffer;
-		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 0, nullptr, 1, &preprocessBarrier, 0, nullptr);
-
-		// Universal shader output location (ping-pong to avoid read-write hazard):
-		// DC enabled: reads from intermediateBuffer, writes to fftBuffer
-		// DC disabled: reads from fftBuffer, writes to intermediateBuffer
-		dataInFftBuffer = dcRemoval;  // true if DC enabled (data in fftBuffer), false otherwise
-	}
-
-
-	// Select FFT buffer dynamically based on where data is (eliminates unnecessary buffer copy)
-	VkBuffer* fftBuffer = dataInFftBuffer ? &this->impl->deviceFftBuffer : &this->impl->deviceIntermediateBuffer;
-
-	// Final barrier before FFT
-	VkBufferMemoryBarrier fftInputBarrier = {};
-	fftInputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	fftInputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	fftInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-	fftInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftInputBarrier.buffer = *fftBuffer;
-	fftInputBarrier.offset = 0;
-	fftInputBarrier.size = VK_WHOLE_SIZE;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &fftInputBarrier,
-	                     0, nullptr);
-
-	// ============================================
-	// Execute VkFFT (Inverse FFT)
-	// ============================================
-
-	VkFFTLaunchParams fftLaunchParams = {};
-	fftLaunchParams.commandBuffer = &cmd;
-	fftLaunchParams.buffer = fftBuffer;  // Use dynamic buffer selection (CUDA-style pointer swap)
-
-	checkVkFFTErrors(VkFFTAppend(&this->impl->fftApp, 1, &fftLaunchParams));  // +1 = inverse FFT
-
-	// Barrier after FFT (wait for FFT to complete before post-FFT processing)
-	VkBufferMemoryBarrier fftOutputBarrier = {};
-	fftOutputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	fftOutputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	fftOutputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	fftOutputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftOutputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftOutputBarrier.buffer = *fftBuffer;  // Use same dynamic buffer
-	fftOutputBarrier.offset = 0;
-	fftOutputBarrier.size = VK_WHOLE_SIZE;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &fftOutputBarrier,
-	                     0, nullptr);
-
-	// ============================================
-	// Fixed Pattern Noise Determination (if needed)
-	// ============================================
-
-	// Calculate required and available A-scans for FPN determination
-	int requiredAscans = this->impl->config.processingParams.fixedPatternNoise.bscanAverageCount * this->impl->ascansPerBscan;
-	int availableAscans = this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
-
-	if (this->impl->config.processingParams.fixedPatternNoise.enabled &&
-	    !this->impl->fixedPatternNoiseDetermined &&
-	    requiredAscans <= availableAscans) {
-		// Dispatch FPN determination shader to compute mean A-line
-		// This happens once when FPN is first requested, using the current frame's data
-
-		// Bind FPN determination pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::FpnDetermination));
-
-		// Bind FPN determination descriptor set (select variant based on which buffer was used for FFT)
-		int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->fpnDeterminationPipelineLayout,
-		                        0, 1, &this->impl->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant], 0, nullptr);
-
-		// Push constants: width, height, segments, stride, outputSignalLength
-		struct FpnDeterminationPushConstants {
-			uint32_t width;         // outputSignalLength (samples per A-scan after truncation)
-			uint32_t height;        // Number of A-scans to use for FPN (bscanAverageCount * ascansPerBscan)
-			uint32_t segments;      // Number of segments for minimum variance calculation
-			uint32_t stride;        // fullSignalLength (stride between A-scans in input)
-			uint32_t outputSignalLength;  // Same as width
-		} fpnPush;
-
-		int outputSignalLength = this->impl->signalLength / 2;
-		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
-		fpnPush.height = static_cast<uint32_t>(requiredAscans);  // Use bscanAverageCount * ascansPerBscan (like CUDA/OpenCL)
-		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
-		fpnPush.stride = static_cast<uint32_t>(this->impl->signalLength);
-		fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
-
-		vkCmdPushConstants(cmd, this->impl->fpnDeterminationPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(fpnPush), &fpnPush);
-
-		// Dispatch FPN determination shader (one thread per sample in the output A-scan)
-		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + 127) / 128;
-		vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
-
-		// Barrier: wait for FPN profile to be written before using it
-		VkBufferMemoryBarrier fpnBarrier = {};
-		fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		fpnBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		fpnBarrier.buffer = this->impl->meanALineBuffer;
-		fpnBarrier.offset = 0;
-		fpnBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &fpnBarrier,
-		                     0, nullptr);
-
-		// Mark as determined for subsequent frames
-		this->impl->fixedPatternNoiseDetermined = true;
-	}
-
-	// ============================================
-	// Dispatch Universal Post-FFT Shader
-	// Merges: Fixed Pattern Noise Removal + Magnitude + Log/Linear Scaling + Normalization
-	// ============================================
-
-	// Select the appropriate universal post-FFT pipeline variant
-	bool fpnEnabled = this->impl->config.processingParams.fixedPatternNoise.enabled && this->impl->fixedPatternNoiseDetermined;
-	bool logScaling = this->impl->config.processingParams.intensity.logScale;
-	int fpnIdx = fpnEnabled ? 1 : 0;
-	int logIdx = logScaling ? 1 : 0;
-	int postFFTPipelineIdx = fpnIdx * 2 + logIdx;  // Linear index: 0-3
-
-	VkPipeline universalPostFFTPipeline = this->impl->universalPostFFTPipelines[postFFTPipelineIdx];
-
-	// Bind universal post-FFT pipeline
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, universalPostFFTPipeline);
-
-	// Bind universal post-FFT descriptor set (select variant based on which buffer was used for FFT)
-	int postFFTDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->universalPostFFTPipelineLayout,
-	                        0, 1, &this->impl->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant], 0, nullptr);
-
-	// Push constants: fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
 	int outputSignalLength = this->impl->signalLength / 2;
-	size_t truncatedSamples = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
-
-	struct UniversalPostFFTPushConstants {
-		uint32_t fullSignalLength;
-		uint32_t outputSignalLength;
-		uint32_t samplesPerBuffer;
-		float grayscaleMax;
-		float grayscaleMin;
-		float addend;
-		float multiplicator;
-	} universalPostFFTPush;
-
-	universalPostFFTPush.fullSignalLength = static_cast<uint32_t>(this->impl->signalLength);
-	universalPostFFTPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
-	universalPostFFTPush.samplesPerBuffer = static_cast<uint32_t>(this->impl->samplesPerBuffer);
-	universalPostFFTPush.grayscaleMax = this->impl->config.processingParams.intensity.rangeMax;
-	universalPostFFTPush.grayscaleMin = this->impl->config.processingParams.intensity.rangeMin;
-	universalPostFFTPush.addend = this->impl->config.processingParams.intensity.postOffset;
-	universalPostFFTPush.multiplicator = this->impl->config.processingParams.intensity.preScale;
-
-	vkCmdPushConstants(cmd, this->impl->universalPostFFTPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-	                   0, sizeof(universalPostFFTPush), &universalPostFFTPush);
-
-	// Dispatch universal post-FFT shader
-	uint32_t universalPostFFTWorkgroups = (this->impl->samplesPerBuffer + 127) / 128;
-	vkCmdDispatch(cmd, universalPostFFTWorkgroups, 1, 1);
-
-	// Barrier after universal post-FFT (wait for writes to complete before next stage)
-	VkBufferMemoryBarrier postFFTBarrier = {};
-	postFFTBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	postFFTBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	postFFTBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // Background subtraction reads and writes
-	postFFTBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	postFFTBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	postFFTBarrier.buffer = this->impl->deviceProcessedBuffer;
-	postFFTBarrier.offset = 0;
-	postFFTBarrier.size = VK_WHOLE_SIZE;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &postFFTBarrier,
-	                     0, nullptr);
-
-	// ============================================
-	// Background Recording (if requested)
-	// ============================================
-
-	if (this->impl->postProcessBackgroundRecordingRequested) {
-		// Bind background recording pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundRecordingPipeline);
-
-		// Bind background recording descriptor set
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundRecordingPipelineLayout,
-		                        0, 1, &this->impl->backgroundRecordingDescriptorSets[idx], 0, nullptr);
-
-		// Push constants: samplesPerAscan, ascansPerBuffer
-		struct BackgroundRecordingPushConstants {
-			uint32_t samplesPerAscan;
-			uint32_t ascansPerBuffer;
-		} bgRecPush;
-
-		bgRecPush.samplesPerAscan = static_cast<uint32_t>(outputSignalLength);
-		bgRecPush.ascansPerBuffer = static_cast<uint32_t>(this->impl->ascansPerBscan * this->impl->bscansPerBuffer);
-
-		vkCmdPushConstants(cmd, this->impl->backgroundRecordingPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(bgRecPush), &bgRecPush);
-
-		// Dispatch background recording shader (one thread per sample in background profile)
-		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + 127) / 128;
-		vkCmdDispatch(cmd, bgRecWorkgroups, 1, 1);
-
-		// Barrier after background recording (wait for writes to complete before subtraction or copy)
-		VkBufferMemoryBarrier bgRecBarrier = {};
-		bgRecBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		bgRecBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		bgRecBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-		bgRecBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgRecBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgRecBarrier.buffer = this->impl->postProcBackgroundBuffer;
-		bgRecBarrier.offset = 0;
-		bgRecBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &bgRecBarrier,
-		                     0, nullptr);
-
-		// Copy recorded background profile from device to staging buffer for host readback
-		VkBufferCopy bgCopyRegion = {};
-		bgCopyRegion.size = static_cast<VkDeviceSize>(outputSignalLength * sizeof(float));
-		vkCmdCopyBuffer(cmd, this->impl->postProcBackgroundBuffer, this->impl->postProcBackgroundStagingBuffer, 1, &bgCopyRegion);
-
-		// Barrier after copy (ensure copy completes before host reads)
-		VkBufferMemoryBarrier bgCopyBarrier = {};
-		bgCopyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		bgCopyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		bgCopyBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-		bgCopyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgCopyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgCopyBarrier.buffer = this->impl->postProcBackgroundStagingBuffer;
-		bgCopyBarrier.offset = 0;
-		bgCopyBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     VK_PIPELINE_STAGE_HOST_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &bgCopyBarrier,
-		                     0, nullptr);
-	}
-
-	// ============================================
-	// Background Subtraction (Post-Processing)
-	// ============================================
-
-	// Apply subtraction if we have a valid profile OR if we just recorded one (same behavior as CUDA)
-	if (this->impl->config.processingParams.background.enabled &&
-	    (this->impl->hasValidBackgroundProfile || this->impl->postProcessBackgroundRecordingRequested)) {
-		// Bind background subtraction pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundSubtractionPipeline);
-
-		// Bind background subtraction descriptor set
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->backgroundSubtractionPipelineLayout,
-		                        0, 1, &this->impl->backgroundSubtractionDescriptorSets[idx], 0, nullptr);
-
-		// Push constants: backgroundWeight, backgroundOffset, samplesPerAscan, samplesPerBuffer
-		struct BackgroundSubtractionPushConstants {
-			float backgroundWeight;
-			float backgroundOffset;
-			uint32_t samplesPerAscan;
-			uint32_t samplesPerBuffer;
-		} bgPush;
-
-		bgPush.backgroundWeight = this->impl->config.processingParams.background.weight;
-		bgPush.backgroundOffset = this->impl->config.processingParams.background.offset;
-		bgPush.samplesPerAscan = static_cast<uint32_t>(outputSignalLength);
-		bgPush.samplesPerBuffer = static_cast<uint32_t>(outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer);
-
-		vkCmdPushConstants(cmd, this->impl->backgroundSubtractionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(bgPush), &bgPush);
-
-		// Dispatch background subtraction shader
-		uint32_t bgWorkgroups = (bgPush.samplesPerBuffer + 127) / 128;
-		vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
-
-		// Barrier after background subtraction (wait for writes to complete before copy)
-		VkBufferMemoryBarrier bgBarrier = {};
-		bgBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		bgBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		bgBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		bgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgBarrier.buffer = this->impl->deviceProcessedBuffer;
-		bgBarrier.offset = 0;
-		bgBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &bgBarrier,
-		                     0, nullptr);
-	} else {
-		// No background subtraction, add barrier for transfer
-		VkBufferMemoryBarrier transferBarrier = {};
-		transferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		transferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		transferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		transferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		transferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		transferBarrier.buffer = this->impl->deviceProcessedBuffer;
-		transferBarrier.offset = 0;
-		transferBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &transferBarrier,
-		                     0, nullptr);
-	}
-
-	// ============================================
-	// Copy Truncated Output to Staging
-	// ============================================
-
-	// Copy processed buffer (truncated) to staging output (GPU → CPU transfer)
-	size_t truncatedOutputSize = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer * sizeof(float);
-	VkBufferCopy finalCopy = {};
-	finalCopy.size = truncatedOutputSize;
-	vkCmdCopyBuffer(cmd, this->impl->deviceProcessedBuffer, this->impl->stagingOutputBuffers[idx], 1, &finalCopy);
-
-	checkVulkanErrors(vkEndCommandBuffer(cmd));
-	}  // End of loop through all command buffers
-	this->impl->commandBuffersValid = true;
-
-	// After recording all buffers, restore cmd to point to current frame's command buffer
-	// (loop left cmd pointing to last buffer, but we need to submit the current frame's buffer)
-	cmd = this->impl->commandBuffers[idx];
-}
-	#endif  // End of OLD CODE (re-recording every frame)
-int outputSignalLength = this->impl->signalLength / 2;
 	// Submit pre-recorded command buffer
 	VkSubmitInfo submitInfo = {};
 	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
