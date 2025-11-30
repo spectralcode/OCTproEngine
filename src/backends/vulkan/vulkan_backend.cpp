@@ -116,6 +116,7 @@ struct VulkanBackend::Impl {
 	std::vector<VkCommandBuffer> commandBuffers;
 	std::vector<VkFence> fences;
 	int currentCommandBuffer = 0;
+	bool commandBuffersValid = false;  // Track if command buffers need re-recording
 
 	// Input buffer management (queue-based, thread-safe)
 	int numInputBuffers = 2;  // Default 2
@@ -744,11 +745,19 @@ void VulkanBackend::process(IOBuffer& input) {
 	outputBuf->setBufferId(input.getBufferId());  // Correlation ID
 
 	#if 1  // Re-enable command recording
-	VkCommandBufferBeginInfo beginInfo = {};
-	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	beginInfo.flags = 0;  // Reusable command buffer
+//static bool recorded = false;
+if (!this->impl->commandBuffersValid) {
+	        vkDeviceWaitIdle(this->impl->device); //wait for all gpu work to complete before re-recording command buffers
 
-	checkVulkanErrors(vkBeginCommandBuffer(cmd, &beginInfo));
+	// Loop through and record ALL command buffers (not just current frame's buffer)
+	for (int idx = 0; idx < this->impl->numCommandBuffers; idx++) {
+		cmd = this->impl->commandBuffers[idx];
+
+		VkCommandBufferBeginInfo beginInfo = {};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = 0;  // Reusable command buffer
+
+		checkVulkanErrors(vkBeginCommandBuffer(cmd, &beginInfo));
 
 	// Copy from staging to device buffer
 	VkBufferCopy copyRegion = {};
@@ -1260,11 +1269,15 @@ void VulkanBackend::process(IOBuffer& input) {
 	vkCmdCopyBuffer(cmd, this->impl->deviceProcessedBuffer, this->impl->stagingOutputBuffers[idx], 1, &finalCopy);
 
 	checkVulkanErrors(vkEndCommandBuffer(cmd));
-	#else
-	// OLD CODE: Assume command buffers are pre-recorded for fixed signal length
-	int outputSignalLength = this->impl->signalLength / 2;
-	#endif  // End of OLD CODE (re-recording every frame)
+	}  // End of loop through all command buffers
+	this->impl->commandBuffersValid = true;
 
+	// After recording all buffers, restore cmd to point to current frame's command buffer
+	// (loop left cmd pointing to last buffer, but we need to submit the current frame's buffer)
+	cmd = this->impl->commandBuffers[idx];
+}
+	#endif  // End of OLD CODE (re-recording every frame)
+int outputSignalLength = this->impl->signalLength / 2;
 	// Submit pre-recorded command buffer
 	VkSubmitInfo submitInfo = {};
 	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1296,12 +1309,10 @@ void VulkanBackend::process(IOBuffer& input) {
 void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 	this->impl->config = config;
 
-	// Re-record command buffers with new configuration
-	// First, wait for all in-flight work to complete
-	vkDeviceWaitIdle(this->impl->device);
-
-	// Re-record all command buffers with the new configuration
-	this->recordCommandBuffers();
+	// Invalidate command buffers to force re-recording with new configuration
+	// Next process() call will re-record all command buffers
+	//todo: this can be improved to only re-record when relevant parameters change
+	this->impl->commandBuffersValid = false;
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
@@ -1721,7 +1732,7 @@ std::vector<float> VulkanBackend::convertInput(
 	int samples,
 	bool applyBitshift
 ) {
-	// TODO: Implement
+	// TODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1731,7 +1742,7 @@ std::vector<float> VulkanBackend::rollingAverageBackgroundRemoval(
 	int lineWidth,
 	int numLines
 ) {
-	// TODO: Implement
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1742,7 +1753,7 @@ std::vector<float> VulkanBackend::kLinearization(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1752,7 +1763,7 @@ std::vector<float> VulkanBackend::windowing(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1762,7 +1773,7 @@ std::vector<float> VulkanBackend::dispersionCompensation(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1774,7 +1785,7 @@ std::vector<float> VulkanBackend::kLinearizationAndWindowing(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement (fused kernel - not for initial implementation)
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1787,7 +1798,7 @@ std::vector<float> VulkanBackend::kLinearizationAndWindowingAndDispersion(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement (fused kernel - not for initial implementation)
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1798,17 +1809,17 @@ std::vector<float> VulkanBackend::dispersionCompensationAndWindowing(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement (fused kernel - not for initial implementation)
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
 std::vector<float> VulkanBackend::fft(const float* input, int lineWidth, int samples) {
-	// TODO: Implement with VkFFT
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
 std::vector<float> VulkanBackend::ifft(const float* input, int lineWidth, int samples) {
-	// TODO: Implement with VkFFT
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1818,7 +1829,7 @@ std::vector<float> VulkanBackend::getMinimumVarianceMean(
 	int height,
 	int segments
 ) {
-	// TODO: remove from all backends
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1828,7 +1839,7 @@ std::vector<float> VulkanBackend::fixedPatternNoiseRemoval(
 	int lineWidth,
 	int numLines
 ) {
-	// TODO: remove from all backends
+	// TTODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -1842,7 +1853,7 @@ std::vector<float> VulkanBackend::postProcessTruncate(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: remove from all backends
+	//todo: remove
 	return std::vector<float>();
 }
 
