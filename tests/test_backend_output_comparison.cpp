@@ -22,12 +22,12 @@ const int BSCANS_PER_BUFFER = 1;
 const bool ENABLE_RESAMPLING = true;
 const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
-const bool ENABLE_DC_REMOVAL = false;  // Disabled for FPN testing (FPN removes similar structures)
+const bool ENABLE_DC_REMOVAL = true;
 const int DC_REMOVAL_WINDOW_SIZE = 64;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_BSCAN_FLIP = false;
 const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = false;
-const bool ENABLE_FIXED_PATTERN_NOISE_CORRECTION = true;  // Testing FPN
+const bool ENABLE_FIXED_PATTERN_NOISE_CORRECTION = false;
 
 const ope::InterpolationMethod INTERPOLATION_METHOD = ope::InterpolationMethod::CUBIC;
 const float RESAMPLING_COEFFS[4] = {0.5f, 2048.0f, -100.0f, 50.0f};
@@ -195,27 +195,14 @@ void configureProcessor(ope::Processor& processor) {
 	);
 
 	processor.enableResampling(ENABLE_RESAMPLING);
-	if (ENABLE_RESAMPLING) {
-		processor.setInterpolationMethod(INTERPOLATION_METHOD);
-		processor.setResamplingCoefficients(RESAMPLING_COEFFS);
-	}
+	processor.setInterpolationMethod(INTERPOLATION_METHOD);
+	processor.setResamplingCoefficients(RESAMPLING_COEFFS);
 	
 	processor.enableWindowing(ENABLE_WINDOWING);
-	if (ENABLE_WINDOWING) {
-		processor.setWindowParameters(
-			WINDOW_TYPE,
-			WINDOW_CENTER,
-			WINDOW_FILL_FACTOR
-		);
-	}
+	processor.setWindowParameters(WINDOW_TYPE, WINDOW_CENTER, WINDOW_FILL_FACTOR);
 	
 	processor.enableDispersionCompensation(ENABLE_DISPERSION);
-	if (ENABLE_DISPERSION) {
-		processor.setDispersionCoefficients(
-			DISPERSION_COEFFS,
-			DISPERSION_FACTOR
-		);
-	}
+	processor.setDispersionCoefficients(DISPERSION_COEFFS, DISPERSION_FACTOR);
 	
 	processor.enableBackgroundRemoval(ENABLE_DC_REMOVAL);
 	processor.setBackgroundRemovalWindowSize(DC_REMOVAL_WINDOW_SIZE);
