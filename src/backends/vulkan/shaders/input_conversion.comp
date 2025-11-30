@@ -3,7 +3,7 @@
 // Input conversion shader: converts raw input data to complex float
 // Real = input value, Imaginary = 0
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) buffer InputBuffer {
 	uint data[];

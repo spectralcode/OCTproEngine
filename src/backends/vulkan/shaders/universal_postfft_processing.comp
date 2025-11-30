@@ -4,7 +4,7 @@
 // Merges: Fixed Pattern Noise Removal + Magnitude Calculation + Log/Linear Scaling + Normalization
 // Uses specialization constants for compile-time optimization
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 // ============================================
 // Specialization Constants (compile-time)

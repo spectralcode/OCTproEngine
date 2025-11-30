@@ -3,7 +3,7 @@
 // Get Background Profile Shader
 // Computes average of all A-scans to create background profile for subtraction
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 // ============================================
 // Descriptor Bindings

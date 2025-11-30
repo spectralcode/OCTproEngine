@@ -53,6 +53,15 @@ static bool s_glslangInitialized = false;
 static std::mutex s_glslangMutex;
 
 // ============================================
+// Compute Shader Configuration
+// ============================================
+
+// Workgroup size for all compute shaders
+// Change this value to test different workgroup sizes (64, 128, 256, 512, etc.)
+// Must be a power of 2 and within device limits (typically max 1024)
+static constexpr uint32_t VULKAN_WORKGROUP_SIZE = 128;
+
+// ============================================
 // Forward Declarations
 // ============================================
 
@@ -333,7 +342,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	// Calculate input size (used in all command buffers)
 	size_t inputSize = this->samplesPerBuffer * this->bytesPerSample;
-	uint32_t numWorkgroups = (this->samplesPerBuffer + 127) / 128;
+	uint32_t numWorkgroups = (this->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 
 	// Loop through and record ALL command buffers (not just current frame's buffer)
 	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
@@ -389,8 +398,8 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	vkCmdPushConstants(cmd, this->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 	                   0, sizeof(pushConstants), pushConstants);
 
-	// Dispatch compute shader (256 threads per workgroup, as defined in shader)
-	uint32_t numWorkgroups = (this->samplesPerBuffer + 127) / 128;
+	// Dispatch compute shader
+	uint32_t numWorkgroups = (this->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 	vkCmdDispatch(cmd, numWorkgroups, 1, 1);
 
 	// Barrier after input conversion
@@ -677,7 +686,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                   0, sizeof(universalPostFFTPush), &universalPostFFTPush);
 
 	// Dispatch universal post-FFT shader
-	uint32_t universalPostFFTWorkgroups = (this->samplesPerBuffer + 127) / 128;
+	uint32_t universalPostFFTWorkgroups = (this->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 	vkCmdDispatch(cmd, universalPostFFTWorkgroups, 1, 1);
 
 	// Barrier after universal post-FFT (wait for writes to complete before next stage)
@@ -802,7 +811,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		                   0, sizeof(bgPush), &bgPush);
 
 		// Dispatch background subtraction shader
-		uint32_t bgWorkgroups = (bgPush.samplesPerBuffer + 127) / 128;
+		uint32_t bgWorkgroups = (bgPush.samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 		vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
 
 		// Barrier after background subtraction (wait for writes to complete before copy)
@@ -1092,7 +1101,7 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->fftConfig.useLUT = 0;
 
 	// Target threads per block to match our shader work group size
-	this->impl->fftConfig.aimThreads = 128;
+	this->impl->fftConfig.aimThreads = VULKAN_WORKGROUP_SIZE;
 
 	// Number of shared memory banks (NVIDIA has 32)
 	this->impl->fftConfig.numSharedBanks = 32;
@@ -2317,7 +2326,7 @@ void VulkanBackend::recordCommandBuffers() {
 		                   0, sizeof(pushConstants), pushConstants);
 
 		// Dispatch
-		uint32_t numWorkgroups = (this->impl->samplesPerBuffer + 127) / 128;
+		uint32_t numWorkgroups = (this->impl->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
 
 		checkVulkanErrors(vkEndCommandBuffer(cmd));
@@ -2370,6 +2379,9 @@ std::vector<uint32_t> compileGLSLToSPIRV(const std::string& source, const std::s
 
 	// Set optimization level
 	options.SetOptimizationLevel(shaderc_optimization_level_performance);
+
+	// Define workgroup size macro for all shaders
+	options.AddMacroDefinition("WORKGROUP_SIZE", std::to_string(VULKAN_WORKGROUP_SIZE));
 
 	// Compile to SPIR-V
 	shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(source, kind, filename.c_str(), options);
@@ -2600,7 +2612,7 @@ void VulkanBackend::createComputePipelines() {
 	// Calculate required shared memory size for DC removal
 	// Shared memory needs to hold: localSize + 2 * maxWindowSize
 	// maxWindowSize can be as large as signalLength
-	uint32_t dcRemovalLocalSize = 128;  // From shader local_size_x
+	uint32_t dcRemovalLocalSize = VULKAN_WORKGROUP_SIZE;  // From shader local_size_x
 	uint32_t maxWindowSize = static_cast<uint32_t>(this->impl->signalLength);
 	uint32_t requiredSharedMemSize = dcRemovalLocalSize + 2 * maxWindowSize;
 

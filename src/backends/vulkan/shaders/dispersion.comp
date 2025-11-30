@@ -3,7 +3,7 @@
 // Dispersion Compensation shader: applies phase correction to complex data
 // Multiplies input by complex phase factors
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) buffer InputBuffer {
 	vec2 data[];  // Complex input data
