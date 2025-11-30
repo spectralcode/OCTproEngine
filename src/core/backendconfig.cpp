@@ -14,6 +14,10 @@
 #endif
 #endif
 
+#ifdef OPE_VULKAN_AVAILABLE
+#include "../backends/vulkan/vulkan_backend.h"
+#endif
+
 namespace ope {
 
 //	========================================
@@ -188,7 +192,21 @@ std::vector<DeviceInfo> BackendUtils::getVulkanDevices() {
 	std::vector<DeviceInfo> devices;
 
 #ifdef OPE_VULKAN_AVAILABLE
-	//	todo: enumerate Vulkan physical devices
+	std::vector<VulkanDeviceInfo> vulkanDevices = VulkanBackend::getAvailableDevices();
+
+	for (const auto& vkDev : vulkanDevices) {
+		DeviceInfo info;
+		info.id = vkDev.deviceId;
+		info.name = vkDev.name;
+		info.totalMemory = vkDev.totalMemory;
+		info.availableMemory = vkDev.freeMemory;
+		info.computeCapabilityMajor = static_cast<int>(vkDev.apiVersionMajor);
+		info.computeCapabilityMinor = static_cast<int>(vkDev.apiVersionMinor);
+		info.vendorName = "Vulkan";  // Generic vendor name
+		info.deviceVersion = vkDev.getApiVersion();
+
+		devices.push_back(info);
+	}
 #endif
 
 	return devices;

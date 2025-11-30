@@ -207,10 +207,6 @@ public:
 	// ============================================
 
 	static std::vector<VulkanDeviceInfo> getAvailableDevices();
-	static bool setDevice(int deviceId);
-	static int getCurrentDevice();
-	static bool isDeviceAvailable(int deviceId);
-	static VulkanDeviceInfo getDeviceInfo(int deviceId);
 
 private:
 	struct Impl;

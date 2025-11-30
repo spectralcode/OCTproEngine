@@ -3890,28 +3890,76 @@ void VulkanBackend::destroyComputePipelines() {
 // ============================================
 
 std::vector<VulkanDeviceInfo> VulkanBackend::getAvailableDevices() {
-	// todo
-	return std::vector<VulkanDeviceInfo>();
-}
+	std::vector<VulkanDeviceInfo> devices;
 
-bool VulkanBackend::setDevice(int deviceId) {
-	// todo
-	return false;
-}
+	// Create a minimal temporary instance for device enumeration
+	VkApplicationInfo appInfo = {};
+	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	appInfo.pApplicationName = "OCTproEngine Device Query";
+	appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+	appInfo.pEngineName = "OCTproEngine";
+	appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+	appInfo.apiVersion = VK_API_VERSION_1_0;
 
-int VulkanBackend::getCurrentDevice() {
-	// todo
-	return 0;
-}
+	VkInstanceCreateInfo createInfo = {};
+	createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	createInfo.pApplicationInfo = &appInfo;
+	createInfo.enabledExtensionCount = 0;
+	createInfo.enabledLayerCount = 0;
 
-bool VulkanBackend::isDeviceAvailable(int deviceId) {
-	// todo
-	return false;
-}
+	VkInstance tempInstance;
+	VkResult result = vkCreateInstance(&createInfo, nullptr, &tempInstance);
+	if (result != VK_SUCCESS) {
+		// Failed to create instance - return empty list
+		return devices;
+	}
 
-VulkanDeviceInfo VulkanBackend::getDeviceInfo(int deviceId) {
-	// todo
-	return VulkanDeviceInfo();
+	// Enumerate physical devices
+	uint32_t deviceCount = 0;
+	vkEnumeratePhysicalDevices(tempInstance, &deviceCount, nullptr);
+
+	if (deviceCount == 0) {
+		vkDestroyInstance(tempInstance, nullptr);
+		return devices;
+	}
+
+	std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+	vkEnumeratePhysicalDevices(tempInstance, &deviceCount, physicalDevices.data());
+
+	// Query properties for each device
+	for (uint32_t i = 0; i < deviceCount; i++) {
+		VkPhysicalDeviceProperties deviceProperties;
+		vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
+
+		VkPhysicalDeviceMemoryProperties memProperties;
+		vkGetPhysicalDeviceMemoryProperties(physicalDevices[i], &memProperties);
+
+		// Calculate total memory from all device-local heaps
+		size_t totalMemory = 0;
+		for (uint32_t j = 0; j < memProperties.memoryHeapCount; j++) {
+			if (memProperties.memoryHeaps[j].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+				totalMemory += memProperties.memoryHeaps[j].size;
+			}
+		}
+
+		VulkanDeviceInfo info;
+		info.deviceId = static_cast<int>(i);
+		info.name = std::string(deviceProperties.deviceName);
+		info.totalMemory = totalMemory;
+		info.freeMemory = totalMemory; // Vulkan doesn't provide free memory query
+		info.apiVersionMajor = VK_VERSION_MAJOR(deviceProperties.apiVersion);
+		info.apiVersionMinor = VK_VERSION_MINOR(deviceProperties.apiVersion);
+		info.apiVersionPatch = VK_VERSION_PATCH(deviceProperties.apiVersion);
+		info.driverVersion = deviceProperties.driverVersion;
+		info.maxWorkGroupSize = deviceProperties.limits.maxComputeWorkGroupInvocations;
+		info.maxComputeSharedMemorySize = deviceProperties.limits.maxComputeSharedMemorySize;
+		info.isAvailable = true;
+
+		devices.push_back(info);
+	}
+
+	vkDestroyInstance(tempInstance, nullptr);
+	return devices;
 }
 
 } // namespace ope

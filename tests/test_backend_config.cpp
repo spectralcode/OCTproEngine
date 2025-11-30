@@ -49,6 +49,21 @@ int main() {
 	}
 	std::cout << std::endl;
 
+	//	Vulkan devices
+	if (BackendUtils::isVulkanAvailable()) {
+		std::cout << "Vulkan Devices:" << std::endl;
+		auto vulkanDevices = BackendUtils::getVulkanDevices();
+		for (const auto& device : vulkanDevices) {
+			std::cout << "  Device " << device.id << ": " << device.name << std::endl;
+			std::cout << "    Vendor: " << device.vendorName << std::endl;
+			std::cout << "    API Version: " << device.deviceVersion << std::endl;
+			std::cout << "    Total Memory: " << (device.totalMemory / (1024*1024)) << " MB" << std::endl;
+		}
+	} else {
+		std::cout << "  Vulkan not available" << std::endl;
+	}
+	std::cout << std::endl;
+
 	//	CPU info
 	if (BackendUtils::isCpuAvailable()) {
 		std::cout << "CPU Info:" << std::endl;
@@ -136,6 +151,28 @@ int main() {
 		std::cout << std::endl;
 	}
 
+	if (BackendUtils::isVulkanAvailable()) {
+		std::cout << "Testing Vulkan configuration:" << std::endl;
+
+		//	Create Vulkan config
+		VulkanConfig vulkanConfig;
+		vulkanConfig.deviceId = 0;
+
+		std::cout << "  Created: " << vulkanConfig.toString() << std::endl;
+
+		//	Serialize and parse
+		std::string serialized = BackendUtils::serializeConfig(vulkanConfig);
+		std::cout << "  Serialized: " << serialized << std::endl;
+
+		auto parsed = BackendUtils::parseConfig(serialized);
+		if (parsed) {
+			std::cout << "  Parsed: " << parsed->toString() << std::endl;
+		} else {
+			std::cout << "  [FAILED] Could not parse config" << std::endl;
+		}
+		std::cout << std::endl;
+	}
+
 	//	Test processor integration
 	std::cout << "========================================" << std::endl;
 	std::cout << "Testing processor integration..." << std::endl;
@@ -145,6 +182,8 @@ int main() {
 	Backend testBackend;
 	if (BackendUtils::isCudaAvailable()) {
 		testBackend = Backend::CUDA;
+	} else if (BackendUtils::isVulkanAvailable()) {
+		testBackend = Backend::VULKAN;
 	} else if (BackendUtils::isOpenCLAvailable()) {
 		testBackend = Backend::OPENCL;
 	} else if (BackendUtils::isCpuAvailable()) {
@@ -160,6 +199,7 @@ int main() {
 		std::cout << "Created processor with ";
 		switch (testBackend) {
 			case Backend::CUDA: std::cout << "CUDA"; break;
+			case Backend::VULKAN: std::cout << "Vulkan"; break;
 			case Backend::OPENCL: std::cout << "OpenCL"; break;
 			case Backend::CPU: std::cout << "CPU"; break;
 		}
@@ -198,6 +238,20 @@ int main() {
 			auto newConfig = processor.getBackendConfig();
 			if (newConfig && newConfig->getBackendType() == Backend::CUDA) {
 				std::cout << "[OK] Successfully switched to CUDA: " << newConfig->toString() << std::endl;
+			} else {
+				std::cout << "[FAILED] Backend switch failed" << std::endl;
+			}
+		}
+
+		if (testBackend == Backend::VULKAN) {
+			std::cout << "\nSwitching back to Vulkan via config..." << std::endl;
+			VulkanConfig vulkanConfig;
+			vulkanConfig.deviceId = 0;
+			processor.setBackendConfig(vulkanConfig);
+
+			auto newConfig = processor.getBackendConfig();
+			if (newConfig && newConfig->getBackendType() == Backend::VULKAN) {
+				std::cout << "[OK] Successfully switched to Vulkan: " << newConfig->toString() << std::endl;
 			} else {
 				std::cout << "[FAILED] Backend switch failed" << std::endl;
 			}

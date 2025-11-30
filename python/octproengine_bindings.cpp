@@ -544,6 +544,15 @@ PYBIND11_MODULE(octproengine, m) {
 			       ", prefer_gpu=" + (config.preferGpu ? "True" : "False") + ")>";
 		});
 
+	// VulkanConfig derived class
+	py::class_<ope::VulkanConfig, ope::BackendConfig>(m, "VulkanConfig")
+		.def(py::init<>())
+		.def_readwrite("device_id", &ope::VulkanConfig::deviceId,
+			"Vulkan physical device ID (default: 0)")
+		.def("__repr__", [](const ope::VulkanConfig& config) {
+			return "<VulkanConfig(device_id=" + std::to_string(config.deviceId) + ")>";
+		});
+
 	// CpuConfig derived class
 	py::class_<ope::CpuConfig, ope::BackendConfig>(m, "CpuConfig")
 		.def(py::init<>())
@@ -562,12 +571,16 @@ PYBIND11_MODULE(octproengine, m) {
 			"Get list of available CUDA devices")
 		.def_static("get_opencl_devices", &ope::BackendUtils::getOpenCLDevices,
 			"Get list of available OpenCL devices")
+		.def_static("get_vulkan_devices", &ope::BackendUtils::getVulkanDevices,
+			"Get list of available Vulkan devices")
 		.def_static("get_cpu_info", &ope::BackendUtils::getCpuInfo,
 			"Get CPU information")
 		.def_static("is_cuda_available", &ope::BackendUtils::isCudaAvailable,
 			"Check if CUDA is available")
 		.def_static("is_opencl_available", &ope::BackendUtils::isOpenCLAvailable,
 			"Check if OpenCL is available")
+		.def_static("is_vulkan_available", &ope::BackendUtils::isVulkanAvailable,
+			"Check if Vulkan is available")
 		.def_static("is_cpu_available", &ope::BackendUtils::isCpuAvailable,
 			"Check if CPU backend is available")
 		.def_static("create_default_config", &ope::BackendUtils::createDefaultConfig,
