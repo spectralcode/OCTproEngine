@@ -22,3 +22,22 @@ More info:
 - https://stackoverflow.com/questions/78598141/first-stdmutexlock-crashes-in-application-built-with-latest-visual-studio
 
 
+
+## Auto GPU downclocking (engergy saver)
+(2024-11-30)  
+While running performance benchmarks, I noticed that the GPU performance was not consistent. The results where all over the place and varied significantly between runs, even with identical settings. 
+
+However, this was an easy one since I have dealt with something similar before.
+
+NVIDIA GPUs use performance states [(_P-states_)](https://docs.nvidia.com/gameworks/content/gameworkslibrary/coresdk/nvapi/group__gpupstate.html#ga136e124b049605bdac0094c1c78f87bc):
+ - P0/P1 - Maximum 3D performance
+ - P2/P3 - Balanced 3D performance-power
+ - P8 - Basic HD video playback
+ - P10 - DVD playback
+ - P12 - Minimum idle power consumption 
+
+To see in which state your GPU is running, you can use [nvidia-smi](https://docs.nvidia.com/deploy/nvidia-smi/index.html). Open Command Prompt for Visual Studio and run `nvidia-smi -l 1`. this will show you some live stats includintg the current P-state.
+My GPU switched to P5 in some cases which caused a huge decrease in performance.
+
+The Fix:  
+Open NVIDIA Control Panel, go to Manage 3D Settings -> Program Settings, add/select your application, and set the Power management mode to "Prefer maximum performance". With this my GPU switched to P2 during benchmarks. 
