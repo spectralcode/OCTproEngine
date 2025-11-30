@@ -189,7 +189,18 @@ public:
 	// Backend update methods
 	void updateBackendResamplingCurve() {
 		if (!this->initialized) return;
-		std::vector<float> curve = this->getResamplingCurve();
+		// When resampling is disabled, upload identity curve [0, 1, 2, ...] for universal shader
+		std::vector<float> curve;
+		if (this->config.processingParams.resampling.enabled) {
+			curve = this->getResamplingCurve();
+		} else {
+			// Upload identity curve: [0.0, 1.0, 2.0, ..., signalLength-1]
+			int signalLength = this->config.dataParams.signalLength;
+			curve.resize(signalLength);
+			for (int i = 0; i < signalLength; ++i) {
+				curve[i] = static_cast<float>(i);
+			}
+		}
 		if (!curve.empty()) {
 			this->backend->updateResamplingCurve(curve.data(), curve.size());
 		}
@@ -197,7 +208,14 @@ public:
 
 	void updateBackendWindowCurve() {
 		if (!this->initialized) return;
-		std::vector<float> curve = this->getWindowCurve();
+		// When windowing is disabled, upload identity curve (all 1.0) for universal shader
+		std::vector<float> curve;
+		if (this->config.processingParams.windowing.enabled) {
+			curve = this->getWindowCurve();
+		} else {
+			// Upload identity curve: all 1.0 (no-op for windowing)
+			curve.resize(this->config.dataParams.signalLength, 1.0f);
+		}
 		if (!curve.empty()) {
 			this->backend->updateWindowCurve(curve.data(), curve.size());
 		}
@@ -205,7 +223,19 @@ public:
 	
 	void updateBackendDispersionCurve() {
 		if (!this->initialized) return;
-		std::vector<float> curve = this->getDispersionCurve();
+		// When dispersion is disabled, upload identity curve (all (1.0, 0.0)) for universal shader
+		std::vector<float> curve;
+		if (this->config.processingParams.dispersion.enabled) {
+			curve = this->getDispersionCurve();
+		} else {
+			// Upload identity curve: all (1.0, 0.0) - identity for complex multiplication
+			int signalLength = this->config.dataParams.signalLength;
+			curve.resize(signalLength * 2);
+			for (int i = 0; i < signalLength; ++i) {
+				curve[i * 2 + 0] = 1.0f;  // Real part
+				curve[i * 2 + 1] = 0.0f;  // Imaginary part
+			}
+		}
 		if (!curve.empty()) {
 			this->backend->updateDispersionCurve(curve.data(), curve.size());
 		}

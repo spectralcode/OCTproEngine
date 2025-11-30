@@ -75,16 +75,13 @@ struct VulkanBackend::Impl {
 	// IMPORTANT: Keep this in sync with the order of push_back calls in createComputePipelines()
 	enum class PipelineIndex : size_t {
 		InputConversion = 0,       // Convert input data to float
-		Windowing = 1,             // Apply window function
-		DcRemoval = 2,             // Rolling average background removal
-		KLinearization = 3,        // K-space linearization (resampling)
-		Dispersion = 4,            // Dispersion compensation
-		FpnDetermination = 5,      // Fixed pattern noise determination
+		DcRemoval = 1,             // Rolling average background removal
+		FpnDetermination = 2,      // Fixed pattern noise determination
 		// NOTE: Universal pre-FFT pipeline variants are stored separately in universalPipelines[] array
 		// NOTE: Universal post-FFT pipeline variants are stored separately in universalPostFFTPipelines[] array
 		//       (replaces old Truncate + Postprocess pipelines)
 
-		Count = 6  // Total number of pipelines (universal variants not included)
+		Count = 3  // Total number of pipelines (universal variants not included)
 	};
 
 	// Helper function to get pipeline with type-safe indexing
@@ -181,25 +178,10 @@ struct VulkanBackend::Impl {
 	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> descriptorSets;
 
-	// Windowing pipeline resources
-	VkPipelineLayout windowingPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout windowingDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> windowingDescriptorSets;
-
 	// DC removal pipeline resources
 	VkPipelineLayout dcRemovalPipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout dcRemovalDescriptorSetLayout = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> dcRemovalDescriptorSets;
-
-	// K-linearization pipeline resources
-	VkPipelineLayout klinearizationPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout klinearizationDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> klinearizationDescriptorSets;
-
-	// Dispersion compensation pipeline resources
-	VkPipelineLayout dispersionPipelineLayout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout dispersionDescriptorSetLayout = VK_NULL_HANDLE;
-	std::vector<VkDescriptorSet> dispersionDescriptorSets;
 
 	// Universal pre-FFT processing pipeline resources
 	VkPipelineLayout universalPreFFTPipelineLayout = VK_NULL_HANDLE;
@@ -580,7 +562,29 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	// Initialize VkFFT
 	checkVkFFTErrors(initializeVkFFT(&this->impl->fftApp, this->impl->fftConfig));
 
+	// Initialize curve buffers with identity values (required for universal shader)
+	// IMPORTANT: Must be done BEFORE createComputePipelines() so descriptor sets can reference these buffers
+	// Resampling identity curve: [0.0, 1.0, 2.0, ..., signalLength-1]
+	std::vector<float> identityResampleCurve(this->impl->signalLength);
+	for (int i = 0; i < this->impl->signalLength; ++i) {
+		identityResampleCurve[i] = static_cast<float>(i);
+	}
+	this->updateResamplingCurve(identityResampleCurve.data(), identityResampleCurve.size());
+
+	// Windowing identity curve: all 1.0
+	std::vector<float> identityWindowCurve(this->impl->signalLength, 1.0f);
+	this->updateWindowCurve(identityWindowCurve.data(), identityWindowCurve.size());
+
+	// Dispersion identity phase: all (1.0, 0.0) - identity for complex multiplication
+	std::vector<float> identityDispersionCurve(this->impl->signalLength * 2);
+	for (int i = 0; i < this->impl->signalLength; ++i) {
+		identityDispersionCurve[i * 2 + 0] = 1.0f;  // Real part
+		identityDispersionCurve[i * 2 + 1] = 0.0f;  // Imaginary part
+	}
+	this->updateDispersionCurve(identityDispersionCurve.data(), identityDispersionCurve.size());
+
 	// Create compute pipelines and shaders (AFTER VkFFT so it gets its descriptor pool first)
+	// AND after curve buffers are created so descriptor sets can reference them
 	this->createComputePipelines();
 
 	// Allocate and initialize host input buffers
@@ -827,12 +831,7 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	// Determine which operations are enabled
 	bool dcRemoval = config.processingParams.dcRemoval.enabled;
-	bool resampling = config.processingParams.resampling.enabled && (this->impl->resampleCurveBuffer != VK_NULL_HANDLE);
-	bool windowing = config.processingParams.windowing.enabled && (this->impl->windowCurveBuffer != VK_NULL_HANDLE);
-	bool dispersion = config.processingParams.dispersion.enabled && (this->impl->dispersionCurveBuffer != VK_NULL_HANDLE);
 	InterpolationMethod interpMethod = config.processingParams.resampling.method;
-
-	bool usedMergedPipeline = false;
 
 	// Step 1: DC Removal (if enabled) - separate pass
 	if (dcRemoval) {
@@ -871,7 +870,8 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	// Step 2-4: Use Universal Pre-FFT Shader (K-Linearization + Windowing + Dispersion)
 	// This shader combines k-linear + windowing + dispersion in one optimized pass
-	if (resampling && windowing && dispersion) {
+	// When features are disabled, identity/neutral curves are used (see curve initialization)
+	{
 		// Select the appropriate pipeline variant
 		int useIntermediate = dcRemoval ? 1 : 0;  // Read from intermediateBuffer if DC was applied
 		int interpIdx = (interpMethod == InterpolationMethod::CUBIC) ? 0 :
@@ -912,220 +912,8 @@ void VulkanBackend::process(IOBuffer& input) {
 		// DC enabled: reads from intermediateBuffer, writes to fftBuffer
 		// DC disabled: reads from fftBuffer, writes to intermediateBuffer
 		dataInFftBuffer = dcRemoval;  // true if DC enabled (data in fftBuffer), false otherwise
-		usedMergedPipeline = true;
 	}
 
-	// Fall back to separate operations for combinations without merged pipelines
-
-	// Fall back to separate operations for combinations without merged pipelines
-	if (!usedMergedPipeline) {
-		// Step 2: K-Linearization (if enabled)
-		//   Input: deviceFftBuffer, Output: deviceIntermediateBuffer
-		if (config.processingParams.resampling.enabled) {
-			// If data is in intermediate buffer (from DC removal), copy it to FFT buffer first
-			if (!dataInFftBuffer) {
-				VkBufferCopy copyRegion = {};
-				copyRegion.srcOffset = 0;
-				copyRegion.dstOffset = 0;
-				copyRegion.size = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float
-
-				vkCmdCopyBuffer(cmd, this->impl->deviceIntermediateBuffer, this->impl->deviceFftBuffer, 1, &copyRegion);
-
-				// Barrier after copy
-				VkBufferMemoryBarrier copyBarrier = {};
-				copyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-				copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				copyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-				copyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				copyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				copyBarrier.buffer = this->impl->deviceFftBuffer;
-				copyBarrier.offset = 0;
-				copyBarrier.size = VK_WHOLE_SIZE;
-
-				vkCmdPipelineBarrier(cmd,
-				                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0,
-				                     0, nullptr,
-				                     1, &copyBarrier,
-				                     0, nullptr);
-
-				dataInFftBuffer = true;
-			}
-
-			// Bind k-linearization pipeline
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::KLinearization));
-
-			// Bind k-linearization descriptor set
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->klinearizationPipelineLayout,
-			                        0, 1, &this->impl->klinearizationDescriptorSets[idx], 0, nullptr);
-
-			// Push constants: signalLength, samplesPerBuffer
-			uint32_t klinearPushConstants[2] = {
-				static_cast<uint32_t>(this->impl->signalLength),
-				static_cast<uint32_t>(this->impl->samplesPerBuffer)
-			};
-			vkCmdPushConstants(cmd, this->impl->klinearizationPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(klinearPushConstants), klinearPushConstants);
-
-			// Dispatch k-linearization shader
-			vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-			// Barrier after k-linearization
-			preprocessBarrier.buffer = this->impl->deviceIntermediateBuffer;
-			preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-			vkCmdPipelineBarrier(cmd,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0,
-			                     0, nullptr,
-			                     1, &preprocessBarrier,
-			                     0, nullptr);
-
-			// Data is now in deviceIntermediateBuffer
-			dataInFftBuffer = false;
-		}
-
-		// Step 3: Windowing (if enabled)
-		//   Input: deviceIntermediateBuffer, Output: deviceFftBuffer
-		if (config.processingParams.windowing.enabled) {
-			// If data is still in FFT buffer, copy it to intermediate buffer first
-			if (dataInFftBuffer) {
-				VkBufferCopy copyRegion = {};
-				copyRegion.srcOffset = 0;
-				copyRegion.dstOffset = 0;
-				copyRegion.size = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float
-
-				vkCmdCopyBuffer(cmd, this->impl->deviceFftBuffer, this->impl->deviceIntermediateBuffer, 1, &copyRegion);
-
-				// Barrier after copy
-				VkBufferMemoryBarrier copyBarrier = {};
-				copyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-				copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				copyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-				copyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				copyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				copyBarrier.buffer = this->impl->deviceIntermediateBuffer;
-				copyBarrier.offset = 0;
-				copyBarrier.size = VK_WHOLE_SIZE;
-
-				vkCmdPipelineBarrier(cmd,
-				                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0,
-				                     0, nullptr,
-				                     1, &copyBarrier,
-				                     0, nullptr);
-
-				dataInFftBuffer = false;
-			}
-
-			// Bind windowing pipeline
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::Windowing));
-
-			// Bind windowing descriptor set
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->windowingPipelineLayout,
-			                        0, 1, &this->impl->windowingDescriptorSets[idx], 0, nullptr);
-
-			// Push constants: signalLength, samplesPerBuffer
-			uint32_t windowingPushConstants[2] = {
-				static_cast<uint32_t>(this->impl->signalLength),
-				static_cast<uint32_t>(this->impl->samplesPerBuffer)
-			};
-			vkCmdPushConstants(cmd, this->impl->windowingPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(windowingPushConstants), windowingPushConstants);
-
-			// Dispatch windowing shader
-			vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-			// Barrier after windowing
-			preprocessBarrier.buffer = this->impl->deviceFftBuffer;
-			preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-			vkCmdPipelineBarrier(cmd,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0,
-			                     0, nullptr,
-			                     1, &preprocessBarrier,
-			                     0, nullptr);
-
-			// Data is now in deviceFftBuffer
-			dataInFftBuffer = true;
-		}
-
-		// Step 4: Dispersion Compensation (if enabled)
-		//   Input: deviceFftBuffer, Output: deviceIntermediateBuffer
-		if (config.processingParams.dispersion.enabled) {
-			// If data is in intermediate buffer, copy it to FFT buffer first
-			if (!dataInFftBuffer) {
-				VkBufferCopy copyRegion = {};
-				copyRegion.srcOffset = 0;
-				copyRegion.dstOffset = 0;
-				copyRegion.size = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float
-
-				vkCmdCopyBuffer(cmd, this->impl->deviceIntermediateBuffer, this->impl->deviceFftBuffer, 1, &copyRegion);
-
-				// Barrier after copy
-				VkBufferMemoryBarrier copyBarrier = {};
-				copyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-				copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				copyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-				copyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				copyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				copyBarrier.buffer = this->impl->deviceFftBuffer;
-				copyBarrier.offset = 0;
-				copyBarrier.size = VK_WHOLE_SIZE;
-
-				vkCmdPipelineBarrier(cmd,
-				                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0,
-				                     0, nullptr,
-				                     1, &copyBarrier,
-				                     0, nullptr);
-
-				dataInFftBuffer = true;
-			}
-
-			// Bind dispersion pipeline (index 6)
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::Dispersion));
-
-			// Bind dispersion descriptor set
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->dispersionPipelineLayout,
-			                        0, 1, &this->impl->dispersionDescriptorSets[idx], 0, nullptr);
-
-			// Push constants: signalLength, samplesPerBuffer
-			uint32_t dispersionPushConstants[2] = {
-				static_cast<uint32_t>(this->impl->signalLength),
-				static_cast<uint32_t>(this->impl->samplesPerBuffer)
-			};
-			vkCmdPushConstants(cmd, this->impl->dispersionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-			                   0, sizeof(dispersionPushConstants), dispersionPushConstants);
-
-			// Dispatch dispersion shader
-			vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-			// Barrier after dispersion
-			preprocessBarrier.buffer = this->impl->deviceIntermediateBuffer;
-			preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-			vkCmdPipelineBarrier(cmd,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0,
-			                     0, nullptr,
-			                     1, &preprocessBarrier,
-			                     0, nullptr);
-
-			// Data is now in deviceIntermediateBuffer
-			dataInFftBuffer = false;
-		}
-	}
 
 	// Select FFT buffer dynamically based on where data is (eliminates unnecessary buffer copy)
 	VkBuffer* fftBuffer = dataInFftBuffer ? &this->impl->deviceFftBuffer : &this->impl->deviceIntermediateBuffer;
@@ -1472,6 +1260,9 @@ void VulkanBackend::process(IOBuffer& input) {
 	vkCmdCopyBuffer(cmd, this->impl->deviceProcessedBuffer, this->impl->stagingOutputBuffers[idx], 1, &finalCopy);
 
 	checkVulkanErrors(vkEndCommandBuffer(cmd));
+	#else
+	// OLD CODE: Assume command buffers are pre-recorded for fixed signal length
+	int outputSignalLength = this->impl->signalLength / 2;
 	#endif  // End of OLD CODE (re-recording every frame)
 
 	// Submit pre-recorded command buffer
@@ -1514,6 +1305,15 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
+	// Create buffer if it doesn't exist
+	if (this->impl->resampleCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength)) {
+		VkDeviceSize bufferSize = length * sizeof(float);
+		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->resampleCurveBuffer, this->impl->resampleCurveMemory);
+	}
+
 	if (this->impl->resampleCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
@@ -1572,6 +1372,15 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 }
 
 void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
+	// Create buffer if it doesn't exist
+	if (this->impl->dispersionCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength * 2)) {
+		VkDeviceSize bufferSize = length * sizeof(float);
+		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->dispersionCurveBuffer, this->impl->dispersionCurveMemory);
+	}
+
 	if (this->impl->dispersionCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength * 2)) {
 		return;
 	}
@@ -1630,6 +1439,15 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 }
 
 void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
+	// Create buffer if it doesn't exist
+	if (this->impl->windowCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength)) {
+		VkDeviceSize bufferSize = length * sizeof(float);
+		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->windowCurveBuffer, this->impl->windowCurveMemory);
+	}
+
 	if (this->impl->windowCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
@@ -1934,243 +1752,8 @@ std::vector<float> VulkanBackend::windowing(
 	int lineWidth,
 	int samples
 ) {
-	// Calculate buffer sizes
-	size_t numSamples = static_cast<size_t>(lineWidth) * samples;
-	size_t bufferSize = numSamples * sizeof(float);
-	size_t windowSize = samples * sizeof(float);
-
-	// Create temporary buffers for windowing operation
-	VkBuffer inputBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory inputMemory = VK_NULL_HANDLE;
-	VkBuffer windowBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory windowMemory = VK_NULL_HANDLE;
-	VkBuffer outputBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory outputMemory = VK_NULL_HANDLE;
-
-	try {
-		// Create and populate input buffer
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-		             inputBuffer, inputMemory);
-
-		// Create and populate window buffer
-		createBuffer(this->impl->device, this->impl->physicalDevice, windowSize,
-		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-		             windowBuffer, windowMemory);
-
-		// Create output buffer
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-		             outputBuffer, outputMemory);
-
-		// Create staging buffers for upload
-		VkBuffer stagingInput = VK_NULL_HANDLE;
-		VkDeviceMemory stagingInputMem = VK_NULL_HANDLE;
-		VkBuffer stagingWindow = VK_NULL_HANDLE;
-		VkDeviceMemory stagingWindowMem = VK_NULL_HANDLE;
-
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		             stagingInput, stagingInputMem);
-
-		createBuffer(this->impl->device, this->impl->physicalDevice, windowSize,
-		             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		             stagingWindow, stagingWindowMem);
-
-		// Upload input data
-		void* mappedInput;
-		vkMapMemory(this->impl->device, stagingInputMem, 0, bufferSize, 0, &mappedInput);
-		memcpy(mappedInput, input, bufferSize);
-		vkUnmapMemory(this->impl->device, stagingInputMem);
-
-		// Upload window curve
-		void* mappedWindow;
-		vkMapMemory(this->impl->device, stagingWindowMem, 0, windowSize, 0, &mappedWindow);
-		memcpy(mappedWindow, windowCurve, windowSize);
-		vkUnmapMemory(this->impl->device, stagingWindowMem);
-
-		// Create one-time command buffer for copy and compute
-		VkCommandBufferAllocateInfo allocInfo = {};
-		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		allocInfo.commandPool = this->impl->commandPool;
-		allocInfo.commandBufferCount = 1;
-
-		VkCommandBuffer cmdBuffer;
-		vkAllocateCommandBuffers(this->impl->device, &allocInfo, &cmdBuffer);
-
-		VkCommandBufferBeginInfo beginInfo = {};
-		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-		vkBeginCommandBuffer(cmdBuffer, &beginInfo);
-
-		// Copy staging to device buffers
-		VkBufferCopy inputCopyRegion = {};
-		inputCopyRegion.size = bufferSize;
-		vkCmdCopyBuffer(cmdBuffer, stagingInput, inputBuffer, 1, &inputCopyRegion);
-
-		VkBufferCopy windowCopyRegion = {};
-		windowCopyRegion.size = windowSize;
-		vkCmdCopyBuffer(cmdBuffer, stagingWindow, windowBuffer, 1, &windowCopyRegion);
-
-		// Pipeline barrier to ensure transfers complete before compute
-		VkMemoryBarrier memoryBarrier = {};
-		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-		vkCmdPipelineBarrier(cmdBuffer,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
-
-		// Create descriptor set for this operation
-		VkDescriptorSetAllocateInfo descAllocInfo = {};
-		descAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-		descAllocInfo.descriptorPool = this->impl->descriptorPool;
-		descAllocInfo.descriptorSetCount = 1;
-		descAllocInfo.pSetLayouts = &this->impl->windowingDescriptorSetLayout;
-
-		VkDescriptorSet descriptorSet;
-		checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &descAllocInfo, &descriptorSet));
-
-		// Update descriptor set
-		std::vector<VkWriteDescriptorSet> descriptorWrites(3);
-
-		VkDescriptorBufferInfo inputBufferInfo = {};
-		inputBufferInfo.buffer = inputBuffer;
-		inputBufferInfo.offset = 0;
-		inputBufferInfo.range = VK_WHOLE_SIZE;
-
-		descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[0].dstSet = descriptorSet;
-		descriptorWrites[0].dstBinding = 0;
-		descriptorWrites[0].dstArrayElement = 0;
-		descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[0].descriptorCount = 1;
-		descriptorWrites[0].pBufferInfo = &inputBufferInfo;
-
-		VkDescriptorBufferInfo windowBufferInfo = {};
-		windowBufferInfo.buffer = windowBuffer;
-		windowBufferInfo.offset = 0;
-		windowBufferInfo.range = VK_WHOLE_SIZE;
-
-		descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[1].dstSet = descriptorSet;
-		descriptorWrites[1].dstBinding = 1;
-		descriptorWrites[1].dstArrayElement = 0;
-		descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[1].descriptorCount = 1;
-		descriptorWrites[1].pBufferInfo = &windowBufferInfo;
-
-		VkDescriptorBufferInfo outputBufferInfo = {};
-		outputBufferInfo.buffer = outputBuffer;
-		outputBufferInfo.offset = 0;
-		outputBufferInfo.range = VK_WHOLE_SIZE;
-
-		descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[2].dstSet = descriptorSet;
-		descriptorWrites[2].dstBinding = 2;
-		descriptorWrites[2].dstArrayElement = 0;
-		descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[2].descriptorCount = 1;
-		descriptorWrites[2].pBufferInfo = &outputBufferInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
-
-		// Bind pipeline and descriptor set
-		vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::Windowing));  // Windowing is pipeline index 2
-		vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->windowingPipelineLayout,
-		                        0, 1, &descriptorSet, 0, nullptr);
-
-		// Set push constants
-		uint32_t pushConstants[2] = {
-			static_cast<uint32_t>(samples),
-			static_cast<uint32_t>(numSamples)
-		};
-		vkCmdPushConstants(cmdBuffer, this->impl->windowingPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(pushConstants), pushConstants);
-
-		// Dispatch compute shader
-		uint32_t workgroups = (static_cast<uint32_t>(numSamples) + 127) / 128;
-		vkCmdDispatch(cmdBuffer, workgroups, 1, 1);
-
-		// Pipeline barrier to ensure compute completes before transfer
-		VkMemoryBarrier computeBarrier = {};
-		computeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		computeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		computeBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-
-		vkCmdPipelineBarrier(cmdBuffer,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0, 1, &computeBarrier, 0, nullptr, 0, nullptr);
-
-		// Create staging buffer for download
-		VkBuffer stagingOutput = VK_NULL_HANDLE;
-		VkDeviceMemory stagingOutputMem = VK_NULL_HANDLE;
-
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		             stagingOutput, stagingOutputMem);
-
-		// Copy result to staging buffer
-		VkBufferCopy outputCopyRegion = {};
-		outputCopyRegion.size = bufferSize;
-		vkCmdCopyBuffer(cmdBuffer, outputBuffer, stagingOutput, 1, &outputCopyRegion);
-
-		vkEndCommandBuffer(cmdBuffer);
-
-		// Submit and wait
-		VkSubmitInfo submitInfo = {};
-		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		submitInfo.commandBufferCount = 1;
-		submitInfo.pCommandBuffers = &cmdBuffer;
-
-		vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-		vkQueueWaitIdle(this->impl->computeQueue);
-
-		// Download result
-		std::vector<float> result(numSamples);
-		void* mappedOutput;
-		vkMapMemory(this->impl->device, stagingOutputMem, 0, bufferSize, 0, &mappedOutput);
-		memcpy(result.data(), mappedOutput, bufferSize);
-		vkUnmapMemory(this->impl->device, stagingOutputMem);
-
-		// Cleanup
-		vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
-		vkDestroyBuffer(this->impl->device, stagingInput, nullptr);
-		vkFreeMemory(this->impl->device, stagingInputMem, nullptr);
-		vkDestroyBuffer(this->impl->device, stagingWindow, nullptr);
-		vkFreeMemory(this->impl->device, stagingWindowMem, nullptr);
-		vkDestroyBuffer(this->impl->device, stagingOutput, nullptr);
-		vkFreeMemory(this->impl->device, stagingOutputMem, nullptr);
-		vkDestroyBuffer(this->impl->device, inputBuffer, nullptr);
-		vkFreeMemory(this->impl->device, inputMemory, nullptr);
-		vkDestroyBuffer(this->impl->device, windowBuffer, nullptr);
-		vkFreeMemory(this->impl->device, windowMemory, nullptr);
-		vkDestroyBuffer(this->impl->device, outputBuffer, nullptr);
-		vkFreeMemory(this->impl->device, outputMemory, nullptr);
-
-		return result;
-
-	} catch (...) {
-		// Cleanup on error
-		if (inputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(this->impl->device, inputBuffer, nullptr);
-		if (inputMemory != VK_NULL_HANDLE) vkFreeMemory(this->impl->device, inputMemory, nullptr);
-		if (windowBuffer != VK_NULL_HANDLE) vkDestroyBuffer(this->impl->device, windowBuffer, nullptr);
-		if (windowMemory != VK_NULL_HANDLE) vkFreeMemory(this->impl->device, windowMemory, nullptr);
-		if (outputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(this->impl->device, outputBuffer, nullptr);
-		if (outputMemory != VK_NULL_HANDLE) vkFreeMemory(this->impl->device, outputMemory, nullptr);
-		throw;
-	}
+	// TODO: Implement
+	return std::vector<float>();
 }
 
 std::vector<float> VulkanBackend::dispersionCompensation(
@@ -2235,7 +1818,7 @@ std::vector<float> VulkanBackend::getMinimumVarianceMean(
 	int height,
 	int segments
 ) {
-	// TODO: Implement
+	// TODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -2245,7 +1828,7 @@ std::vector<float> VulkanBackend::fixedPatternNoiseRemoval(
 	int lineWidth,
 	int numLines
 ) {
-	// TODO: Implement
+	// TODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -2259,215 +1842,8 @@ std::vector<float> VulkanBackend::postProcessTruncate(
 	int lineWidth,
 	int samples
 ) {
-	// Calculate buffer sizes
-	size_t numSamples = static_cast<size_t>(lineWidth) * samples;
-	size_t bufferSize = numSamples * sizeof(float);
-
-	// Create temporary buffers
-	VkBuffer inputBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory inputMemory = VK_NULL_HANDLE;
-	VkBuffer outputBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory outputMemory = VK_NULL_HANDLE;
-
-	try {
-		// Create input and output buffers
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-		             inputBuffer, inputMemory);
-
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-		             outputBuffer, outputMemory);
-
-		// Create staging buffers
-		VkBuffer stagingInput = VK_NULL_HANDLE;
-		VkDeviceMemory stagingInputMem = VK_NULL_HANDLE;
-
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		             stagingInput, stagingInputMem);
-
-		// Upload input data
-		void* mappedInput;
-		vkMapMemory(this->impl->device, stagingInputMem, 0, bufferSize, 0, &mappedInput);
-		memcpy(mappedInput, input, bufferSize);
-		vkUnmapMemory(this->impl->device, stagingInputMem);
-
-		// Create command buffer
-		VkCommandBufferAllocateInfo allocInfo = {};
-		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		allocInfo.commandPool = this->impl->commandPool;
-		allocInfo.commandBufferCount = 1;
-
-		VkCommandBuffer cmdBuffer;
-		vkAllocateCommandBuffers(this->impl->device, &allocInfo, &cmdBuffer);
-
-		VkCommandBufferBeginInfo beginInfo = {};
-		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-		vkBeginCommandBuffer(cmdBuffer, &beginInfo);
-
-		// Copy staging to device buffer
-		VkBufferCopy inputCopyRegion = {};
-		inputCopyRegion.size = bufferSize;
-		vkCmdCopyBuffer(cmdBuffer, stagingInput, inputBuffer, 1, &inputCopyRegion);
-
-		// Pipeline barrier
-		VkMemoryBarrier memoryBarrier = {};
-		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-		vkCmdPipelineBarrier(cmdBuffer,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
-
-		// TODO: Update this to use universal post-FFT pipeline variant (FPN disabled, log/linear based on parameter)
-		// For now, background recording is disabled until universal post-FFT pipeline is fully integrated
-		throw std::runtime_error("requestPostProcessBackgroundRecording not yet implemented for universal post-FFT pipeline");
-
-		/* OLD CODE - Commented out until universal post-FFT pipeline integration is complete
-		// Create descriptor set
-		VkDescriptorSetAllocateInfo descAllocInfo = {};
-		descAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-		descAllocInfo.descriptorPool = this->impl->descriptorPool;
-		descAllocInfo.descriptorSetCount = 1;
-		descAllocInfo.pSetLayouts = &this->impl->postprocessDescriptorSetLayout;
-
-		VkDescriptorSet descriptorSet;
-		checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &descAllocInfo, &descriptorSet));
-
-		// Update descriptor set
-		std::vector<VkWriteDescriptorSet> descriptorWrites(2);
-
-		VkDescriptorBufferInfo inputBufferInfo = {};
-		inputBufferInfo.buffer = inputBuffer;
-		inputBufferInfo.offset = 0;
-		inputBufferInfo.range = VK_WHOLE_SIZE;
-
-		descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[0].dstSet = descriptorSet;
-		descriptorWrites[0].dstBinding = 0;
-		descriptorWrites[0].dstArrayElement = 0;
-		descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[0].descriptorCount = 1;
-		descriptorWrites[0].pBufferInfo = &inputBufferInfo;
-
-		VkDescriptorBufferInfo outputBufferInfo = {};
-		outputBufferInfo.buffer = outputBuffer;
-		outputBufferInfo.offset = 0;
-		outputBufferInfo.range = VK_WHOLE_SIZE;
-
-		descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		descriptorWrites[1].dstSet = descriptorSet;
-		descriptorWrites[1].dstBinding = 1;
-		descriptorWrites[1].dstArrayElement = 0;
-		descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		descriptorWrites[1].descriptorCount = 1;
-		descriptorWrites[1].pBufferInfo = &outputBufferInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
-
-		// Bind pipeline and descriptor set
-		vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::Postprocess));  // Postprocess is pipeline index 3
-		vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->postprocessPipelineLayout,
-		                        0, 1, &descriptorSet, 0, nullptr);
-
-		// Set push constants
-		struct PushConstants {
-			uint32_t samplesPerBuffer;
-			uint32_t logScaling;
-			float grayscaleMax;
-			float grayscaleMin;
-			float addend;
-			float multiplicator;
-		} pushConstants;
-
-		pushConstants.samplesPerBuffer = static_cast<uint32_t>(numSamples);
-		pushConstants.logScaling = logScaling ? 1 : 0;
-		pushConstants.grayscaleMax = grayscaleMax;
-		pushConstants.grayscaleMin = grayscaleMin;
-		pushConstants.addend = addend;
-		pushConstants.multiplicator = multiplicator;
-
-		vkCmdPushConstants(cmdBuffer, this->impl->postprocessPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(pushConstants), &pushConstants);
-
-		// Dispatch compute shader
-		uint32_t workgroups = (static_cast<uint32_t>(numSamples) + 127) / 128;
-		vkCmdDispatch(cmdBuffer, workgroups, 1, 1);
-
-		// Pipeline barrier
-		VkMemoryBarrier computeBarrier = {};
-		computeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		computeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		computeBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-
-		vkCmdPipelineBarrier(cmdBuffer,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0, 1, &computeBarrier, 0, nullptr, 0, nullptr);
-		*/ // End of OLD CODE comment
-
-		// Create staging output buffer
-		VkBuffer stagingOutput = VK_NULL_HANDLE;
-		VkDeviceMemory stagingOutputMem = VK_NULL_HANDLE;
-
-		createBuffer(this->impl->device, this->impl->physicalDevice, bufferSize,
-		             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		             stagingOutput, stagingOutputMem);
-
-		// Copy result to staging buffer
-		VkBufferCopy outputCopyRegion = {};
-		outputCopyRegion.size = bufferSize;
-		vkCmdCopyBuffer(cmdBuffer, outputBuffer, stagingOutput, 1, &outputCopyRegion);
-
-		vkEndCommandBuffer(cmdBuffer);
-
-		// Submit and wait
-		VkSubmitInfo submitInfo = {};
-		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		submitInfo.commandBufferCount = 1;
-		submitInfo.pCommandBuffers = &cmdBuffer;
-
-		vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-		vkQueueWaitIdle(this->impl->computeQueue);
-
-		// Download result
-		std::vector<float> result(numSamples);
-		void* mappedOutput;
-		vkMapMemory(this->impl->device, stagingOutputMem, 0, bufferSize, 0, &mappedOutput);
-		memcpy(result.data(), mappedOutput, bufferSize);
-		vkUnmapMemory(this->impl->device, stagingOutputMem);
-
-		// Cleanup
-		vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
-		vkDestroyBuffer(this->impl->device, stagingInput, nullptr);
-		vkFreeMemory(this->impl->device, stagingInputMem, nullptr);
-		vkDestroyBuffer(this->impl->device, stagingOutput, nullptr);
-		vkFreeMemory(this->impl->device, stagingOutputMem, nullptr);
-		vkDestroyBuffer(this->impl->device, inputBuffer, nullptr);
-		vkFreeMemory(this->impl->device, inputMemory, nullptr);
-		vkDestroyBuffer(this->impl->device, outputBuffer, nullptr);
-		vkFreeMemory(this->impl->device, outputMemory, nullptr);
-
-		return result;
-
-	} catch (...) {
-		// Cleanup on error
-		if (inputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(this->impl->device, inputBuffer, nullptr);
-		if (inputMemory != VK_NULL_HANDLE) vkFreeMemory(this->impl->device, inputMemory, nullptr);
-		if (outputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(this->impl->device, outputBuffer, nullptr);
-		if (outputMemory != VK_NULL_HANDLE) vkFreeMemory(this->impl->device, outputMemory, nullptr);
-		throw;
-	}
+	// TODO: remove from all backends
+	return std::vector<float>();
 }
 
 std::vector<float> VulkanBackend::bscanFlip(
@@ -2476,7 +1852,7 @@ std::vector<float> VulkanBackend::bscanFlip(
 	int linesPerBscan,
 	int numBscans
 ) {
-	// TODO: Implement
+	// TODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -2487,7 +1863,7 @@ std::vector<float> VulkanBackend::sinusoidalScanCorrection(
 	int linesPerBscan,
 	int numBscans
 ) {
-	// TODO: Implement
+	// TODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -2499,7 +1875,7 @@ std::vector<float> VulkanBackend::postProcessBackgroundSubtraction(
 	int lineWidth,
 	int samples
 ) {
-	// TODO: Implement
+	// TODO: remove from all backends
 	return std::vector<float>();
 }
 
@@ -2899,9 +2275,6 @@ void VulkanBackend::recordCommandBuffers() {
 		                     1, &barrier,
 		                     0, nullptr);
 
-		// NOTE: Rest of command recording will be added here
-		// For now, just record input conversion as a test
-
 		// Bind input conversion pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::InputConversion));
 
@@ -3149,141 +2522,6 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
-	// Create Windowing Shader Pipeline
-	// ============================================
-
-	// Create descriptor set layout for windowing (3 storage buffers: input, window curve, output)
-	std::vector<VkDescriptorSetLayoutBinding> windowingBindings(3);
-
-	// Binding 0: Input buffer
-	windowingBindings[0].binding = 0;
-	windowingBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	windowingBindings[0].descriptorCount = 1;
-	windowingBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	windowingBindings[0].pImmutableSamplers = nullptr;
-
-	// Binding 1: Window curve buffer
-	windowingBindings[1].binding = 1;
-	windowingBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	windowingBindings[1].descriptorCount = 1;
-	windowingBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	windowingBindings[1].pImmutableSamplers = nullptr;
-
-	// Binding 2: Output buffer
-	windowingBindings[2].binding = 2;
-	windowingBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	windowingBindings[2].descriptorCount = 1;
-	windowingBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	windowingBindings[2].pImmutableSamplers = nullptr;
-
-	VkDescriptorSetLayoutCreateInfo windowingLayoutInfo = {};
-	windowingLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	windowingLayoutInfo.bindingCount = static_cast<uint32_t>(windowingBindings.size());
-	windowingLayoutInfo.pBindings = windowingBindings.data();
-
-	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &windowingLayoutInfo, nullptr, &this->impl->windowingDescriptorSetLayout));
-
-	// Create pipeline layout for windowing
-	VkPushConstantRange windowingPushConstantRange = {};
-	windowingPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	windowingPushConstantRange.offset = 0;
-	windowingPushConstantRange.size = sizeof(uint32_t) * 2;  // signalLength, samplesPerBuffer
-
-	VkPipelineLayoutCreateInfo windowingPipelineLayoutInfo = {};
-	windowingPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	windowingPipelineLayoutInfo.setLayoutCount = 1;
-	windowingPipelineLayoutInfo.pSetLayouts = &this->impl->windowingDescriptorSetLayout;
-	windowingPipelineLayoutInfo.pushConstantRangeCount = 1;
-	windowingPipelineLayoutInfo.pPushConstantRanges = &windowingPushConstantRange;
-
-	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &windowingPipelineLayoutInfo, nullptr, &this->impl->windowingPipelineLayout));
-
-	// Load and compile windowing shader
-	std::string windowingShaderPath = "src/backends/vulkan/shaders/windowing.comp";
-	std::string windowingShaderSource = loadShaderSource(windowingShaderPath);
-	std::vector<uint32_t> windowingSPIRV = compileGLSLToSPIRV(windowingShaderSource, windowingShaderPath, shaderc_compute_shader);
-
-	VkShaderModule windowingShader = createShaderModule(this->impl->device, windowingSPIRV);
-	this->impl->shaderModules.push_back(windowingShader);
-
-	// Create windowing compute pipeline
-	VkPipelineShaderStageCreateInfo windowingShaderStageInfo = {};
-	windowingShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	windowingShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	windowingShaderStageInfo.module = windowingShader;
-	windowingShaderStageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo windowingPipelineInfo = {};
-	windowingPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	windowingPipelineInfo.stage = windowingShaderStageInfo;
-	windowingPipelineInfo.layout = this->impl->windowingPipelineLayout;
-
-	VkPipeline windowingPipeline;
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &windowingPipelineInfo, nullptr, &windowingPipeline));
-	this->impl->computePipelines.push_back(windowingPipeline);
-
-	// Allocate and Update Windowing Descriptor Sets
-	std::vector<VkDescriptorSetLayout> windowingLayouts(this->impl->numCommandBuffers, this->impl->windowingDescriptorSetLayout);
-
-	VkDescriptorSetAllocateInfo windowingAllocInfo = {};
-	windowingAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	windowingAllocInfo.descriptorPool = this->impl->descriptorPool;
-	windowingAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
-	windowingAllocInfo.pSetLayouts = windowingLayouts.data();
-
-	this->impl->windowingDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &windowingAllocInfo, this->impl->windowingDescriptorSets.data()));
-
-	// Update windowing descriptor sets
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> windowingDescriptorWrites(3);
-
-		// Binding 0: Input buffer (Intermediate buffer - from k-linearization)
-		VkDescriptorBufferInfo windowingInputInfo = {};
-		windowingInputInfo.buffer = this->impl->deviceIntermediateBuffer;
-		windowingInputInfo.offset = 0;
-		windowingInputInfo.range = VK_WHOLE_SIZE;
-
-		windowingDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		windowingDescriptorWrites[0].dstSet = this->impl->windowingDescriptorSets[i];
-		windowingDescriptorWrites[0].dstBinding = 0;
-		windowingDescriptorWrites[0].dstArrayElement = 0;
-		windowingDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		windowingDescriptorWrites[0].descriptorCount = 1;
-		windowingDescriptorWrites[0].pBufferInfo = &windowingInputInfo;
-
-		// Binding 1: Window curve buffer
-		VkDescriptorBufferInfo windowCurveInfo = {};
-		windowCurveInfo.buffer = this->impl->windowCurveBuffer;
-		windowCurveInfo.offset = 0;
-		windowCurveInfo.range = VK_WHOLE_SIZE;
-
-		windowingDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		windowingDescriptorWrites[1].dstSet = this->impl->windowingDescriptorSets[i];
-		windowingDescriptorWrites[1].dstBinding = 1;
-		windowingDescriptorWrites[1].dstArrayElement = 0;
-		windowingDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		windowingDescriptorWrites[1].descriptorCount = 1;
-		windowingDescriptorWrites[1].pBufferInfo = &windowCurveInfo;
-
-		// Binding 2: Output buffer (FFT buffer)
-		VkDescriptorBufferInfo windowingOutputInfo = {};
-		windowingOutputInfo.buffer = this->impl->deviceFftBuffer;
-		windowingOutputInfo.offset = 0;
-		windowingOutputInfo.range = VK_WHOLE_SIZE;
-
-		windowingDescriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		windowingDescriptorWrites[2].dstSet = this->impl->windowingDescriptorSets[i];
-		windowingDescriptorWrites[2].dstBinding = 2;
-		windowingDescriptorWrites[2].dstArrayElement = 0;
-		windowingDescriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		windowingDescriptorWrites[2].descriptorCount = 1;
-		windowingDescriptorWrites[2].pBufferInfo = &windowingOutputInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(windowingDescriptorWrites.size()), windowingDescriptorWrites.data(), 0, nullptr);
-	}
-
-	// ============================================
 	// Create DC Removal Shader Pipeline
 	// ============================================
 
@@ -3427,276 +2665,6 @@ void VulkanBackend::createComputePipelines() {
 		dcRemovalDescriptorWrites[1].pBufferInfo = &dcRemovalOutputBufferInfo;
 
 		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(dcRemovalDescriptorWrites.size()), dcRemovalDescriptorWrites.data(), 0, nullptr);
-	}
-
-	// ============================================
-	// Create K-Linearization Shader Pipeline
-	// ============================================
-
-	// Create descriptor set layout for K-linearization (3 storage buffers: input, resample curve, output)
-	std::vector<VkDescriptorSetLayoutBinding> klinearBindings(3);
-
-	// Binding 0: Input buffer (complex data)
-	klinearBindings[0].binding = 0;
-	klinearBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearBindings[0].descriptorCount = 1;
-	klinearBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearBindings[0].pImmutableSamplers = nullptr;
-
-	// Binding 1: Resample curve buffer
-	klinearBindings[1].binding = 1;
-	klinearBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearBindings[1].descriptorCount = 1;
-	klinearBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearBindings[1].pImmutableSamplers = nullptr;
-
-	// Binding 2: Output buffer (k-linearized complex data)
-	klinearBindings[2].binding = 2;
-	klinearBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	klinearBindings[2].descriptorCount = 1;
-	klinearBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearBindings[2].pImmutableSamplers = nullptr;
-
-	VkDescriptorSetLayoutCreateInfo klinearLayoutInfo = {};
-	klinearLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	klinearLayoutInfo.bindingCount = static_cast<uint32_t>(klinearBindings.size());
-	klinearLayoutInfo.pBindings = klinearBindings.data();
-
-	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &klinearLayoutInfo, nullptr, &this->impl->klinearizationDescriptorSetLayout));
-
-	// Create pipeline layout for K-linearization
-	VkPushConstantRange klinearPushConstantRange = {};
-	klinearPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearPushConstantRange.offset = 0;
-	klinearPushConstantRange.size = sizeof(uint32_t) * 2;  // signalLength, samplesPerBuffer
-
-	VkPipelineLayoutCreateInfo klinearPipelineLayoutInfo = {};
-	klinearPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	klinearPipelineLayoutInfo.setLayoutCount = 1;
-	klinearPipelineLayoutInfo.pSetLayouts = &this->impl->klinearizationDescriptorSetLayout;
-	klinearPipelineLayoutInfo.pushConstantRangeCount = 1;
-	klinearPipelineLayoutInfo.pPushConstantRanges = &klinearPushConstantRange;
-
-	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &klinearPipelineLayoutInfo, nullptr, &this->impl->klinearizationPipelineLayout));
-
-	// Load and compile K-linearization shader
-	std::string klinearShaderPath = "src/backends/vulkan/shaders/klinearization.comp";
-	std::string klinearShaderSource = loadShaderSource(klinearShaderPath);
-	std::vector<uint32_t> klinearSPIRV = compileGLSLToSPIRV(klinearShaderSource, klinearShaderPath, shaderc_compute_shader);
-
-	VkShaderModule klinearShader = createShaderModule(this->impl->device, klinearSPIRV);
-	this->impl->shaderModules.push_back(klinearShader);
-
-	// Create K-linearization compute pipeline
-	VkPipelineShaderStageCreateInfo klinearShaderStageInfo = {};
-	klinearShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	klinearShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	klinearShaderStageInfo.module = klinearShader;
-	klinearShaderStageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo klinearPipelineInfo = {};
-	klinearPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	klinearPipelineInfo.stage = klinearShaderStageInfo;
-	klinearPipelineInfo.layout = this->impl->klinearizationPipelineLayout;
-
-	VkPipeline klinearPipeline;
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &klinearPipelineInfo, nullptr, &klinearPipeline));
-	this->impl->computePipelines.push_back(klinearPipeline);
-
-	// Allocate and Update K-linearization Descriptor Sets
-	std::vector<VkDescriptorSetLayout> klinearLayouts(this->impl->numCommandBuffers, this->impl->klinearizationDescriptorSetLayout);
-
-	VkDescriptorSetAllocateInfo klinearAllocInfo = {};
-	klinearAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	klinearAllocInfo.descriptorPool = this->impl->descriptorPool;
-	klinearAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
-	klinearAllocInfo.pSetLayouts = klinearLayouts.data();
-
-	this->impl->klinearizationDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &klinearAllocInfo, this->impl->klinearizationDescriptorSets.data()));
-
-	// Update k-linearization descriptor sets
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> klinearDescriptorWrites(3);
-
-		// Binding 0: Input buffer (FFT buffer)
-		VkDescriptorBufferInfo klinearInputInfo = {};
-		klinearInputInfo.buffer = this->impl->deviceFftBuffer;
-		klinearInputInfo.offset = 0;
-		klinearInputInfo.range = VK_WHOLE_SIZE;
-
-		klinearDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearDescriptorWrites[0].dstSet = this->impl->klinearizationDescriptorSets[i];
-		klinearDescriptorWrites[0].dstBinding = 0;
-		klinearDescriptorWrites[0].dstArrayElement = 0;
-		klinearDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearDescriptorWrites[0].descriptorCount = 1;
-		klinearDescriptorWrites[0].pBufferInfo = &klinearInputInfo;
-
-		// Binding 1: Resample curve buffer
-		VkDescriptorBufferInfo resampleCurveInfo = {};
-		resampleCurveInfo.buffer = this->impl->resampleCurveBuffer;
-		resampleCurveInfo.offset = 0;
-		resampleCurveInfo.range = VK_WHOLE_SIZE;
-
-		klinearDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearDescriptorWrites[1].dstSet = this->impl->klinearizationDescriptorSets[i];
-		klinearDescriptorWrites[1].dstBinding = 1;
-		klinearDescriptorWrites[1].dstArrayElement = 0;
-		klinearDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearDescriptorWrites[1].descriptorCount = 1;
-		klinearDescriptorWrites[1].pBufferInfo = &resampleCurveInfo;
-
-		// Binding 2: Output buffer (Intermediate buffer)
-		VkDescriptorBufferInfo klinearOutputInfo = {};
-		klinearOutputInfo.buffer = this->impl->deviceIntermediateBuffer;
-		klinearOutputInfo.offset = 0;
-		klinearOutputInfo.range = VK_WHOLE_SIZE;
-
-		klinearDescriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		klinearDescriptorWrites[2].dstSet = this->impl->klinearizationDescriptorSets[i];
-		klinearDescriptorWrites[2].dstBinding = 2;
-		klinearDescriptorWrites[2].dstArrayElement = 0;
-		klinearDescriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		klinearDescriptorWrites[2].descriptorCount = 1;
-		klinearDescriptorWrites[2].pBufferInfo = &klinearOutputInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(klinearDescriptorWrites.size()), klinearDescriptorWrites.data(), 0, nullptr);
-	}
-
-	// ============================================
-	// Create Dispersion Compensation Shader Pipeline
-	// ============================================
-
-	// Create descriptor set layout for dispersion compensation (3 storage buffers: input, phase complex, output)
-	std::vector<VkDescriptorSetLayoutBinding> dispersionBindings(3);
-
-	// Binding 0: Input buffer (complex data)
-	dispersionBindings[0].binding = 0;
-	dispersionBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	dispersionBindings[0].descriptorCount = 1;
-	dispersionBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	dispersionBindings[0].pImmutableSamplers = nullptr;
-
-	// Binding 1: Phase complex buffer
-	dispersionBindings[1].binding = 1;
-	dispersionBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	dispersionBindings[1].descriptorCount = 1;
-	dispersionBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	dispersionBindings[1].pImmutableSamplers = nullptr;
-
-	// Binding 2: Output buffer (dispersion compensated complex data)
-	dispersionBindings[2].binding = 2;
-	dispersionBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	dispersionBindings[2].descriptorCount = 1;
-	dispersionBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	dispersionBindings[2].pImmutableSamplers = nullptr;
-
-	VkDescriptorSetLayoutCreateInfo dispersionLayoutInfo = {};
-	dispersionLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	dispersionLayoutInfo.bindingCount = static_cast<uint32_t>(dispersionBindings.size());
-	dispersionLayoutInfo.pBindings = dispersionBindings.data();
-
-	checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &dispersionLayoutInfo, nullptr, &this->impl->dispersionDescriptorSetLayout));
-
-	// Create pipeline layout for dispersion compensation
-	VkPushConstantRange dispersionPushConstantRange = {};
-	dispersionPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	dispersionPushConstantRange.offset = 0;
-	dispersionPushConstantRange.size = sizeof(uint32_t) * 2;  // signalLength, samplesPerBuffer
-
-	VkPipelineLayoutCreateInfo dispersionPipelineLayoutInfo = {};
-	dispersionPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	dispersionPipelineLayoutInfo.setLayoutCount = 1;
-	dispersionPipelineLayoutInfo.pSetLayouts = &this->impl->dispersionDescriptorSetLayout;
-	dispersionPipelineLayoutInfo.pushConstantRangeCount = 1;
-	dispersionPipelineLayoutInfo.pPushConstantRanges = &dispersionPushConstantRange;
-
-	checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &dispersionPipelineLayoutInfo, nullptr, &this->impl->dispersionPipelineLayout));
-
-	// Load and compile dispersion compensation shader
-	std::string dispersionShaderPath = "src/backends/vulkan/shaders/dispersion.comp";
-	std::string dispersionShaderSource = loadShaderSource(dispersionShaderPath);
-	std::vector<uint32_t> dispersionSPIRV = compileGLSLToSPIRV(dispersionShaderSource, dispersionShaderPath, shaderc_compute_shader);
-
-	VkShaderModule dispersionShader = createShaderModule(this->impl->device, dispersionSPIRV);
-	this->impl->shaderModules.push_back(dispersionShader);
-
-	// Create dispersion compensation compute pipeline
-	VkPipelineShaderStageCreateInfo dispersionShaderStageInfo = {};
-	dispersionShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	dispersionShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	dispersionShaderStageInfo.module = dispersionShader;
-	dispersionShaderStageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo dispersionPipelineInfo = {};
-	dispersionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	dispersionPipelineInfo.stage = dispersionShaderStageInfo;
-	dispersionPipelineInfo.layout = this->impl->dispersionPipelineLayout;
-
-	VkPipeline dispersionPipeline;
-	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &dispersionPipelineInfo, nullptr, &dispersionPipeline));
-	this->impl->computePipelines.push_back(dispersionPipeline);
-
-	// Allocate and Update Dispersion Descriptor Sets
-	std::vector<VkDescriptorSetLayout> dispersionLayouts(this->impl->numCommandBuffers, this->impl->dispersionDescriptorSetLayout);
-
-	VkDescriptorSetAllocateInfo dispersionAllocInfo = {};
-	dispersionAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	dispersionAllocInfo.descriptorPool = this->impl->descriptorPool;
-	dispersionAllocInfo.descriptorSetCount = static_cast<uint32_t>(this->impl->numCommandBuffers);
-	dispersionAllocInfo.pSetLayouts = dispersionLayouts.data();
-
-	this->impl->dispersionDescriptorSets.resize(this->impl->numCommandBuffers);
-	checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &dispersionAllocInfo, this->impl->dispersionDescriptorSets.data()));
-
-	// Update dispersion descriptor sets
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		std::vector<VkWriteDescriptorSet> dispersionDescriptorWrites(3);
-
-		// Binding 0: Input buffer (FFT buffer - from k-linearization or windowing)
-		VkDescriptorBufferInfo dispersionInputInfo = {};
-		dispersionInputInfo.buffer = this->impl->deviceFftBuffer;
-		dispersionInputInfo.offset = 0;
-		dispersionInputInfo.range = VK_WHOLE_SIZE;
-
-		dispersionDescriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		dispersionDescriptorWrites[0].dstSet = this->impl->dispersionDescriptorSets[i];
-		dispersionDescriptorWrites[0].dstBinding = 0;
-		dispersionDescriptorWrites[0].dstArrayElement = 0;
-		dispersionDescriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		dispersionDescriptorWrites[0].descriptorCount = 1;
-		dispersionDescriptorWrites[0].pBufferInfo = &dispersionInputInfo;
-
-		// Binding 1: Phase complex buffer (dispersion curve)
-		VkDescriptorBufferInfo phaseComplexInfo = {};
-		phaseComplexInfo.buffer = this->impl->dispersionCurveBuffer;
-		phaseComplexInfo.offset = 0;
-		phaseComplexInfo.range = VK_WHOLE_SIZE;
-
-		dispersionDescriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		dispersionDescriptorWrites[1].dstSet = this->impl->dispersionDescriptorSets[i];
-		dispersionDescriptorWrites[1].dstBinding = 1;
-		dispersionDescriptorWrites[1].dstArrayElement = 0;
-		dispersionDescriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		dispersionDescriptorWrites[1].descriptorCount = 1;
-		dispersionDescriptorWrites[1].pBufferInfo = &phaseComplexInfo;
-
-		// Binding 2: Output buffer (Intermediate buffer)
-		VkDescriptorBufferInfo dispersionOutputInfo = {};
-		dispersionOutputInfo.buffer = this->impl->deviceIntermediateBuffer;
-		dispersionOutputInfo.offset = 0;
-		dispersionOutputInfo.range = VK_WHOLE_SIZE;
-
-		dispersionDescriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		dispersionDescriptorWrites[2].dstSet = this->impl->dispersionDescriptorSets[i];
-		dispersionDescriptorWrites[2].dstBinding = 2;
-		dispersionDescriptorWrites[2].dstArrayElement = 0;
-		dispersionDescriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		dispersionDescriptorWrites[2].descriptorCount = 1;
-		dispersionDescriptorWrites[2].pBufferInfo = &dispersionOutputInfo;
-
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(dispersionDescriptorWrites.size()), dispersionDescriptorWrites.data(), 0, nullptr);
 	}
 
 	// ============================================
@@ -4614,17 +3582,6 @@ void VulkanBackend::destroyComputePipelines() {
 		this->impl->pipelineLayout = VK_NULL_HANDLE;
 	}
 
-	// Destroy windowing pipeline resources
-	if (this->impl->windowingDescriptorSetLayout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->windowingDescriptorSetLayout, nullptr);
-		this->impl->windowingDescriptorSetLayout = VK_NULL_HANDLE;
-	}
-
-	if (this->impl->windowingPipelineLayout != VK_NULL_HANDLE) {
-		vkDestroyPipelineLayout(this->impl->device, this->impl->windowingPipelineLayout, nullptr);
-		this->impl->windowingPipelineLayout = VK_NULL_HANDLE;
-	}
-
 	// Destroy DC removal pipeline resources
 	if (this->impl->dcRemovalDescriptorSetLayout != VK_NULL_HANDLE) {
 		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->dcRemovalDescriptorSetLayout, nullptr);
@@ -4634,28 +3591,6 @@ void VulkanBackend::destroyComputePipelines() {
 	if (this->impl->dcRemovalPipelineLayout != VK_NULL_HANDLE) {
 		vkDestroyPipelineLayout(this->impl->device, this->impl->dcRemovalPipelineLayout, nullptr);
 		this->impl->dcRemovalPipelineLayout = VK_NULL_HANDLE;
-	}
-
-	// Destroy K-linearization pipeline resources
-	if (this->impl->klinearizationDescriptorSetLayout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->klinearizationDescriptorSetLayout, nullptr);
-		this->impl->klinearizationDescriptorSetLayout = VK_NULL_HANDLE;
-	}
-
-	if (this->impl->klinearizationPipelineLayout != VK_NULL_HANDLE) {
-		vkDestroyPipelineLayout(this->impl->device, this->impl->klinearizationPipelineLayout, nullptr);
-		this->impl->klinearizationPipelineLayout = VK_NULL_HANDLE;
-	}
-
-	// Destroy dispersion compensation pipeline resources
-	if (this->impl->dispersionDescriptorSetLayout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(this->impl->device, this->impl->dispersionDescriptorSetLayout, nullptr);
-		this->impl->dispersionDescriptorSetLayout = VK_NULL_HANDLE;
-	}
-
-	if (this->impl->dispersionPipelineLayout != VK_NULL_HANDLE) {
-		vkDestroyPipelineLayout(this->impl->device, this->impl->dispersionPipelineLayout, nullptr);
-		this->impl->dispersionPipelineLayout = VK_NULL_HANDLE;
 	}
 
 	// Destroy FPN determination pipeline resources
