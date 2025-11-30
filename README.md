@@ -12,6 +12,9 @@ Preliminary results: [Performance Benchmark](documentation/developer/PERFORMANCE
 - **FFTW3** (optional, for CPU backend)
 - **OpenCL** (optional, for OpenCL backend)
 	- VkFFT
+- **Vulkan SDK** (optional, for Vulkan backend)
+	- Windows: Download from [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
+	- VkFFT (auto-downloaded if enabled)
 - **Python** ≥ 3.8 (optional, for Python bindings)
 	- pybind11, NumPy
 - **C++ Compiler**
@@ -57,6 +60,7 @@ Here is a list of all available build options:
 | `BUILD_CUDA` | `ON` | Build with CUDA backend support |
 | `BUILD_CPU` | `ON` | Build with CPU backend (requires FFTW3) |
 | `BUILD_OPENCL` | `ON` | Build with OpenCL backend (requires VkFFT) |
+| `BUILD_VULKAN` | `ON` | Build with Vulkan backend (requires Vulkan SDK, VkFFT) |
 | `BUILD_PYTHON` | `OFF` | Build Python bindings (requires pybind11, NumPy) |
 | `BUILD_TESTS` | `ON` | Build test suite |
 | `BUILD_EXAMPLES` | `ON` | Build example applications |
@@ -65,7 +69,7 @@ Here is a list of all available build options:
 | `FFTW3_AUTO_DOWNLOAD` | `ON` | Auto-download FFTW3 if not found (Windows only) |
 | `VKFFT_AUTO_DOWNLOAD` | `ON` | Auto-download VkFFT if not found |
 
-**Note:** At least one backend (`BUILD_CUDA`, `BUILD_CPU`, or `BUILD_OPENCL`) must be enabled.
+**Note:** At least one backend (`BUILD_CUDA`, `BUILD_CPU`, `BUILD_OPENCL`, or `BUILD_VULKAN`) must be enabled.
 
 ### Linux / Jetson
 
@@ -108,7 +112,7 @@ python run_all_tests.py
 #include <iostream>
 
 int main() {
-    // Create processor
+    // Create processor (VULKAN, CUDA, CPU, or OPENCL)
     ope::Processor processor(ope::Backend::CUDA);
     
     // Configure
@@ -142,7 +146,7 @@ int main() {
 import octproengine as ope
 import numpy as np
 
-# Create processor
+# Create processor (VULKAN, CUDA, CPU, or OPENCL)
 proc = ope.Processor(ope.Backend.CUDA)
 
 # Configure
