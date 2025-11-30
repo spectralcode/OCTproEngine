@@ -33,6 +33,7 @@ if not is_aarch64:
     BENCHMARK_CPU = True
     BENCHMARK_CUDA = True
     BENCHMARK_OPENCL = True
+    BENCHMARK_VULKAN = True
 
     SIGNAL_LENGTHS = [512, 1024, 2048, 4096]
     ASCANS_PER_BSCAN = [256, 512, 1024, 2048]
@@ -45,6 +46,7 @@ else:
     BENCHMARK_CPU = False
     BENCHMARK_CUDA = True
     BENCHMARK_OPENCL = False
+    BENCHMARK_VULKAN = False
 
     SIGNAL_LENGTHS = [512, 1024, 2048]
     ASCANS_PER_BSCAN = [256, 512, 1024]
@@ -55,7 +57,7 @@ else:
 ENABLE_RESAMPLING = True
 ENABLE_WINDOWING = True
 ENABLE_DISPERSION = True
-ENABLE_BACKGROUND_REMOVAL = True
+ENABLE_DC_REMOVAL = True
 ENABLE_LOG_SCALING = True
 ENABLE_BSCAN_FLIP = False
 
@@ -170,7 +172,7 @@ def configure_processor(processor, signal_length, ascans_per_bscan, bscans_per_b
             DISPERSION_FACTOR
         )
     
-    processor.enable_background_removal(ENABLE_BACKGROUND_REMOVAL)
+    processor.enable_background_removal(ENABLE_DC_REMOVAL)
     processor.enable_log_scaling(ENABLE_LOG_SCALING)
     processor.set_grayscale_range(GRAYSCALE_MIN, GRAYSCALE_MAX)
     processor.enable_bscan_flip(ENABLE_BSCAN_FLIP)
@@ -199,7 +201,8 @@ def run_benchmark(backend, signal_length, ascans_per_bscan, bscans_per_buffer, t
     result.ascans_per_bscan = ascans_per_bscan
     result.bscans_per_buffer = bscans_per_buffer
     result.backend = ("CPU" if backend == ope.Backend.CPU else
-                     "CUDA" if backend == ope.Backend.CUDA else "OpenCL")
+                     "CUDA" if backend == ope.Backend.CUDA else
+                     "Vulkan" if backend == ope.Backend.VULKAN else "OpenCL")
     result.iterations = ITERATIONS
     
     try:
@@ -336,7 +339,7 @@ def print_configuration():
         enabled.append("Windowing")
     if ENABLE_DISPERSION:
         enabled.append("Dispersion")
-    if ENABLE_BACKGROUND_REMOVAL:
+    if ENABLE_DC_REMOVAL:
         enabled.append("BG-Removal")
     if ENABLE_LOG_SCALING:
         enabled.append("Log-Scale")
@@ -350,6 +353,8 @@ def print_configuration():
         print("CUDA ", end="")
     if BENCHMARK_OPENCL:
         print("OpenCL ", end="")
+    if BENCHMARK_VULKAN:
+        print("Vulkan ", end="")
     print()
     print()
 
@@ -372,7 +377,7 @@ def main():
         all_results = []
 
         # Calculate total number of tests
-        num_backends = (1 if BENCHMARK_CPU else 0) + (1 if BENCHMARK_CUDA else 0) + (1 if BENCHMARK_OPENCL else 0)
+        num_backends = (1 if BENCHMARK_CPU else 0) + (1 if BENCHMARK_CUDA else 0) + (1 if BENCHMARK_OPENCL else 0) + (1 if BENCHMARK_VULKAN else 0)
         total_tests = len(SIGNAL_LENGTHS) * len(ASCANS_PER_BSCAN) * len(BSCANS_PER_BUFFER) * num_backends
         current_test = 0
         
@@ -387,7 +392,8 @@ def main():
                     cpu_result = None
                     cuda_result = None
                     opencl_result = None
-                    
+                    vulkan_result = None
+
                     # Benchmark CPU
                     if BENCHMARK_CPU:
                         current_test += 1
@@ -444,6 +450,29 @@ def main():
                             print(f"{opencl_result.avg_time_ms:.3f} ms", end="")
                             if cpu_result:
                                 print(f" (speedup: {opencl_result.speedup:.2f}x)")
+                            else:
+                                print()
+                        else:
+                            print("FAILED")
+
+                    # Benchmark Vulkan
+                    if BENCHMARK_VULKAN:
+                        current_test += 1
+                        print(f"[{current_test}/{total_tests}] Testing Vulkan: "
+                              f"{signal_length}x{ascans_per_bscan}x{bscans_per_buffer} ... ", end="", flush=True)
+
+                        vulkan_result = run_benchmark(ope.Backend.VULKAN, signal_length,
+                                                     ascans_per_bscan, bscans_per_buffer, test_data)
+
+                        if vulkan_result:
+                            # Calculate speedup if we have CPU result
+                            if cpu_result:
+                                vulkan_result.speedup = cpu_result.avg_time_ms / vulkan_result.avg_time_ms
+
+                            all_results.append(vulkan_result)
+                            print(f"{vulkan_result.avg_time_ms:.3f} ms", end="")
+                            if cpu_result:
+                                print(f" (speedup: {vulkan_result.speedup:.2f}x)")
                             else:
                                 print()
                         else:
