@@ -120,6 +120,14 @@ struct VulkanBackend::Impl {
 	VkQueue computeQueue = VK_NULL_HANDLE;
 	uint32_t queueFamilyIndex = 0;
 
+	// Transfer queue (for async GPU transfers)
+	VkQueue transferQueue = VK_NULL_HANDLE;
+	uint32_t transferQueueFamilyIndex = 0;
+	VkCommandPool transferCommandPool = VK_NULL_HANDLE;
+	std::vector<VkCommandBuffer> transferCommandBuffers;
+	bool useSeparateTransferQueue = false;
+	std::vector<VkSemaphore> transferToComputeSemaphores;  // Signal from transfer, wait on compute
+
 	// Command buffers and synchronization
 	VkCommandPool commandPool = VK_NULL_HANDLE;
 	std::vector<VkCommandBuffer> commandBuffers;
@@ -346,6 +354,56 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	// Loop through and record ALL command buffers (not just current frame's buffer)
 	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
+		// ============================================
+		// Record Transfer Command Buffer (Input Transfer)
+		// ============================================
+
+		VkCommandBuffer transferCmd = this->transferCommandBuffers[idx];
+
+		VkCommandBufferBeginInfo transferBeginInfo = {};
+		transferBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		transferBeginInfo.flags = 0;  // Reusable command buffer
+
+		checkVulkanErrors(vkBeginCommandBuffer(transferCmd, &transferBeginInfo));
+
+		// Copy from staging to device buffer
+		VkBufferCopy copyRegion = {};
+		copyRegion.size = inputSize;
+		vkCmdCopyBuffer(transferCmd, this->stagingInputBuffers[idx], this->deviceInputBuffers[idx], 1, &copyRegion);
+
+		// Release barrier (transfer queue releases ownership to compute queue)
+		VkBufferMemoryBarrier releaseBarrier = {};
+		releaseBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		releaseBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		releaseBarrier.dstAccessMask = 0;  // No access on transfer queue side
+		releaseBarrier.buffer = this->deviceInputBuffers[idx];
+		releaseBarrier.offset = 0;
+		releaseBarrier.size = inputSize;
+
+		if (this->useSeparateTransferQueue) {
+			// Queue family ownership transfer
+			releaseBarrier.srcQueueFamilyIndex = this->transferQueueFamilyIndex;
+			releaseBarrier.dstQueueFamilyIndex = this->queueFamilyIndex;
+		} else {
+			// Same queue, no ownership transfer
+			releaseBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			releaseBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		}
+
+		vkCmdPipelineBarrier(transferCmd,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &releaseBarrier,
+		                     0, nullptr);
+
+		checkVulkanErrors(vkEndCommandBuffer(transferCmd));
+
+		// ============================================
+		// Record Compute Command Buffer (All Compute + Output Transfer)
+		// ============================================
+
 		VkCommandBuffer cmd = this->commandBuffers[idx];
 
 		VkCommandBufferBeginInfo beginInfo = {};
@@ -354,29 +412,32 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 		checkVulkanErrors(vkBeginCommandBuffer(cmd, &beginInfo));
 
-	// Copy from staging to device buffer
-	VkBufferCopy copyRegion = {};
-	copyRegion.size = inputSize;
-	vkCmdCopyBuffer(cmd, this->stagingInputBuffers[idx], this->deviceInputBuffers[idx], 1, &copyRegion);
+		// Acquire barrier (compute queue acquires ownership from transfer queue)
+		VkBufferMemoryBarrier acquireBarrier = {};
+		acquireBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		acquireBarrier.srcAccessMask = 0;  // No access on compute queue side yet
+		acquireBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		acquireBarrier.buffer = this->deviceInputBuffers[idx];
+		acquireBarrier.offset = 0;
+		acquireBarrier.size = inputSize;
 
-	// Add memory barrier (ensure copy completes before any compute operations)
-	VkBufferMemoryBarrier barrier = {};
-	barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer = this->deviceInputBuffers[idx];
-	barrier.offset = 0;
-	barrier.size = inputSize;
+		if (this->useSeparateTransferQueue) {
+			// Queue family ownership transfer
+			acquireBarrier.srcQueueFamilyIndex = this->transferQueueFamilyIndex;
+			acquireBarrier.dstQueueFamilyIndex = this->queueFamilyIndex;
+		} else {
+			// Same queue, no ownership transfer
+			acquireBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			acquireBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		}
 
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &barrier,
-	                     0, nullptr);
+		vkCmdPipelineBarrier(cmd,
+		                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &acquireBarrier,
+		                     0, nullptr);
 
 	// ============================================
 	// Dispatch Input Conversion Shader
@@ -985,33 +1046,71 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 
 	this->impl->physicalDevice = physicalDevices[this->impl->deviceId];
 
-	// Find compute queue family
+	// Find compute and transfer queue families
 	uint32_t queueFamilyCount = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(this->impl->physicalDevice, &queueFamilyCount, nullptr);
 
 	std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
 	vkGetPhysicalDeviceQueueFamilyProperties(this->impl->physicalDevice, &queueFamilyCount, queueFamilies.data());
 
-	bool foundQueue = false;
+	uint32_t computeFamily = UINT32_MAX;
+	uint32_t transferFamily = UINT32_MAX;
+
+	// Look for dedicated transfer queue (TRANSFER but not COMPUTE/GRAPHICS)
+	// This is rare but exists on some GPUs (e.g., NVIDIA has dedicated DMA queue)
 	for (uint32_t i = 0; i < queueFamilyCount; i++) {
-		if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-			this->impl->queueFamilyIndex = i;
-			foundQueue = true;
-			break;
+		VkQueueFlags flags = queueFamilies[i].queueFlags;
+
+		if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+			!(flags & VK_QUEUE_COMPUTE_BIT) &&
+			!(flags & VK_QUEUE_GRAPHICS_BIT)) {
+			transferFamily = i;
+		}
+
+		if (flags & VK_QUEUE_COMPUTE_BIT) {
+			computeFamily = i;
 		}
 	}
 
-	if (!foundQueue) {
+	if (computeFamily == UINT32_MAX) {
 		throw std::runtime_error("No compute queue family found");
 	}
 
+	// Fallback: use compute queue for transfers if no dedicated queue
+	this->impl->queueFamilyIndex = computeFamily;
+	this->impl->transferQueueFamilyIndex = (transferFamily != UINT32_MAX) ? transferFamily : computeFamily;
+	this->impl->useSeparateTransferQueue = (transferFamily != UINT32_MAX);
+
+	// For debug/info purposes
+	//std::cout << "Queue families: Compute=" << computeFamily;
+	//if (this->impl->useSeparateTransferQueue) {
+	//	std::cout << ", Dedicated Transfer=" << transferFamily << " (async GPU transfers enabled!)";
+	//} else {
+	//	std::cout << ", Transfer=" << this->impl->transferQueueFamilyIndex << " (shared with compute)";
+	//}
+	//std::cout << std::endl;
+
 	// Create logical device
-	float queuePriority = 1.0f;
-	VkDeviceQueueCreateInfo queueCreateInfo = {};
-	queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-	queueCreateInfo.queueFamilyIndex = this->impl->queueFamilyIndex;
-	queueCreateInfo.queueCount = 1;
-	queueCreateInfo.pQueuePriorities = &queuePriority;
+	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+	std::vector<float> queuePriorities = {1.0f};
+
+	// Compute queue
+	VkDeviceQueueCreateInfo computeQueueInfo = {};
+	computeQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+	computeQueueInfo.queueFamilyIndex = this->impl->queueFamilyIndex;
+	computeQueueInfo.queueCount = 1;
+	computeQueueInfo.pQueuePriorities = queuePriorities.data();
+	queueCreateInfos.push_back(computeQueueInfo);
+
+	// Transfer queue (if different family)
+	if (this->impl->useSeparateTransferQueue) {
+		VkDeviceQueueCreateInfo transferQueueInfo = {};
+		transferQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+		transferQueueInfo.queueFamilyIndex = this->impl->transferQueueFamilyIndex;
+		transferQueueInfo.queueCount = 1;
+		transferQueueInfo.pQueuePriorities = queuePriorities.data();
+		queueCreateInfos.push_back(transferQueueInfo);
+	}
 
 	// Query device features and enable what we need
 	VkPhysicalDeviceFeatures deviceFeatures = {};
@@ -1019,22 +1118,31 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 
 	VkDeviceCreateInfo deviceCreateInfo = {};
 	deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-	deviceCreateInfo.queueCreateInfoCount = 1;
-	deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+	deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+	deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
 	deviceCreateInfo.pEnabledFeatures = &deviceFeatures;
 
 	checkVulkanErrors(vkCreateDevice(this->impl->physicalDevice, &deviceCreateInfo, nullptr, &this->impl->device));
 
-	// Get compute queue
+	// Get compute and transfer queues
 	vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 0, &this->impl->computeQueue);
+	vkGetDeviceQueue(this->impl->device, this->impl->transferQueueFamilyIndex, 0, &this->impl->transferQueue);
 
-	// Create command pool
+	// Create compute command pool
 	VkCommandPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 	poolInfo.queueFamilyIndex = this->impl->queueFamilyIndex;
 	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
 	checkVulkanErrors(vkCreateCommandPool(this->impl->device, &poolInfo, nullptr, &this->impl->commandPool));
+
+	// Create transfer command pool
+	VkCommandPoolCreateInfo transferPoolInfo = {};
+	transferPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	transferPoolInfo.queueFamilyIndex = this->impl->transferQueueFamilyIndex;
+	transferPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+
+	checkVulkanErrors(vkCreateCommandPool(this->impl->device, &transferPoolInfo, nullptr, &this->impl->transferCommandPool));
 
 	// Allocate buffers
 	this->allocateDeviceBuffers();
@@ -1231,10 +1339,16 @@ void VulkanBackend::cleanup() {
 		this->impl->freeBuffersQueue.pop();
 	}
 
-	// Destroy command pool
+	// Destroy compute command pool
 	if (this->impl->commandPool != VK_NULL_HANDLE) {
 		vkDestroyCommandPool(this->impl->device, this->impl->commandPool, nullptr);
 		this->impl->commandPool = VK_NULL_HANDLE;
+	}
+
+	// Destroy transfer command pool
+	if (this->impl->transferCommandPool != VK_NULL_HANDLE) {
+		vkDestroyCommandPool(this->impl->device, this->impl->transferCommandPool, nullptr);
+		this->impl->transferCommandPool = VK_NULL_HANDLE;
 	}
 
 	// Destroy device
@@ -1301,13 +1415,36 @@ void VulkanBackend::process(IOBuffer& input) {
 	}
 
 	int outputSignalLength = this->impl->signalLength / 2;
-	// Submit pre-recorded command buffer
-	VkSubmitInfo submitInfo = {};
-	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submitInfo.commandBufferCount = 1;
-	submitInfo.pCommandBuffers = &cmd;
 
-	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, fence));
+	// ============================================
+	// Submit Transfer and Compute Command Buffers
+	// ============================================
+
+	// Submit transfer command buffer first (signals semaphore when complete)
+	VkCommandBuffer transferCmd = this->impl->transferCommandBuffers[idx];
+	VkSemaphore transferCompleteSemaphore = this->impl->transferToComputeSemaphores[idx];
+
+	VkSubmitInfo transferSubmit = {};
+	transferSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	transferSubmit.commandBufferCount = 1;
+	transferSubmit.pCommandBuffers = &transferCmd;
+	transferSubmit.signalSemaphoreCount = 1;
+	transferSubmit.pSignalSemaphores = &transferCompleteSemaphore;
+
+	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
+
+	// Submit compute command buffer (waits for transfer semaphore, signals fence when complete)
+	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+	VkSubmitInfo computeSubmit = {};
+	computeSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	computeSubmit.commandBufferCount = 1;
+	computeSubmit.pCommandBuffers = &cmd;
+	computeSubmit.waitSemaphoreCount = 1;
+	computeSubmit.pWaitSemaphores = &transferCompleteSemaphore;
+	computeSubmit.pWaitDstStageMask = &waitStage;
+
+	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, fence));
 
 	// Queue work for async completion (completion thread will wait for fence and invoke callback)
 	// This enables true async overlap: process() returns immediately, allowing next frame to start
@@ -2217,7 +2354,7 @@ void VulkanBackend::releaseDeviceBuffers() {
 }
 
 void VulkanBackend::createCommandBuffersAndFences() {
-	// Allocate command buffers
+	// Allocate compute command buffers
 	this->impl->commandBuffers.resize(this->impl->numCommandBuffers);
 
 	VkCommandBufferAllocateInfo allocInfo = {};
@@ -2227,6 +2364,17 @@ void VulkanBackend::createCommandBuffersAndFences() {
 	allocInfo.commandBufferCount = this->impl->numCommandBuffers;
 
 	checkVulkanErrors(vkAllocateCommandBuffers(this->impl->device, &allocInfo, this->impl->commandBuffers.data()));
+
+	// Allocate transfer command buffers
+	this->impl->transferCommandBuffers.resize(this->impl->numCommandBuffers);
+
+	VkCommandBufferAllocateInfo transferAllocInfo = {};
+	transferAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	transferAllocInfo.commandPool = this->impl->transferCommandPool;
+	transferAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	transferAllocInfo.commandBufferCount = this->impl->numCommandBuffers;
+
+	checkVulkanErrors(vkAllocateCommandBuffers(this->impl->device, &transferAllocInfo, this->impl->transferCommandBuffers.data()));
 
 	// Create fences
 	this->impl->fences.resize(this->impl->numCommandBuffers);
@@ -2241,15 +2389,33 @@ void VulkanBackend::createCommandBuffersAndFences() {
 
 	// Create dedicated fence for VkFFT
 	checkVulkanErrors(vkCreateFence(this->impl->device, &fenceInfo, nullptr, &this->impl->fftFence));
+
+	// Create semaphores for transfer→compute synchronization
+	this->impl->transferToComputeSemaphores.resize(this->impl->numCommandBuffers);
+
+	VkSemaphoreCreateInfo semaphoreInfo = {};
+	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		checkVulkanErrors(vkCreateSemaphore(this->impl->device, &semaphoreInfo, nullptr, &this->impl->transferToComputeSemaphores[i]));
+	}
 }
 
 void VulkanBackend::destroyCommandBuffersAndFences() {
-	// Free command buffers (automatically freed when pool is destroyed)
+	// Free compute command buffers (automatically freed when pool is destroyed)
 	if (!this->impl->commandBuffers.empty() && this->impl->commandPool != VK_NULL_HANDLE) {
 		vkFreeCommandBuffers(this->impl->device, this->impl->commandPool,
 		                     static_cast<uint32_t>(this->impl->commandBuffers.size()),
 		                     this->impl->commandBuffers.data());
 		this->impl->commandBuffers.clear();
+	}
+
+	// Free transfer command buffers
+	if (!this->impl->transferCommandBuffers.empty() && this->impl->transferCommandPool != VK_NULL_HANDLE) {
+		vkFreeCommandBuffers(this->impl->device, this->impl->transferCommandPool,
+		                     static_cast<uint32_t>(this->impl->transferCommandBuffers.size()),
+		                     this->impl->transferCommandBuffers.data());
+		this->impl->transferCommandBuffers.clear();
 	}
 
 	// Destroy fences
@@ -2265,6 +2431,14 @@ void VulkanBackend::destroyCommandBuffersAndFences() {
 		vkDestroyFence(this->impl->device, this->impl->fftFence, nullptr);
 		this->impl->fftFence = VK_NULL_HANDLE;
 	}
+
+	// Destroy transfer→compute semaphores
+	for (auto& semaphore : this->impl->transferToComputeSemaphores) {
+		if (semaphore != VK_NULL_HANDLE) {
+			vkDestroySemaphore(this->impl->device, semaphore, nullptr);
+		}
+	}
+	this->impl->transferToComputeSemaphores.clear();
 }
 
 // ============================================
