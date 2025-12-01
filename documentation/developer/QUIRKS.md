@@ -41,3 +41,11 @@ My GPU switched to P5 in some cases which caused a huge decrease in performance.
 
 The Fix:  
 Open NVIDIA Control Panel, go to Manage 3D Settings -> Program Settings, add/select your application, and set the Power management mode to "Prefer maximum performance". With this my GPU switched to P2 during benchmarks. 
+
+
+## Jetson Orin Nano Performance Benchmark
+(2025-12-01)  
+Related to my prevous entry: To get consistent performance results on the Jetson Orin Nano, it is necessary to set the power mode to MAXN SUPER and to run `jetson_clocks` before executing the benchmarks.  
+See: 
+- [Nvidia developer forum](https://forums.developer.nvidia.com/t/what-is-the-advantage-of-using-jetson-clocks-sh-over-max-n-when-benchmarking-devboards/155162/6?utm_source=chatgpt.com)  
+- [Allied Vision Application Notes](https://cdn.alliedvision.com/fileadmin/content/documents/products/software/software/embedded/Optimizing-Performance-Jetson_appnote.pdf)
