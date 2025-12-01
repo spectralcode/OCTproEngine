@@ -7,3 +7,15 @@ todo: investigate
 
 2025-11-30
 vulkans dc-removal shader seems to be much slower than cudas equivalent kernel. with dc-removal disalbed, vulkan and cuda performance is comparable. with dc-removal enabled, vulkan is much slower.
+
+2025-12-01
+Profiling on Jetson Orin Nano:
+```bash
+nsys-ui
+```
+select target: ubuntu  
+Target application, command line with arguments: test_performance_benchmark   
+Working directory: /home/orinoct/projects/OCTproEngine/build/tests  
+Evironment variables, add: LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+```
+
