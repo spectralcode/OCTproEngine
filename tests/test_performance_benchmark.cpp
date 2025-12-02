@@ -15,8 +15,6 @@
 #include <thread>
 #include <sstream>
 #include <ctime>
-#include <sys/utsname.h>
-#include <unistd.h>
 
 // ============================================
 // CONFIGURE BENCHMARK HERE
@@ -92,6 +90,28 @@ const char* CSV_FILENAME = "benchmark_results.csv";
 // Helper Functions
 // ============================================
 
+std::string getPlatformDescription() {
+	if (BENCHMARK_CUDA) {
+		auto cudaDevices = ope::BackendUtils::getCudaDevices();
+		if (!cudaDevices.empty()) {
+			return cudaDevices.front().name;
+		}
+	}
+	if (BENCHMARK_OPENCL) {
+		auto openclDevices = ope::BackendUtils::getOpenCLDevices();
+		if (!openclDevices.empty()) {
+			return openclDevices.front().name;
+		}
+	}
+	if (BENCHMARK_VULKAN) {
+		auto vulkanDevices = ope::BackendUtils::getVulkanDevices();
+		if (!vulkanDevices.empty()) {
+			return vulkanDevices.front().name;
+		}
+	}
+	return BENCHMARK_CPU ? std::string("CPU") : std::string("Unknown");
+}
+
 // Get current timestamp in format YYYYMMDD_HHMMSSmmm (matching Recorder format)
 std::string getCurrentTimestamp() {
 	auto now = std::chrono::system_clock::now();
@@ -110,49 +130,6 @@ std::string getCurrentTimestamp() {
 	oss << std::setfill('0') << std::setw(3) << ms.count();
 	
 	return oss.str();
-}
-
-// Get platform/architecture information
-std::string getPlatform() {
-	struct utsname info;
-	if (uname(&info) == 0) {
-		return std::string(info.machine);
-	}
-	return "unknown";
-}
-
-// Get OS information
-std::string getOSInfo() {
-	struct utsname info;
-	if (uname(&info) == 0) {
-		return std::string(info.sysname) + " " + std::string(info.release);
-	}
-	return "unknown";
-}
-
-// Get CPU core count
-int getCPUCores() {
-#ifdef _WIN32
-	SYSTEM_INFO sysinfo;
-	GetSystemInfo(&sysinfo);
-	return sysinfo.dwNumberOfProcessors;
-#else
-	return sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-}
-
-// Get total RAM in GB
-double getTotalRAM() {
-#ifdef _WIN32
-	MEMORYSTATUSEX memInfo;
-	memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-	GlobalMemoryStatusEx(&memInfo);
-	return memInfo.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
-#else
-	long pages = sysconf(_SC_PHYS_PAGES);
-	long page_size = sysconf(_SC_PAGE_SIZE);
-	return (pages * page_size) / (1024.0 * 1024.0 * 1024.0);
-#endif
 }
 
 // Generate synthetic test data
@@ -424,7 +401,7 @@ void printResultsTable(const std::vector<BenchmarkResult>& results) {
 
 void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::string& timestamp) {
 	// Generate filename with timestamp prefix
-	std::string filename = timestamp + "_benchmark_results.csv";
+	std::string filename = timestamp + "_" + CSV_FILENAME;
 	
 	std::ofstream file(filename);
 	if (!file.is_open()) {
@@ -469,10 +446,7 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::stri
 	file << "# Benchmark Configuration" << emptyAfter1 << std::endl;
 	file << "Timestamp," << timestamp << emptyAfter2 << std::endl;
 	file << "OCTproEngine_Version," << OPE_VERSION_STRING << emptyAfter2 << std::endl;
-	file << "Platform," << getPlatform() << emptyAfter2 << std::endl;
-	file << "OS," << getOSInfo() << emptyAfter2 << std::endl;
-	file << "CPU_Cores," << getCPUCores() << emptyAfter2 << std::endl;
-	file << "Total_RAM_GB," << std::fixed << std::setprecision(1) << getTotalRAM() << emptyAfter2 << std::endl;
+	file << "Platform," << getPlatformDescription() << emptyAfter2 << std::endl;
 	file << "InputBitDepth," << inputBitDepth << emptyAfter2 << std::endl;
 	file << "OutputBitDepth," << outputBitDepth << emptyAfter2 << std::endl;
 	file << "Iterations," << ITERATIONS << emptyAfter2 << std::endl;
