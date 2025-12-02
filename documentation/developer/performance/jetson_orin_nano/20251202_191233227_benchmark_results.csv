@@ -16,7 +16,7 @@ DCRemoval,true, , , , , ,
 DCWindowSize,64, , , , , , 
 FPNRemoval,false, , , , , , 
 LogScaling,true, , , , , , 
-
+ , , , , , , ,
 # Benchmark Results, , , , , , , 
 Signal length,A-Scans/B-scan,B-Scans/Buffer,Backend,Time in ms,A-Scans/s,B-Scans/s,MB/s
 512,32,1,CUDA,0.373,85715.05,2678.60,83.71
