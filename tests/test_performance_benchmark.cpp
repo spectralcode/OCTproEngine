@@ -59,6 +59,7 @@ const bool ENABLE_DISPERSION = true;
 const bool ENABLE_DC_REMOVAL = true;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_FIXED_PATTERN_NOISE_REMOVAL = false;
+const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = true;
 
 
 const bool ENABLE_BSCAN_FLIP = false;
@@ -250,6 +251,14 @@ void configureProcessor(ope::Processor& processor, int signalLength, int ascansP
 	}
 
 	processor.enableFixedPatternNoiseRemoval(ENABLE_FIXED_PATTERN_NOISE_REMOVAL);
+	if (ENABLE_FIXED_PATTERN_NOISE_REMOVAL) {
+		processor.requestFixedPatternNoiseDetermination();
+	}
+
+	processor.enablePostProcessBackgroundSubtraction(ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION);
+	if (ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION) {
+		processor.requestPostProcessBackgroundRecording();
+	}
 	processor.enableLogScaling(ENABLE_LOG_SCALING);
 	processor.setGrayscaleRange(GRAYSCALE_MIN, GRAYSCALE_MAX);
 	processor.enableBscanFlip(ENABLE_BSCAN_FLIP);
@@ -432,6 +441,17 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::stri
 		}
 	}
 	
+	// Get actual input/output bit depths from processor configuration
+	// Create a temporary processor to get the configuration
+	ope::Processor tempProcessor(BENCHMARK_CUDA ? ope::Backend::CUDA : 
+	                              BENCHMARK_CPU ? ope::Backend::CPU :
+	                              BENCHMARK_OPENCL ? ope::Backend::OPENCL :
+	                              ope::Backend::VULKAN);
+	configureProcessor(tempProcessor, SIGNAL_LENGTHS[0], ASCANS_PER_BSCAN[0], BSCANS_PER_BUFFER[0]);
+	const auto& config = tempProcessor.getConfig();
+	int inputBitDepth = ope::getDataTypeBitDepth(config.dataParams.inputDataType);
+	int outputBitDepth = ope::getDataTypeBitDepth(config.dataParams.outputDataType);
+	
 	// Determine number of columns (base 8 + optional speedup)
 	int numCols = hasCPU ? 9 : 8;
 	std::string emptyColumns = ",";
@@ -447,8 +467,8 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::stri
 	file << "OS," << getOSInfo() << emptyColumns << std::endl;
 	file << "CPU_Cores," << getCPUCores() << emptyColumns << std::endl;
 	file << "Total_RAM_GB," << std::fixed << std::setprecision(1) << getTotalRAM() << emptyColumns << std::endl;
-	file << "InputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT16)) << emptyColumns << std::endl;
-	file << "OutputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT8)) << emptyColumns << std::endl;
+	file << "InputBitDepth," << inputBitDepth << emptyColumns << std::endl;
+	file << "OutputBitDepth," << outputBitDepth << emptyColumns << std::endl;
 	file << "Iterations," << ITERATIONS << emptyColumns << std::endl;
 	file << "Resampling," << (ENABLE_RESAMPLING ? "true" : "false") << emptyColumns << std::endl;
 	
@@ -465,6 +485,7 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::stri
 	file << "DC-Removal," << (ENABLE_DC_REMOVAL ? "true" : "false") << emptyColumns << std::endl;
 	file << "DC-WindowSize," << DC_REMOVAL_WINDOW_SIZE << emptyColumns << std::endl;
 	file << "FPN-Removal," << (ENABLE_FIXED_PATTERN_NOISE_REMOVAL ? "true" : "false") << emptyColumns << std::endl;
+	file << "PostProcessBackgroundSubtraction," << (ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION ? "true" : "false") << emptyColumns << std::endl;
 	file << "LogScaling," << (ENABLE_LOG_SCALING ? "true" : "false") << emptyColumns << std::endl;
 	file << emptyColumns << std::endl;
 	
@@ -509,6 +530,7 @@ void printConfiguration() {
 	if (ENABLE_DC_REMOVAL) enabled.push_back("DC-Removal");
 	if (ENABLE_LOG_SCALING) enabled.push_back("Log-Scale");
 	if (ENABLE_FIXED_PATTERN_NOISE_REMOVAL) enabled.push_back("FPN-Removal");
+	if (ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION) enabled.push_back("PostProcess-BG-Sub");
 	
 	for (size_t i = 0; i < enabled.size(); ++i) {
 		std::cout << enabled[i];
