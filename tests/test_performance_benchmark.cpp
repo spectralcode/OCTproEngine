@@ -49,7 +49,7 @@ const bool BENCHMARK_VULKAN = false;
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {32, 64, 128, 256, 512, 1024, 2048};
 const int BSCANS_PER_BUFFER[] = {1};
-const int ITERATIONS = 20000;
+const int ITERATIONS = 200;
 #endif
 
 // Processing configuration
@@ -432,18 +432,25 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::stri
 		}
 	}
 	
-	// Write configuration header
-	file << "# Benchmark Configuration" << std::endl;
-	file << "Timestamp," << timestamp << std::endl;
-	file << "OCTproEngine_Version," << OPE_VERSION_STRING << std::endl;
-	file << "Platform," << getPlatform() << std::endl;
-	file << "OS," << getOSInfo() << std::endl;
-	file << "CPU_Cores," << getCPUCores() << std::endl;
-	file << "Total_RAM_GB," << std::fixed << std::setprecision(1) << getTotalRAM() << std::endl;
-	file << "InputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT16)) << std::endl;
-	file << "OutputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT8)) << std::endl;
-	file << "Iterations," << ITERATIONS << std::endl;
-	file << "Resampling," << (ENABLE_RESAMPLING ? "true" : "false") << std::endl;
+	// Determine number of columns (base 8 + optional speedup)
+	int numCols = hasCPU ? 9 : 8;
+	std::string emptyColumns = ",";
+	for (int i = 1; i < numCols - 1; ++i) {
+		emptyColumns += " ,";
+	}
+	
+	// Write configuration header with matching column count
+	file << "# Benchmark Configuration" << emptyColumns << std::endl;
+	file << "Timestamp," << timestamp << emptyColumns << std::endl;
+	file << "OCTproEngine_Version," << OPE_VERSION_STRING << emptyColumns << std::endl;
+	file << "Platform," << getPlatform() << emptyColumns << std::endl;
+	file << "OS," << getOSInfo() << emptyColumns << std::endl;
+	file << "CPU_Cores," << getCPUCores() << emptyColumns << std::endl;
+	file << "Total_RAM_GB," << std::fixed << std::setprecision(1) << getTotalRAM() << emptyColumns << std::endl;
+	file << "InputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT16)) << emptyColumns << std::endl;
+	file << "OutputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT8)) << emptyColumns << std::endl;
+	file << "Iterations," << ITERATIONS << emptyColumns << std::endl;
+	file << "Resampling," << (ENABLE_RESAMPLING ? "true" : "false") << emptyColumns << std::endl;
 	
 	std::string interpMethod = "NONE";
 	if (ENABLE_RESAMPLING) {
@@ -451,18 +458,18 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::stri
 		else if (INTERPOLATION_METHOD == ope::InterpolationMethod::CUBIC) interpMethod = "CUBIC";
 		else if (INTERPOLATION_METHOD == ope::InterpolationMethod::LANCZOS) interpMethod = "LANCZOS";
 	}
-	file << "ResamplingMethod," << interpMethod << std::endl;
+	file << "ResamplingMethod," << interpMethod << emptyColumns << std::endl;
 	
-	file << "Windowing," << (ENABLE_WINDOWING ? "true" : "false") << std::endl;
-	file << "Dispersion," << (ENABLE_DISPERSION ? "true" : "false") << std::endl;
-	file << "DCRemoval," << (ENABLE_DC_REMOVAL ? "true" : "false") << std::endl;
-	file << "DCWindowSize," << DC_REMOVAL_WINDOW_SIZE << std::endl;
-	file << "FPNRemoval," << (ENABLE_FIXED_PATTERN_NOISE_REMOVAL ? "true" : "false") << std::endl;
-	file << "LogScaling," << (ENABLE_LOG_SCALING ? "true" : "false") << std::endl;
-	file << std::endl;
+	file << "Windowing," << (ENABLE_WINDOWING ? "true" : "false") << emptyColumns << std::endl;
+	file << "Dispersion," << (ENABLE_DISPERSION ? "true" : "false") << emptyColumns << std::endl;
+	file << "DC-Removal," << (ENABLE_DC_REMOVAL ? "true" : "false") << emptyColumns << std::endl;
+	file << "DC-WindowSize," << DC_REMOVAL_WINDOW_SIZE << emptyColumns << std::endl;
+	file << "FPN-Removal," << (ENABLE_FIXED_PATTERN_NOISE_REMOVAL ? "true" : "false") << emptyColumns << std::endl;
+	file << "LogScaling," << (ENABLE_LOG_SCALING ? "true" : "false") << emptyColumns << std::endl;
+	file << emptyColumns << std::endl;
 	
 	// Write results header
-	file << "# Benchmark Results" << std::endl;
+	file << "# Benchmark Results" << emptyColumns << std::endl;
 	file << "Signal length,A-Scans/B-scan,B-Scans/Buffer,Backend,Time in ms,A-Scans/s,B-Scans/s,MB/s";
 	if (hasCPU) {
 		file << ",Speedup";
