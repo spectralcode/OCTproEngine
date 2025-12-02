@@ -49,7 +49,7 @@ const bool BENCHMARK_VULKAN = false;
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {32, 64, 128, 256, 512, 1024, 2048};
 const int BSCANS_PER_BUFFER[] = {1};
-const int ITERATIONS = 200;
+const int ITERATIONS = 20000;
 #endif
 
 // Processing configuration
@@ -59,7 +59,7 @@ const bool ENABLE_DISPERSION = true;
 const bool ENABLE_DC_REMOVAL = true;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_FIXED_PATTERN_NOISE_REMOVAL = false;
-const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = true;
+const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = false;
 
 
 const bool ENABLE_BSCAN_FLIP = false;
