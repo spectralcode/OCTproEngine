@@ -2,6 +2,7 @@
 #include "../include/processorconfiguration.h"
 #include "../include/types.h"
 #include "../include/iobuffer.h"
+#include "../include/version.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -13,6 +14,9 @@
 #include <atomic>
 #include <thread>
 #include <sstream>
+#include <ctime>
+#include <sys/utsname.h>
+#include <unistd.h>
 
 // ============================================
 // CONFIGURE BENCHMARK HERE
@@ -43,9 +47,9 @@ const bool BENCHMARK_OPENCL = false;
 const bool BENCHMARK_VULKAN = false;
 
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
-const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
+const int ASCANS_PER_BSCAN[] = {32, 64, 128, 256, 512, 1024, 2048};
 const int BSCANS_PER_BUFFER[] = {1};
-const int ITERATIONS = 2000;
+const int ITERATIONS = 20000;
 #endif
 
 // Processing configuration
@@ -54,7 +58,7 @@ const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
 const bool ENABLE_DC_REMOVAL = true;
 const bool ENABLE_LOG_SCALING = true;
-const bool ENABLE_FIXED_PATTERN_NOISE_REMOVAL = true;
+const bool ENABLE_FIXED_PATTERN_NOISE_REMOVAL = false;
 
 
 const bool ENABLE_BSCAN_FLIP = false;
@@ -86,6 +90,69 @@ const char* CSV_FILENAME = "benchmark_results.csv";
 // ============================================
 // Helper Functions
 // ============================================
+
+// Get current timestamp in format YYYYMMDD_HHMMSSmmm (matching Recorder format)
+std::string getCurrentTimestamp() {
+	auto now = std::chrono::system_clock::now();
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+	auto timer = std::chrono::system_clock::to_time_t(now);
+	
+	std::tm bt;
+#ifdef _WIN32
+	localtime_s(&bt, &timer);
+#else
+	localtime_r(&timer, &bt);
+#endif
+	
+	std::ostringstream oss;
+	oss << std::put_time(&bt, "%Y%m%d_%H%M%S");
+	oss << std::setfill('0') << std::setw(3) << ms.count();
+	
+	return oss.str();
+}
+
+// Get platform/architecture information
+std::string getPlatform() {
+	struct utsname info;
+	if (uname(&info) == 0) {
+		return std::string(info.machine);
+	}
+	return "unknown";
+}
+
+// Get OS information
+std::string getOSInfo() {
+	struct utsname info;
+	if (uname(&info) == 0) {
+		return std::string(info.sysname) + " " + std::string(info.release);
+	}
+	return "unknown";
+}
+
+// Get CPU core count
+int getCPUCores() {
+#ifdef _WIN32
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	return sysinfo.dwNumberOfProcessors;
+#else
+	return sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+}
+
+// Get total RAM in GB
+double getTotalRAM() {
+#ifdef _WIN32
+	MEMORYSTATUSEX memInfo;
+	memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+	GlobalMemoryStatusEx(&memInfo);
+	return memInfo.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+#else
+	long pages = sysconf(_SC_PHYS_PAGES);
+	long page_size = sysconf(_SC_PAGE_SIZE);
+	return (pages * page_size) / (1024.0 * 1024.0 * 1024.0);
+#endif
+}
 
 // Generate synthetic test data
 std::vector<uint16_t> generateSyntheticAScan(int signalLength, int ascanIndex) {
@@ -276,19 +343,31 @@ std::string formatNumber(double value) {
 }
 
 void printResultsTable(const std::vector<BenchmarkResult>& results) {
+	// Check if CPU was benchmarked
+	bool hasCPU = false;
+	for (const auto& r : results) {
+		if (r.backend == "CPU") {
+			hasCPU = true;
+			break;
+		}
+	}
+	
 	std::cout << std::endl;
-	std::cout << "+" << std::string(110, '-') << "+" << std::endl;
-	std::cout << "| " << std::left << std::setw(6) << "Signal"
-	          << " | " << std::setw(6) << "AScans"
-	          << " | " << std::setw(6) << "BScans"
+	int tableWidth = hasCPU ? 124 : 114;
+	std::cout << "+" << std::string(tableWidth, '-') << "+" << std::endl;
+	std::cout << "| " << std::left << std::setw(13) << "Signal length"
+	          << " | " << std::setw(14) << "A-Scans/B-scan"
+	          << " | " << std::setw(14) << "B-Scans/Buffer"
 	          << " | " << std::setw(7) << "Backend"
-	          << " | " << std::right << std::setw(9) << "Time(ms)"
-	          << " | " << std::setw(12) << "BScans/s"
-	          << " | " << std::setw(14) << "AScans/s"
-	          << " | " << std::setw(10) << "MB/s"
-	          << " | " << std::setw(8) << "Speedup"
-	          << " |" << std::endl;
-	std::cout << "+" << std::string(110, '-') << "+" << std::endl;
+	          << " | " << std::right << std::setw(10) << "Time in ms"
+	          << " | " << std::setw(14) << "A-Scans/s"
+	          << " | " << std::setw(12) << "B-Scans/s"
+	          << " | " << std::setw(10) << "MB/s";
+	if (hasCPU) {
+		std::cout << " | " << std::setw(8) << "Speedup";
+	}
+	std::cout << " |" << std::endl;
+	std::cout << "+" << std::string(tableWidth, '-') << "+" << std::endl;
 	
 	// Group by buffer configuration
 	int lastSignalLength = -1;
@@ -301,7 +380,7 @@ void printResultsTable(const std::vector<BenchmarkResult>& results) {
 		// Add separator between different configurations
 		if (r.signalLength != lastSignalLength || r.ascansPerBscan != lastAscans || r.bscansPerBuffer != lastBscans) {
 			if (i > 0) {
-				std::cout << "+" << std::string(110, '-') << "+" << std::endl;
+				std::cout << "+" << std::string(tableWidth, '-') << "+" << std::endl;
 			}
 			lastSignalLength = r.signalLength;
 			lastAscans = r.ascansPerBscan;
@@ -316,44 +395,93 @@ void printResultsTable(const std::vector<BenchmarkResult>& results) {
 			speedupStr = ss.str();
 		}
 		
-		std::cout << "| " << std::left << std::setw(6) << r.signalLength
-		          << " | " << std::setw(6) << r.ascansPerBscan
-		          << " | " << std::setw(6) << r.bscansPerBuffer
+		std::cout << "| " << std::left << std::setw(13) << r.signalLength
+		          << " | " << std::setw(14) << r.ascansPerBscan
+		          << " | " << std::setw(14) << r.bscansPerBuffer
 		          << " | " << std::setw(7) << r.backend
-		          << " | " << std::right << std::setw(9) << std::fixed << std::setprecision(3) << r.avgTimeMs
-		          << " | " << std::setw(12) << formatNumber(r.bscansPerSec)
+		          << " | " << std::right << std::setw(10) << std::fixed << std::setprecision(3) << r.avgTimeMs
 		          << " | " << std::setw(14) << formatNumber(r.ascansPerSec)
-		          << " | " << std::setw(10) << std::fixed << std::setprecision(2) << r.mbPerSec
-		          << " | " << std::setw(8) << speedupStr
-		          << " |" << std::endl;
+		          << " | " << std::setw(12) << formatNumber(r.bscansPerSec)
+		          << " | " << std::setw(10) << std::fixed << std::setprecision(2) << r.mbPerSec;
+		if (hasCPU) {
+			std::cout << " | " << std::setw(8) << speedupStr;
+		}
+		std::cout << " |" << std::endl;
 	}
 	
-	std::cout << "+" << std::string(110, '-') << "+" << std::endl;
+	std::cout << "+" << std::string(tableWidth, '-') << "+" << std::endl;
 	std::cout << std::endl;
 }
 
-void saveResultsCSV(const std::vector<BenchmarkResult>& results, const char* filename) {
+void saveResultsCSV(const std::vector<BenchmarkResult>& results, const std::string& timestamp) {
+	// Generate filename with timestamp prefix
+	std::string filename = timestamp + "_benchmark_results.csv";
+	
 	std::ofstream file(filename);
 	if (!file.is_open()) {
 		std::cerr << "Failed to open CSV file: " << filename << std::endl;
 		return;
 	}
 	
-	file << "SignalLength,AScansPerBScan,BScansPerBuffer,Backend,Iterations,"
-	     << "TotalTime_ms,AvgTime_ms,BScansPerSec,AScansPerSec,MB_per_sec,Speedup" << std::endl;
+	// Check if CPU was benchmarked
+	bool hasCPU = false;
+	for (const auto& r : results) {
+		if (r.backend == "CPU") {
+			hasCPU = true;
+			break;
+		}
+	}
+	
+	// Write configuration header
+	file << "# Benchmark Configuration" << std::endl;
+	file << "Timestamp," << timestamp << std::endl;
+	file << "OCTproEngine_Version," << OPE_VERSION_STRING << std::endl;
+	file << "Platform," << getPlatform() << std::endl;
+	file << "OS," << getOSInfo() << std::endl;
+	file << "CPU_Cores," << getCPUCores() << std::endl;
+	file << "Total_RAM_GB," << std::fixed << std::setprecision(1) << getTotalRAM() << std::endl;
+	file << "InputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT16)) << std::endl;
+	file << "OutputBitDepth," << (ope::getDataTypeBitDepth(ope::DataType::UINT8)) << std::endl;
+	file << "Iterations," << ITERATIONS << std::endl;
+	file << "Resampling," << (ENABLE_RESAMPLING ? "true" : "false") << std::endl;
+	
+	std::string interpMethod = "NONE";
+	if (ENABLE_RESAMPLING) {
+		if (INTERPOLATION_METHOD == ope::InterpolationMethod::LINEAR) interpMethod = "LINEAR";
+		else if (INTERPOLATION_METHOD == ope::InterpolationMethod::CUBIC) interpMethod = "CUBIC";
+		else if (INTERPOLATION_METHOD == ope::InterpolationMethod::LANCZOS) interpMethod = "LANCZOS";
+	}
+	file << "ResamplingMethod," << interpMethod << std::endl;
+	
+	file << "Windowing," << (ENABLE_WINDOWING ? "true" : "false") << std::endl;
+	file << "Dispersion," << (ENABLE_DISPERSION ? "true" : "false") << std::endl;
+	file << "DCRemoval," << (ENABLE_DC_REMOVAL ? "true" : "false") << std::endl;
+	file << "DCWindowSize," << DC_REMOVAL_WINDOW_SIZE << std::endl;
+	file << "FPNRemoval," << (ENABLE_FIXED_PATTERN_NOISE_REMOVAL ? "true" : "false") << std::endl;
+	file << "LogScaling," << (ENABLE_LOG_SCALING ? "true" : "false") << std::endl;
+	file << std::endl;
+	
+	// Write results header
+	file << "# Benchmark Results" << std::endl;
+	file << "Signal length,A-Scans/B-scan,B-Scans/Buffer,Backend,Time in ms,A-Scans/s,B-Scans/s,MB/s";
+	if (hasCPU) {
+		file << ",Speedup";
+	}
+	file << std::endl;
 	
 	for (const auto& r : results) {
 		file << r.signalLength << ","
 		     << r.ascansPerBscan << ","
 		     << r.bscansPerBuffer << ","
 		     << r.backend << ","
-		     << r.iterations << ","
-		     << std::fixed << std::setprecision(6) << r.totalTimeMs << ","
-		     << r.avgTimeMs << ","
-		     << std::setprecision(2) << r.bscansPerSec << ","
-		     << r.ascansPerSec << ","
-		     << r.mbPerSec << ","
-		     << r.speedup << std::endl;
+		     << std::fixed << std::setprecision(3) << r.avgTimeMs << ","
+		     << std::setprecision(2) << r.ascansPerSec << ","
+		     << r.bscansPerSec << ","
+		     << r.mbPerSec;
+		if (hasCPU) {
+			file << "," << r.speedup;
+		}
+		file << std::endl;
 	}
 	
 	file.close();
@@ -509,7 +637,8 @@ int main() {
 	
 	// Save CSV if requested
 	if (SAVE_CSV) {
-		saveResultsCSV(allResults, CSV_FILENAME);
+		std::string timestamp = getCurrentTimestamp();
+		saveResultsCSV(allResults, timestamp);
 	}
 	
 	std::cout << "Benchmark complete!" << std::endl;
