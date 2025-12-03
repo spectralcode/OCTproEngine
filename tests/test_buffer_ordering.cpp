@@ -10,7 +10,7 @@
 #include <map>
 #include "test_utils.h"
 
-const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+const ope::Backend TEST_BACKEND = ope::Backend::VULKAN;
 const int NUM_FRAMES = 20000;
 const int CONTEXT_SIZE = 3;  // Show this many IDs before/after each mismatch
 
@@ -23,6 +23,9 @@ public:
     std::vector<uint64_t> outputIds;  // IDs in receive order (from output callback)
     std::atomic<int> inputCount{0};
     std::atomic<int> outputCount{0};
+
+    // Performance tracking
+    std::chrono::high_resolution_clock::time_point endTime;
 
 protected:
     void configureCallbacks() override {
@@ -43,6 +46,9 @@ protected:
                 std::lock_guard<std::mutex> lock(outputMutex);
                 outputIds.push_back(buf.getBufferId());
                 outputCount++;
+                if (outputCount == NUM_FRAMES) {
+                    endTime = std::chrono::high_resolution_clock::now();
+                }
             }
         );
     }
@@ -66,13 +72,30 @@ void testBufferOrdering() {
     std::cout << "Testing buffer ordering with " << NUM_FRAMES << " frames..." << std::endl;
 
     ope::Processor processor(TEST_BACKEND);
-    processor.setInputParameters(1024, 512, 1, ope::DataType::UINT16);
+    int samplesPerSignal = 1024;
+    int ascansPerBscan = 512;
+    int bscansPerBuffer = 1;
+    int bitDepth = 16;
+    processor.setInputParameters(samplesPerSignal, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT16);
     processor.initialize();
+
+    // Print configuration
+    std::cout << "\n=== Configuration ===" << std::endl;
+    std::cout << "  Backend: ";
+    if (TEST_BACKEND == ope::Backend::CUDA) std::cout << "CUDA" << std::endl;
+    else if (TEST_BACKEND == ope::Backend::VULKAN) std::cout << "Vulkan" << std::endl;
+    else if (TEST_BACKEND == ope::Backend::OPENCL) std::cout << "OpenCL" << std::endl;
+    else if (TEST_BACKEND == ope::Backend::CPU) std::cout << "CPU" << std::endl;
+    std::cout << "  Samples per signal: " << samplesPerSignal << std::endl;
+    std::cout << "  A-scans per B-scan: " << ascansPerBscan << std::endl;
+    std::cout << "  B-scans per buffer: " << bscansPerBuffer << std::endl;
+    std::cout << "  Bit depth: " << bitDepth << std::endl;
 
     BufferOrderingTool tool;
     tool.attachToProcessor(&processor);
 
     // Submit all frames
+    auto startTime = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < NUM_FRAMES; i++) {
         auto& inputBuffer = processor.getNextAvailableInputBuffer();
         //sleep to simulate acquisition delay
@@ -85,7 +108,19 @@ void testBufferOrdering() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    std::cout << "\n=== Results ===" << std::endl;
+    // === PERFORMANCE ===
+    double durationMs = std::chrono::duration<double, std::milli>(tool.endTime - startTime).count();
+    double bscansPerSec = (NUM_FRAMES * bscansPerBuffer / durationMs) * 1000.0;
+    size_t bytesPerBuffer = samplesPerSignal * ascansPerBscan * bscansPerBuffer * (bitDepth / 8);
+    double mbPerSec = (NUM_FRAMES * bytesPerBuffer / durationMs) * 1000.0 / (1024.0 * 1024.0);
+    
+    std::cout << "\n=== Performance ===" << std::endl;
+    std::cout << "  Duration: " << durationMs << " ms" << std::endl;
+    std::cout << "  B-scans/s: " << bscansPerSec << std::endl;
+    std::cout << "  MB/s: " << mbPerSec << std::endl;
+
+    // === ORDERING RESULTS ===
+    std::cout << "\n=== Ordering Results ===" << std::endl;
     std::cout << "  Input callbacks received: " << tool.inputIds.size() << std::endl;
     std::cout << "  Output callbacks received: " << tool.outputIds.size() << std::endl;
 
