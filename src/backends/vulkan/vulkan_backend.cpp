@@ -128,6 +128,14 @@ struct VulkanBackend::Impl {
 	bool useSeparateTransferQueue = false;
 	std::vector<VkSemaphore> transferToComputeSemaphores;  // Signal from transfer, wait on compute
 
+	// Timeline semaphore for ordered output transfers (ensures buffer N completes before buffer N+1)
+	VkSemaphore outputOrderingSemaphore = VK_NULL_HANDLE;
+	uint64_t nextOutputSignalValue = 1;  // Monotonically increasing value for timeline semaphore
+	std::vector<uint64_t> lastTimelineValuePerCB;  // Last timeline value used by each command buffer
+	std::atomic<uint64_t> lastProcessedTimelineValue{0};  // Highest timeline value fully processed by completion thread
+	std::mutex stagingBufferMutex;  // Protects staging buffer access
+	std::condition_variable stagingBufferCV;  // For waiting on staging buffer availability
+
 	// Command buffers and synchronization
 	VkCommandPool commandPool = VK_NULL_HANDLE;
 	std::vector<VkCommandBuffer> commandBuffers;
@@ -136,7 +144,7 @@ struct VulkanBackend::Impl {
 	bool commandBuffersValid = false;  // Track if command buffers need re-recording
 
 	// Input buffer management (queue-based, thread-safe)
-	int numInputBuffers = 2;  // Default 2
+	int numInputBuffers = 4;  // Default 2
 	std::vector<IOBuffer> hostInputBuffers;
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
@@ -261,6 +269,8 @@ struct VulkanBackend::Impl {
 		IOBuffer* outputBuffer;
 		size_t outputSize;
 		int outputSignalLength;
+		uint64_t timelineValue;  // Timeline semaphore value to wait for
+		uint64_t bufferId;       // Buffer ID to restore before callback (output buffer is shared)
 	};
 	std::queue<PendingWork> pendingWorkQueue;
 	std::mutex pendingWorkMutex;
@@ -300,10 +310,19 @@ struct VulkanBackend::Impl {
 				this->pendingWorkQueue.pop();
 			}
 
-			// Wait for fence (outside lock to allow concurrent submissions)
-			VkResult result = vkWaitForFences(this->device, 1, &work.fence, VK_TRUE, UINT64_MAX);
+			// Wait for timeline semaphore value (ensures callbacks are invoked in submission order)
+			// This replaces fence waiting to avoid fence reuse race conditions
+			VkSemaphoreWaitInfo waitInfo = {};
+			waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+			waitInfo.pNext = nullptr;
+			waitInfo.flags = 0;
+			waitInfo.semaphoreCount = 1;
+			waitInfo.pSemaphores = &this->outputOrderingSemaphore;
+			waitInfo.pValues = &work.timelineValue;
+
+			VkResult result = vkWaitSemaphores(this->device, &waitInfo, UINT64_MAX);
 			if (result != VK_SUCCESS) {
-				std::cerr << "Vulkan fence wait failed in completion thread: " << result << std::endl;
+				std::cerr << "Vulkan timeline semaphore wait failed in completion thread: " << result << std::endl;
 				continue;
 			}
 
@@ -329,10 +348,20 @@ struct VulkanBackend::Impl {
 				// For now, just mark the profile as recorded; it will be applied on next call to process()
 			}
 
-			// Invoke callback if registered
+			// Restore buffer ID and invoke callback if registered
+			// Buffer ID must be restored because output buffer is shared between frames using same CB
+			work.outputBuffer->setBufferId(work.bufferId);
 			if (this->callback) {
 				this->callback(*work.outputBuffer);
 			}
+
+			// Update processed timeline value AFTER callback (output buffer is now safe to reuse)
+			// This must be done after callback to prevent next frame from overwriting buffer ID
+			{
+				std::lock_guard<std::mutex> lock(this->stagingBufferMutex);
+				this->lastProcessedTimelineValue = work.timelineValue;
+			}
+			this->stagingBufferCV.notify_all();
 		}
 	}
 
@@ -1386,27 +1415,37 @@ void VulkanBackend::process(IOBuffer& input) {
 	VkCommandBuffer cmd = this->impl->commandBuffers[idx];
 	VkFence fence = this->impl->fences[idx];
 
+	// Wait for this CB to be available before writing to its staging buffers
+	// This ensures we don't overwrite staging buffers while GPU is reading them
+	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
+	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
+
+	// Wait for completion thread to finish with this CB's output staging buffer
+	// This prevents overwriting staging data before the callback has copied it
+	uint64_t lastTimelineValue = this->impl->lastTimelineValuePerCB[idx];
+	if (lastTimelineValue > 0) {
+		std::unique_lock<std::mutex> lock(this->impl->stagingBufferMutex);
+		this->impl->stagingBufferCV.wait(lock, [this, lastTimelineValue] {
+			return this->impl->lastProcessedTimelineValue >= lastTimelineValue;
+		});
+	}
+
 	// Copy input data to staging buffer (CPU → GPU transfer preparation)
-	// Note: This is a CPU-side memcpy to pinned memory, happens asynchronously with GPU work
+	// Now safe to write - GPU is done reading and completion thread is done copying
 	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
 	std::memcpy(this->impl->stagingInputMapped[idx], input.getDataPointer(), inputSize);
 
-	// Return input buffer immediately - we've copied the data, don't need it anymore
-	// This allows the producer to start filling the next buffer while GPU processes current frame
+	// Return input buffer - we've copied the data, don't need it anymore
 	{
 		std::lock_guard<std::mutex> lock(this->impl->freeQueueMutex);
 		this->impl->freeBuffersQueue.push(&input);
 	}
 	this->impl->freeQueueCV.notify_one();
 
-	// Wait ONLY if this specific command buffer is still in use (allows overlap between command buffers!)
-	// This ensures we don't overwrite staging buffers while GPU is reading them
-	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
-	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
-
 	// Get output buffer for this command buffer
+	// Note: Don't set bufferId here - it would race with consumer threads reading it
+	// The completion thread restores bufferId from work.bufferId before callback
 	IOBuffer* outputBuf = &this->impl->outputBuffers[idx];
-	outputBuf->setBufferId(input.getBufferId());  // Correlation ID
 
 	// Record all command buffers if needed (first call or after config change)
 	if (!this->impl->commandBuffersValid) {
@@ -1433,20 +1472,46 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
 
-	// Submit compute command buffer (waits for transfer semaphore, signals fence when complete)
-	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	// Submit compute command buffer with timeline semaphore for ordered output transfers
+	// Frame N waits for frame N-1's output transfer to complete before starting its output transfer
+	// This ensures output buffers are delivered in submission order
+	uint64_t waitValue = this->impl->nextOutputSignalValue - 1;   // Wait for previous frame (0 for first frame)
+	uint64_t signalValue = this->impl->nextOutputSignalValue;     // Signal when this frame completes
+
+	// VkTimelineSemaphoreSubmitInfo specifies values for timeline semaphore operations
+	// Value arrays must match semaphore arrays in VkSubmitInfo
+	uint64_t waitValues[2] = {0, waitValue};      // [binary sem (ignored), timeline sem]
+	uint64_t signalValues[1] = {signalValue};     // Timeline semaphore signal value
+
+	VkTimelineSemaphoreSubmitInfo timelineSubmitInfo = {};
+	timelineSubmitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+	timelineSubmitInfo.pNext = nullptr;
+	timelineSubmitInfo.waitSemaphoreValueCount = 2;
+	timelineSubmitInfo.pWaitSemaphoreValues = waitValues;
+	timelineSubmitInfo.signalSemaphoreValueCount = 1;
+	timelineSubmitInfo.pSignalSemaphoreValues = signalValues;
+
+	// Wait on: transfer semaphore (binary) AND output ordering semaphore (timeline)
+	VkSemaphore waitSemaphores[2] = {transferCompleteSemaphore, this->impl->outputOrderingSemaphore};
+	VkPipelineStageFlags waitStages[2] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                                       VK_PIPELINE_STAGE_TRANSFER_BIT};
 
 	VkSubmitInfo computeSubmit = {};
 	computeSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	computeSubmit.pNext = &timelineSubmitInfo;
+	computeSubmit.waitSemaphoreCount = 2;
+	computeSubmit.pWaitSemaphores = waitSemaphores;
+	computeSubmit.pWaitDstStageMask = waitStages;
 	computeSubmit.commandBufferCount = 1;
 	computeSubmit.pCommandBuffers = &cmd;
-	computeSubmit.waitSemaphoreCount = 1;
-	computeSubmit.pWaitSemaphores = &transferCompleteSemaphore;
-	computeSubmit.pWaitDstStageMask = &waitStage;
+	computeSubmit.signalSemaphoreCount = 1;
+	computeSubmit.pSignalSemaphores = &this->impl->outputOrderingSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, fence));
 
-	// Queue work for async completion (completion thread will wait for fence and invoke callback)
+	this->impl->nextOutputSignalValue++;
+
+	// Queue work for async completion (completion thread will wait on timeline semaphore and invoke callback)
 	// This enables true async overlap: process() returns immediately, allowing next frame to start
 	size_t outputSize = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer * sizeof(float);
 	{
@@ -1456,10 +1521,15 @@ void VulkanBackend::process(IOBuffer& input) {
 			idx,
 			outputBuf,
 			outputSize,
-			outputSignalLength
+			outputSignalLength,
+			signalValue,           // Timeline semaphore value for this frame
+			input.getBufferId()    // Save buffer ID (output buffer is shared between frames using same CB)
 		});
 	}
 	this->impl->pendingWorkCV.notify_one();  // Wake completion thread
+
+	// Track which timeline value was used by this CB (for staging buffer protection)
+	this->impl->lastTimelineValuePerCB[idx] = signalValue;
 }
 
 // ============================================
@@ -2399,6 +2469,26 @@ void VulkanBackend::createCommandBuffersAndFences() {
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		checkVulkanErrors(vkCreateSemaphore(this->impl->device, &semaphoreInfo, nullptr, &this->impl->transferToComputeSemaphores[i]));
 	}
+
+	// Create timeline semaphore for ordered output transfers
+	// See: https://docs.vulkan.org/samples/latest/samples/extensions/timeline_semaphore/README.html
+	VkSemaphoreTypeCreateInfo timelineCreateInfo = {};
+	timelineCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+	timelineCreateInfo.pNext = nullptr;
+	timelineCreateInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	timelineCreateInfo.initialValue = 0;
+
+	VkSemaphoreCreateInfo timelineSemaphoreInfo = {};
+	timelineSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	timelineSemaphoreInfo.pNext = &timelineCreateInfo;
+	timelineSemaphoreInfo.flags = 0;
+
+	checkVulkanErrors(vkCreateSemaphore(this->impl->device, &timelineSemaphoreInfo, nullptr,
+	                                     &this->impl->outputOrderingSemaphore));
+	this->impl->nextOutputSignalValue = 1;
+
+	// Initialize per-CB timeline tracking (0 means no previous frame used this CB)
+	this->impl->lastTimelineValuePerCB.resize(this->impl->numCommandBuffers, 0);
 }
 
 void VulkanBackend::destroyCommandBuffersAndFences() {
@@ -2439,6 +2529,12 @@ void VulkanBackend::destroyCommandBuffersAndFences() {
 		}
 	}
 	this->impl->transferToComputeSemaphores.clear();
+
+	// Destroy timeline semaphore for output ordering
+	if (this->impl->outputOrderingSemaphore != VK_NULL_HANDLE) {
+		vkDestroySemaphore(this->impl->device, this->impl->outputOrderingSemaphore, nullptr);
+		this->impl->outputOrderingSemaphore = VK_NULL_HANDLE;
+	}
 }
 
 // ============================================
