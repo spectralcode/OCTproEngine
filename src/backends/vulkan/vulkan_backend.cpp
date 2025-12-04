@@ -144,7 +144,7 @@ struct VulkanBackend::Impl {
 	bool commandBuffersValid = false;  // Track if command buffers need re-recording
 
 	// Input buffer management (queue-based, thread-safe)
-	int numInputBuffers = 4;  // Default 2
+	int numInputBuffers = numCommandBuffers;  // Default 2
 	std::vector<IOBuffer> hostInputBuffers;
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
@@ -1420,8 +1420,8 @@ void VulkanBackend::process(IOBuffer& input) {
 	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
 	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
 
-	// Wait for completion thread to finish with this CB's output staging buffer
-	// This prevents overwriting staging data before the callback has copied it
+	// Wait for completion thread to finish with this CB's staging buffers
+	// This prevents overwriting staging output buffer while completion thread is copying from it
 	uint64_t lastTimelineValue = this->impl->lastTimelineValuePerCB[idx];
 	if (lastTimelineValue > 0) {
 		std::unique_lock<std::mutex> lock(this->impl->stagingBufferMutex);
@@ -1473,11 +1473,11 @@ void VulkanBackend::process(IOBuffer& input) {
 	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
 
 	// Submit compute command buffer with timeline semaphore for ordered output transfers
-	// Frame N waits for frame N-1's output transfer to complete before starting its output transfer
-	// This ensures output buffers are delivered in submission order
-	uint64_t waitValue = this->impl->nextOutputSignalValue - 1;   // Wait for previous frame (0 for first frame)
-	uint64_t signalValue = this->impl->nextOutputSignalValue;     // Signal when this frame completes
-
+	uint64_t waitValue = (this->impl->nextOutputSignalValue > this->impl->numCommandBuffers) 
+                      ? (this->impl->nextOutputSignalValue - this->impl->numCommandBuffers) 
+                      : 0;
+	uint64_t signalValue = this->impl->nextOutputSignalValue;
+	
 	// VkTimelineSemaphoreSubmitInfo specifies values for timeline semaphore operations
 	// Value arrays must match semaphore arrays in VkSubmitInfo
 	uint64_t waitValues[2] = {0, waitValue};      // [binary sem (ignored), timeline sem]
