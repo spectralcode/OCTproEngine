@@ -3,10 +3,12 @@
 
 namespace ope {
 
-CallbackManager::ConsumerThread::ConsumerThread(CallbackId callbackId, OutputCallback cb)
+CallbackManager::ConsumerThread::ConsumerThread(CallbackId callbackId, OutputCallback cb, size_t maxSize)
 	: callback(std::move(cb))
 	, running(true)
+	, invoking(false)
 	, id(callbackId)
+	, maxQueueSize(maxSize)
 {
 	this->thread = std::thread([this]() {
 		this->run();
@@ -20,22 +22,23 @@ CallbackManager::ConsumerThread::~ConsumerThread() {
 void CallbackManager::ConsumerThread::run() {
 	while (this->running) {
 		const IOBuffer* buffer = nullptr;
-		
+
 		// Wait for data in queue
 		{
 			std::unique_lock<std::mutex> lock(this->mutex);
-			this->cv.wait(lock, [this]() {
+			this->cvBufferReady.wait(lock, [this]() {
 				return !this->queue.empty() || !this->running;
 			});
-			
-			if (!this->running) {
+
+			if (!this->running && this->queue.empty()) {
 				break;
 			}
-			
+
 			buffer = this->queue.front();
 			this->queue.pop();
+			this->invoking = true;
 		}
-		
+
 		// Call user's callback on this thread
 		if (buffer) {
 			try {
@@ -47,15 +50,41 @@ void CallbackManager::ConsumerThread::run() {
 				// Catch all to prevent thread termination
 			}
 		}
+
+		// Signal that we're done with this buffer
+		{
+			std::lock_guard<std::mutex> lock(this->mutex);
+			this->invoking = false;
+		}
+		this->cvInvocationComplete.notify_all();
 	}
 }
 
 void CallbackManager::ConsumerThread::post(const IOBuffer* buffer) {
 	{
-		std::lock_guard<std::mutex> lock(this->mutex);
+		std::unique_lock<std::mutex> lock(this->mutex);
+
+		// Backpressure: wait if queue is full
+		if (this->maxQueueSize > 0) {
+			this->cvInvocationComplete.wait(lock, [this]() {
+				return this->queue.size() < this->maxQueueSize || !this->running;
+			});
+		}
+
+		if (!this->running) {
+			return;
+		}
+
 		this->queue.push(buffer);
 	}
-	this->cv.notify_one();
+	this->cvBufferReady.notify_one();
+}
+
+void CallbackManager::ConsumerThread::waitUntilDone() {
+	std::unique_lock<std::mutex> lock(this->mutex);
+	this->cvInvocationComplete.wait(lock, [this]() {
+		return this->queue.empty() && !this->invoking;
+	});
 }
 
 void CallbackManager::ConsumerThread::stop() {
@@ -64,8 +93,9 @@ void CallbackManager::ConsumerThread::stop() {
 		{
 			std::lock_guard<std::mutex> lock(this->mutex);
 		}
-		this->cv.notify_one();
-		
+		this->cvBufferReady.notify_one();
+		this->cvInvocationComplete.notify_all();
+
 		// Wait for thread to finish
 		if (this->thread.joinable()) {
 			this->thread.join();
@@ -124,8 +154,16 @@ void CallbackManager::clear() {
 
 void CallbackManager::invokeAll(const IOBuffer& buffer) {
 	std::lock_guard<std::mutex> lock(this->consumersMutex);
+
+	// Post pointer to all consumers (they start reading buffer in parallel)
 	for (auto& consumer : this->consumers) {
 		consumer->post(&buffer);
+	}
+
+	// Wait for ALL consumers to finish reading buffer
+	// This ensures buffer won't be reused until all consumers are done
+	for (auto& consumer : this->consumers) {
+		consumer->waitUntilDone();
 	}
 }
 

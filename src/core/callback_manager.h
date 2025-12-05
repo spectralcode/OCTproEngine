@@ -67,11 +67,10 @@ public:
 	 * @brief Invoke all registered callbacks with the given buffer
 	 * 
 	 * Posts a pointer to the buffer to all consumer queues.
-	 * Returns immediately (~0.1ms for 10 consumers).
 	 * 
 	 * Callbacks execute in parallel on their dedicated threads.
 	 * 
-	 * WARNING: Buffer lifetime management is caller's responsibility!
+	 * WARNING:
 	 * Callbacks must copy data if they need to keep it beyond the callback.
 	 * 
 	 * @param buffer Output buffer to pass to all callbacks
@@ -88,16 +87,20 @@ private:
 		std::thread thread;
 		std::queue<const IOBuffer*> queue;
 		std::mutex mutex;
-		std::condition_variable cv;
+		std::condition_variable cvBufferReady;
+		std::condition_variable cvInvocationComplete;
 		OutputCallback callback;
 		std::atomic<bool> running;
+		std::atomic<bool> invoking;
 		CallbackId id;
-		
-		ConsumerThread(CallbackId callbackId, OutputCallback cb);
+		size_t maxQueueSize;
+
+		ConsumerThread(CallbackId callbackId, OutputCallback cb, size_t maxSize = 0);
 		~ConsumerThread();
-		
+
 		void run();
 		void post(const IOBuffer* buffer);
+		void waitUntilDone(); // Blocks until queue empty and not invoking
 		void stop();
 	};
 	
