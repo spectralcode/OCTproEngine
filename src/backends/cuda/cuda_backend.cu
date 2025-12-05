@@ -6,9 +6,11 @@
 #include <sstream>
 #include <iostream>
 #include <queue>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <thread>
 
 // Helper macro for checking CUDA errors
 #define checkCudaErrors(call) \
@@ -43,7 +45,7 @@ struct CudaBackend::Impl {
 	ProcessorConfiguration config;
 
 	// CUDA parameters
-	int numStreams = 2;
+	int numStreams = 3;
 	int blockSize = 128;
 	int gridSize = 0;
 	int deviceId = 0;
@@ -63,8 +65,16 @@ struct CudaBackend::Impl {
 	cudaEvent_t syncEvent;
 	int currentStream = 0;
 
+	// Callback ordering queue. delivers callbacks in buffer submission order
+	std::mutex callbackQueueMutex;
+	std::condition_variable callbackQueueCV;
+	std::map<uint64_t, IOBuffer*> pendingCallbacks;  // bufferId -> outputBuffer
+	uint64_t nextExpectedCallback = 0;
+	std::thread callbackWorkerThread;
+	std::atomic<bool> callbackWorkerRunning{false};
+
 	// Input buffer management (queue-based, thread-safe)
-	int numInputBuffers = 2;  // Default 2
+	int numInputBuffers = numStreams;  // Default 2
 	std::vector<IOBuffer> hostInputBuffers;
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
@@ -74,10 +84,10 @@ struct CudaBackend::Impl {
 	std::vector<void*> d_inputBuffers;
 	int currentBuffer = 0;
 	
-	// Processing buffers
-	cufftComplex* d_fftBuffer = nullptr;
-	cufftComplex* d_inputLinearized = nullptr;
-	float* d_processedBuffer = nullptr;
+	// Processing buffers (one per stream for parallel execution)
+	std::vector<cufftComplex*> d_fftBuffers;
+	std::vector<cufftComplex*> d_inputLinearizedBuffers;
+	std::vector<float*> d_processedBuffers;
 	
 	// Curve buffers
 	float* d_resampleCurve = nullptr;
@@ -93,20 +103,27 @@ struct CudaBackend::Impl {
 	
 	// Post-processing
 	float* d_postProcBackgroundLine = nullptr;
-	float* d_sinusoidalScanTmpBuffer = nullptr;
+	std::vector<float*> d_sinusoidalScanTmpBuffers;  // One per stream
 	bool postProcessBackgroundRecordingRequested = false;
 	bool postProcessBackgroundUpdated = false;
 	std::vector<float> recordedPostProcessBackground;
 	
-	// cuFFT plan
-	cufftHandle fftPlan = 0;
+	// cuFFT plans (one per stream - internal work buffers not safe for concurrent use)
+	std::vector<cufftHandle> fftPlans;
 
-	// Output buffers for callback (one per stream)
+	// Output buffers for callback (rotating pool for ordered delivery)
 	std::vector<IOBuffer> outputBuffers;
+	std::atomic<int> currentOutputBuffer{0};
+	static constexpr int OUTPUT_BUFFER_MULTIPLIER = 1;  // outputBuffers.size() = numStreams * this
+
+	// Semaphore to limit in-flight output buffers (prevents buffer reuse before callback delivery)
+	std::mutex outputSemaphoreMutex;
+	std::condition_variable outputSemaphoreCV;
+	int availableOutputBuffers = 0;  // Initialized in initialize()
 
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
-	
+
 	// Pre-allocated callback data pool (NO heap allocations!)
 	struct CallbackData {
 		Impl* impl;
@@ -199,8 +216,8 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->gridSize = this->impl->samplesPerBuffer / this->impl->blockSize;
 	
 	// Pre-allocate callback data pool (NO heap allocations during processing!)
-	// Size: numStreams Ã— 2 callbacks per stream Ã— 2 for safety = numStreams Ã— 4
-	int poolSize = this->impl->numStreams * 4;
+	// Size matches output buffer pool for 1:1 correspondence
+	int poolSize = 2 * this->impl->numStreams * Impl::OUTPUT_BUFFER_MULTIPLIER;
 	this->impl->callbackDataPool.resize(poolSize);
 	for (auto& data : this->impl->callbackDataPool) {
 		data.impl = this->impl.get();
@@ -252,11 +269,14 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
 	}
 	
-	// Allocate output buffers (one per stream to prevent race conditions)
+	// Allocate output buffers (rotating pool for ordered callback delivery)
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
-	this->impl->outputBuffers.resize(this->impl->numStreams);
+	int numOutputBuffers = this->impl->numStreams * Impl::OUTPUT_BUFFER_MULTIPLIER;
+	this->impl->outputBuffers.resize(numOutputBuffers);
+	this->impl->currentOutputBuffer = 0;
+	this->impl->availableOutputBuffers = numOutputBuffers;  // All buffers available initially
 
-	for (int i = 0; i < this->impl->numStreams; ++i) {
+	for (int i = 0; i < numOutputBuffers; ++i) {
 		// Set allocation hint for output buffer (same as input buffers)
 		this->impl->outputBuffers[i].setAllocationHint(hint);
 
@@ -276,13 +296,18 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 #endif
 	}
 	
-	// Create cuFFT plan
-	checkCufftErrors(cufftPlan1d(
-		&this->impl->fftPlan,
-		this->impl->signalLength,
-		CUFFT_C2C,
-		this->impl->ascansPerBscan * this->impl->bscansPerBuffer
-	));
+	// Create cuFFT plans (one per stream - internal work buffers not safe for concurrent use)
+	this->impl->fftPlans.resize(this->impl->numStreams);
+	for (int i = 0; i < this->impl->numStreams; ++i) {
+		checkCufftErrors(cufftPlan1d(
+			&this->impl->fftPlans[i],
+			this->impl->signalLength,
+			CUFFT_C2C,
+			this->impl->ascansPerBscan * this->impl->bscansPerBuffer
+		));
+		// Associate plan with its dedicated stream
+		checkCufftErrors(cufftSetStream(this->impl->fftPlans[i], this->impl->streams[i]));
+	}
 	
 	
 	// Fill sinusoidal scan correction curve
@@ -340,6 +365,75 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->fixedPatternNoiseDetermined = true;
 	}
 
+	// Start callback worker thread for ordered delivery
+	this->impl->callbackWorkerRunning = true;
+	this->impl->nextExpectedCallback = 0;
+	this->impl->callbackWorkerThread = std::thread([this]() {
+		while (this->impl->callbackWorkerRunning) {
+			IOBuffer* bufferToDeliver = nullptr;
+
+			{
+				std::unique_lock<std::mutex> lock(this->impl->callbackQueueMutex);
+				// Wait until we have the next expected callback or shutdown
+				this->impl->callbackQueueCV.wait(lock, [this]() {
+					return !this->impl->callbackWorkerRunning ||
+					       this->impl->pendingCallbacks.count(this->impl->nextExpectedCallback) > 0;
+				});
+
+				if (!this->impl->callbackWorkerRunning && this->impl->pendingCallbacks.empty()) {
+					break;
+				}
+
+				// Check if next expected callback is ready
+				auto it = this->impl->pendingCallbacks.find(this->impl->nextExpectedCallback);
+				if (it != this->impl->pendingCallbacks.end()) {
+					bufferToDeliver = it->second;
+					this->impl->pendingCallbacks.erase(it);
+					this->impl->nextExpectedCallback++;
+				}
+			}
+
+			// Deliver callback outside the lock
+			if (bufferToDeliver) {
+				if (this->impl->callback) {
+					this->impl->callback(*bufferToDeliver);
+				}
+				// Release output buffer back to pool
+				{
+					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+					this->impl->availableOutputBuffers++;
+				}
+				this->impl->outputSemaphoreCV.notify_one();
+			}
+		}
+
+		// Drain remaining callbacks on shutdown
+		while (true) {
+			IOBuffer* bufferToDeliver = nullptr;
+			{
+				std::lock_guard<std::mutex> lock(this->impl->callbackQueueMutex);
+				auto it = this->impl->pendingCallbacks.find(this->impl->nextExpectedCallback);
+				if (it == this->impl->pendingCallbacks.end()) {
+					break;
+				}
+				bufferToDeliver = it->second;
+				this->impl->pendingCallbacks.erase(it);
+				this->impl->nextExpectedCallback++;
+			}
+			if (bufferToDeliver) {
+				if (this->impl->callback) {
+					this->impl->callback(*bufferToDeliver);
+				}
+				// Release output buffer back to pool
+				{
+					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+					this->impl->availableOutputBuffers++;
+				}
+				this->impl->outputSemaphoreCV.notify_one();
+			}
+		}
+	});
+
 	this->impl->cudaInitialized = true;
 }
 
@@ -347,13 +441,23 @@ void CudaBackend::cleanup() {
 	if (!this->impl->cudaInitialized) {
 		return;
 	}
-	
+
 	// Set device
 	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
-	
+
 	// Wait for all streams to complete
 	for (auto& stream : this->impl->streams) {
 		cudaStreamSynchronize(stream);
+	}
+
+	// Stop callback worker thread
+	{
+		std::lock_guard<std::mutex> lock(this->impl->callbackQueueMutex);
+		this->impl->callbackWorkerRunning = false;
+	}
+	this->impl->callbackQueueCV.notify_all();
+	if (this->impl->callbackWorkerThread.joinable()) {
+		this->impl->callbackWorkerThread.join();
 	}
 	
 	// Unregister and release host input buffers
@@ -400,11 +504,11 @@ void CudaBackend::cleanup() {
 	// Release device buffers
 	this->releaseDeviceBuffers();
 
-	// Destroy cuFFT plan
-	if (this->impl->fftPlan) {
-		cufftDestroy(this->impl->fftPlan);
-		this->impl->fftPlan = 0;
+	// Destroy cuFFT plans
+	for (auto& plan : this->impl->fftPlans) {
+		if (plan) cufftDestroy(plan);
 	}
+	this->impl->fftPlans.clear();
 
 	// Destroy streams and events
 	this->destroyStreamsAndEvents();
@@ -473,11 +577,18 @@ void CUDART_CB CudaBackend::returnBufferCallback(void* userData) {
 
 void CUDART_CB CudaBackend::outputCallback(void* userData) {
 	Impl::CallbackData* data = static_cast<Impl::CallbackData*>(userData);
-	
-	if (data && data->impl && data->impl->callback && data->outputBuffer) {
-		data->impl->callback(*data->outputBuffer);
+
+	if (data && data->impl && data->outputBuffer) {
+		uint64_t bufferId = data->outputBuffer->getBufferId();
+
+		// Queue the callback for ordered delivery (non-blocking)
+		{
+			std::lock_guard<std::mutex> lock(data->impl->callbackQueueMutex);
+			data->impl->pendingCallbacks[bufferId] = data->outputBuffer;
+		}
+		data->impl->callbackQueueCV.notify_one();
 	}
-	
+
 	// NO delete! Memory is pre-allocated
 }
 
@@ -495,7 +606,15 @@ void CudaBackend::process(IOBuffer& input) {
 
 	// Round-robin stream selection
 	this->impl->currentStream = (this->impl->currentStream + 1) % this->impl->numStreams;
-	cudaStream_t stream = this->impl->streams[this->impl->currentStream];
+	int streamIdx = this->impl->currentStream;
+	cudaStream_t stream = this->impl->streams[streamIdx];
+
+	// Get per-stream processing buffers (eliminates shared buffer race conditions)
+	cufftComplex* d_fftBuffer = this->impl->d_fftBuffers[streamIdx];
+	cufftComplex* d_inputLinearized = this->impl->d_inputLinearizedBuffers[streamIdx];
+	float* d_processedBuffer = this->impl->d_processedBuffers[streamIdx];
+	float* d_sinusoidalScanTmpBuffer = this->impl->d_sinusoidalScanTmpBuffers[streamIdx];
+	cufftHandle fftPlan = this->impl->fftPlans[streamIdx];
 
 	// Round-robin device buffer selection 
 #ifdef __aarch64__
@@ -506,8 +625,19 @@ void CudaBackend::process(IOBuffer& input) {
 	this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
 #endif
 
-	// Select output buffer
-	IOBuffer* currentOutputBuf = &this->impl->outputBuffers[this->impl->currentStream];
+	// Wait for an output buffer to be available (prevents buffer reuse before callback delivery)
+	{
+		std::unique_lock<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->outputSemaphoreCV.wait(lock, [this]() {
+			return this->impl->availableOutputBuffers > 0;
+		});
+		this->impl->availableOutputBuffers--;
+	}
+
+	// Select output buffer from rotating pool
+	int outputBufIdx = this->impl->currentOutputBuffer.fetch_add(1, std::memory_order_relaxed)
+	                   % static_cast<int>(this->impl->outputBuffers.size());
+	IOBuffer* currentOutputBuf = &this->impl->outputBuffers[outputBufIdx];
 
 	// Get buffer ID from input to propagate to output later in the pipeline
 	uint64_t bufferId = input.getBufferId();
@@ -578,7 +708,7 @@ void CudaBackend::process(IOBuffer& input) {
 	// Step 1: Convert input to cufftComplex
 	if (config.processingParams.input.bitshift) {
 		cuda_kernels::inputToCufftComplex_and_bitshift<<<gridSize, blockSize, 0, stream>>>(
-			this->impl->d_fftBuffer,
+			d_fftBuffer,
 			d_input,
 			signalLength,
 			signalLength,
@@ -587,7 +717,7 @@ void CudaBackend::process(IOBuffer& input) {
 		);
 	} else {
 		cuda_kernels::inputToCufftComplex<<<gridSize, blockSize, 0, stream>>>(
-			this->impl->d_fftBuffer,
+			d_fftBuffer,
 			d_input,
 			signalLength,
 			signalLength,
@@ -598,8 +728,8 @@ void CudaBackend::process(IOBuffer& input) {
 
 	// Synchronization 
 	//todo: review. probably can be removed, synchronization is done via input buffer callbacks
-	cudaEventRecord(this->impl->syncEvent, stream);
-	cudaEventSynchronize(this->impl->syncEvent);
+	//cudaEventRecord(this->impl->syncEvent, stream);
+	//cudaEventSynchronize(this->impl->syncEvent);
 
 
 	// For zero-copy mode on Jetson, return the input buffer
@@ -617,22 +747,20 @@ void CudaBackend::process(IOBuffer& input) {
 	if (config.processingParams.dcRemoval.enabled) {
 		int sharedMemSize = (blockSize + 2 * config.processingParams.dcRemoval.windowSize) * sizeof(float);
 		cuda_kernels::rollingAverageBackgroundRemoval<<<gridSize, blockSize, sharedMemSize, stream>>>(
-			this->impl->d_inputLinearized,
-			this->impl->d_fftBuffer,
+			d_inputLinearized,
+			d_fftBuffer,
 			config.processingParams.dcRemoval.windowSize,
 			signalLength,
 			ascansPerBscan,
 			signalLength * ascansPerBscan,
 			samplesPerBuffer
 		);
-		// Swap pointers
-		cufftComplex* tmpSwapPointer = this->impl->d_inputLinearized;
-		this->impl->d_inputLinearized = this->impl->d_fftBuffer;
-		this->impl->d_fftBuffer = tmpSwapPointer;
+		// LOCAL pointer swap (not global - avoids race condition with other streams)
+		std::swap(d_inputLinearized, d_fftBuffer);
 	}
-	
+
 	// Step 3: K-linearization, windowing, and dispersion compensation
-	cufftComplex* d_fftBuffer2 = this->impl->d_fftBuffer;
+	cufftComplex* d_fftBuffer2 = d_fftBuffer;
 	
 	// Determine which fused kernel to use based on enabled features
 	bool resampling = config.processingParams.resampling.enabled;
@@ -640,59 +768,59 @@ void CudaBackend::process(IOBuffer& input) {
 	bool dispersion = config.processingParams.dispersion.enabled;
 	InterpolationMethod interpMethod = config.processingParams.resampling.method;
 	
-	if (this->impl->d_inputLinearized != nullptr && resampling && windowing && dispersion) {
+	if (d_inputLinearized != nullptr && resampling && windowing && dispersion) {
 		// K-linearization + windowing + dispersion (most common case)
 		if (interpMethod == InterpolationMethod::CUBIC) {
 			cuda_kernels::klinearizationCubicAndWindowingAndDispersionCompensation<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer, this->impl->d_resampleCurve,
+				d_inputLinearized, d_fftBuffer, this->impl->d_resampleCurve,
 				this->impl->d_windowCurve, this->impl->d_phaseCartesian, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LINEAR) {
 			cuda_kernels::klinearizationAndWindowingAndDispersionCompensation<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer, this->impl->d_resampleCurve,
+				d_inputLinearized, d_fftBuffer, this->impl->d_resampleCurve,
 				this->impl->d_windowCurve, this->impl->d_phaseCartesian, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LANCZOS) {
 			cuda_kernels::klinearizationLanczosAndWindowingAndDispersionCompensation<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer, this->impl->d_resampleCurve,
+				d_inputLinearized, d_fftBuffer, this->impl->d_resampleCurve,
 				this->impl->d_windowCurve, this->impl->d_phaseCartesian, signalLength, samplesPerBuffer);
 		}
-		d_fftBuffer2 = this->impl->d_inputLinearized;
-	} else if (this->impl->d_inputLinearized != nullptr && resampling && windowing && !dispersion) {
+		d_fftBuffer2 = d_inputLinearized;
+	} else if (d_inputLinearized != nullptr && resampling && windowing && !dispersion) {
 		// K-linearization + windowing
 		if (interpMethod == InterpolationMethod::CUBIC) {
 			cuda_kernels::klinearizationCubicAndWindowing<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer, this->impl->d_resampleCurve,
+				d_inputLinearized, d_fftBuffer, this->impl->d_resampleCurve,
 				this->impl->d_windowCurve, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LINEAR) {
 			cuda_kernels::klinearizationAndWindowing<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer, this->impl->d_resampleCurve,
+				d_inputLinearized, d_fftBuffer, this->impl->d_resampleCurve,
 				this->impl->d_windowCurve, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LANCZOS) {
 			cuda_kernels::klinearizationLanczosAndWindowing<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer, this->impl->d_resampleCurve,
+				d_inputLinearized, d_fftBuffer, this->impl->d_resampleCurve,
 				this->impl->d_windowCurve, signalLength, samplesPerBuffer);
 		}
-		d_fftBuffer2 = this->impl->d_inputLinearized;
+		d_fftBuffer2 = d_inputLinearized;
 	} else if (!resampling && windowing && dispersion) {
 		// Dispersion + windowing
 		cuda_kernels::dispersionCompensationAndWindowing<<<gridSize, blockSize, 0, stream>>>(
 			d_fftBuffer2, d_fftBuffer2, this->impl->d_phaseCartesian,
 			this->impl->d_windowCurve, signalLength, samplesPerBuffer);
-	} else if (this->impl->d_inputLinearized != nullptr && resampling && !windowing && !dispersion) {
+	} else if (d_inputLinearized != nullptr && resampling && !windowing && !dispersion) {
 		// Just k-linearization
 		if (interpMethod == InterpolationMethod::CUBIC) {
 			cuda_kernels::klinearizationCubic<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer,
+				d_inputLinearized, d_fftBuffer,
 				this->impl->d_resampleCurve, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LINEAR) {
 			cuda_kernels::klinearization<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer,
+				d_inputLinearized, d_fftBuffer,
 				this->impl->d_resampleCurve, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LANCZOS) {
 			cuda_kernels::klinearizationLanczos<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer,
+				d_inputLinearized, d_fftBuffer,
 				this->impl->d_resampleCurve, signalLength, samplesPerBuffer);
 		}
-		d_fftBuffer2 = this->impl->d_inputLinearized;
+		d_fftBuffer2 = d_inputLinearized;
 	} else if (!resampling && windowing && !dispersion) {
 		// Just windowing
 		cuda_kernels::windowing<<<gridSize, blockSize, 0, stream>>>(
@@ -701,29 +829,28 @@ void CudaBackend::process(IOBuffer& input) {
 		// Just dispersion
 		cuda_kernels::dispersionCompensation<<<gridSize, blockSize, 0, stream>>>(
 			d_fftBuffer2, d_fftBuffer2, this->impl->d_phaseCartesian, signalLength, samplesPerBuffer);
-	} else if (this->impl->d_inputLinearized != nullptr && resampling && !windowing && dispersion) {
+	} else if (d_inputLinearized != nullptr && resampling && !windowing && dispersion) {
 		// K-linearization + dispersion (rarely used, so not optimized with fused kernel)
 		if (interpMethod == InterpolationMethod::CUBIC) {
 			cuda_kernels::klinearizationCubic<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer,
+				d_inputLinearized, d_fftBuffer,
 				this->impl->d_resampleCurve, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LINEAR) {
 			cuda_kernels::klinearization<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer,
+				d_inputLinearized, d_fftBuffer,
 				this->impl->d_resampleCurve, signalLength, samplesPerBuffer);
 		} else if (interpMethod == InterpolationMethod::LANCZOS) {
 			cuda_kernels::klinearizationLanczos<<<gridSize, blockSize, 0, stream>>>(
-				this->impl->d_inputLinearized, this->impl->d_fftBuffer,
+				d_inputLinearized, d_fftBuffer,
 				this->impl->d_resampleCurve, signalLength, samplesPerBuffer);
 		}
-		d_fftBuffer2 = this->impl->d_inputLinearized;
+		d_fftBuffer2 = d_inputLinearized;
 		cuda_kernels::dispersionCompensation<<<gridSize, blockSize, 0, stream>>>(
 			d_fftBuffer2, d_fftBuffer2, this->impl->d_phaseCartesian, signalLength, samplesPerBuffer);
 	}
-	
-	// Step 4: IFFT
-	cufftSetStream(this->impl->fftPlan, stream);
-	checkCufftErrors(cufftExecC2C(this->impl->fftPlan, d_fftBuffer2, d_fftBuffer2, CUFFT_INVERSE));
+
+	// Step 4: IFFT (use per-stream plan)
+	checkCufftErrors(cufftExecC2C(fftPlan, d_fftBuffer2, d_fftBuffer2, CUFFT_INVERSE));
 	
 	// Step 5: Fixed-pattern noise removal
 	if (config.processingParams.fixedPatternNoise.enabled) {
@@ -774,7 +901,7 @@ void CudaBackend::process(IOBuffer& input) {
 	}
 	
 	// Step 6: Post-process truncate (magnitude, log scaling, copy to output)
-	float* d_currBuffer = this->impl->d_processedBuffer;
+	float* d_currBuffer = d_processedBuffer;
 	
 	if (config.processingParams.intensity.logScale) {
 		cuda_kernels::postProcessTruncateLog<<<gridSize/2, blockSize, 0, stream>>>(
@@ -800,14 +927,14 @@ void CudaBackend::process(IOBuffer& input) {
 	}
 	
 	// Step 8: Sinusoidal scan correction
-	if (config.processingParams.geometry.sinusoidalCorrection && 
-		this->impl->d_sinusoidalScanTmpBuffer != nullptr) {
+	if (config.processingParams.geometry.sinusoidalCorrection &&
+		d_sinusoidalScanTmpBuffer != nullptr) {
 		checkCudaErrors(cudaMemcpyAsync(
-			this->impl->d_sinusoidalScanTmpBuffer, d_currBuffer,
+			d_sinusoidalScanTmpBuffer, d_currBuffer,
 			sizeof(float) * samplesPerBuffer / 2,
 			cudaMemcpyDeviceToDevice, stream));
 		cuda_kernels::sinusoidalScanCorrection<<<gridSize/2, blockSize, 0, stream>>>(
-			d_currBuffer, this->impl->d_sinusoidalScanTmpBuffer,
+			d_currBuffer, d_sinusoidalScanTmpBuffer,
 			this->impl->d_sinusoidalResampleCurve, signalLength / 2,
 			ascansPerBscan, bscansPerBuffer, samplesPerBuffer / 2);
 	}
@@ -855,7 +982,7 @@ void CudaBackend::process(IOBuffer& input) {
 	}
 	
 	// Step 10: Copy result to host output buffer asynchronously
-	currentOutputBuf->setBufferId(bufferId); // propagate buffer ID from input to output to make it possible to match input and output buffers
+	currentOutputBuf->setBufferId(bufferId);
 	size_t outputSize = (samplesPerBuffer / 2) * sizeof(float);
 	checkCudaErrors(cudaMemcpyAsync(
 		currentOutputBuf->getDataPointer(),
@@ -864,17 +991,16 @@ void CudaBackend::process(IOBuffer& input) {
 		cudaMemcpyDeviceToHost,
 		stream
 	));
-	
-	// Step 11: Register callbacks to be called when stream completes
+
+	// Step 11: Register callback with ordering (waits for its turn before invoking user callback)
 	if (this->impl->callback) {
-		// Get pre-allocated callback data for output callback
 		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
 		          static_cast<int>(this->impl->callbackDataPool.size());
 		Impl::CallbackData* callbackData = &this->impl->callbackDataPool[idx];
 		callbackData->outputBuffer = currentOutputBuf;
 		checkCudaErrors(cudaLaunchHostFunc(stream, outputCallback, callbackData));
 	}
-	
+
 	// Check for errors
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) {
@@ -1172,15 +1298,22 @@ void CudaBackend::allocateDeviceBuffers() {
 	}
 #endif
 	
-	// Allocate processing buffers
-	checkCudaErrors(cudaMalloc(&this->impl->d_fftBuffer, 
-		sizeof(cufftComplex) * this->impl->samplesPerBuffer));
-	
-	checkCudaErrors(cudaMalloc(&this->impl->d_inputLinearized, 
-		sizeof(cufftComplex) * this->impl->samplesPerBuffer));
-	
-	checkCudaErrors(cudaMalloc(&this->impl->d_processedBuffer, 
-		sizeof(float) * this->impl->samplesPerBuffer / 2));
+	// Allocate processing buffers (one per stream for parallel execution)
+	this->impl->d_fftBuffers.resize(this->impl->numStreams);
+	this->impl->d_inputLinearizedBuffers.resize(this->impl->numStreams);
+	this->impl->d_processedBuffers.resize(this->impl->numStreams);
+	this->impl->d_sinusoidalScanTmpBuffers.resize(this->impl->numStreams);
+
+	for (int i = 0; i < this->impl->numStreams; ++i) {
+		checkCudaErrors(cudaMalloc(&this->impl->d_fftBuffers[i],
+			sizeof(cufftComplex) * this->impl->samplesPerBuffer));
+		checkCudaErrors(cudaMalloc(&this->impl->d_inputLinearizedBuffers[i],
+			sizeof(cufftComplex) * this->impl->samplesPerBuffer));
+		checkCudaErrors(cudaMalloc(&this->impl->d_processedBuffers[i],
+			sizeof(float) * this->impl->samplesPerBuffer / 2));
+		checkCudaErrors(cudaMalloc(&this->impl->d_sinusoidalScanTmpBuffers[i],
+			sizeof(float) * this->impl->samplesPerBuffer / 2));
+	}
 	
 	// Allocate curve buffers
 	checkCudaErrors(cudaMalloc(&this->impl->d_resampleCurve, 
@@ -1203,11 +1336,8 @@ void CudaBackend::allocateDeviceBuffers() {
 		sizeof(cufftComplex) * this->impl->signalLength));
 	
 	// Allocate post-processing buffers
-	checkCudaErrors(cudaMalloc(&this->impl->d_postProcBackgroundLine, 
+	checkCudaErrors(cudaMalloc(&this->impl->d_postProcBackgroundLine,
 		sizeof(float) * this->impl->signalLength / 2));
-	
-	checkCudaErrors(cudaMalloc(&this->impl->d_sinusoidalScanTmpBuffer, 
-		sizeof(float) * this->impl->samplesPerBuffer / 2));
 }
 
 void CudaBackend::releaseDeviceBuffers() {
@@ -1217,10 +1347,18 @@ void CudaBackend::releaseDeviceBuffers() {
 	}
 	this->impl->d_inputBuffers.clear();
 	
-	// Free processing buffers
-	if (this->impl->d_fftBuffer) { cudaFree(this->impl->d_fftBuffer); this->impl->d_fftBuffer = nullptr; }
-	if (this->impl->d_inputLinearized) { cudaFree(this->impl->d_inputLinearized); this->impl->d_inputLinearized = nullptr; }
-	if (this->impl->d_processedBuffer) { cudaFree(this->impl->d_processedBuffer); this->impl->d_processedBuffer = nullptr; }
+	// Free processing buffers (per-stream)
+	for (auto buf : this->impl->d_fftBuffers) { if (buf) cudaFree(buf); }
+	this->impl->d_fftBuffers.clear();
+
+	for (auto buf : this->impl->d_inputLinearizedBuffers) { if (buf) cudaFree(buf); }
+	this->impl->d_inputLinearizedBuffers.clear();
+
+	for (auto buf : this->impl->d_processedBuffers) { if (buf) cudaFree(buf); }
+	this->impl->d_processedBuffers.clear();
+
+	for (auto buf : this->impl->d_sinusoidalScanTmpBuffers) { if (buf) cudaFree(buf); }
+	this->impl->d_sinusoidalScanTmpBuffers.clear();
 	
 	// Free curve buffers
 	if (this->impl->d_resampleCurve) { cudaFree(this->impl->d_resampleCurve); this->impl->d_resampleCurve = nullptr; }
@@ -1234,7 +1372,6 @@ void CudaBackend::releaseDeviceBuffers() {
 	
 	// Free post-processing buffers
 	if (this->impl->d_postProcBackgroundLine) { cudaFree(this->impl->d_postProcBackgroundLine); this->impl->d_postProcBackgroundLine = nullptr; }
-	if (this->impl->d_sinusoidalScanTmpBuffer) { cudaFree(this->impl->d_sinusoidalScanTmpBuffer); this->impl->d_sinusoidalScanTmpBuffer = nullptr; }
 }
 
 void CudaBackend::createStreamsAndEvents() {
@@ -1251,12 +1388,12 @@ void CudaBackend::destroyStreamsAndEvents() {
 		if (stream) cudaStreamDestroy(stream);
 	}
 	this->impl->streams.clear();
-	
+
 	if (this->impl->userRequestStream) {
 		cudaStreamDestroy(this->impl->userRequestStream);
 		this->impl->userRequestStream = nullptr;
 	}
-	
+
 	if (this->impl->syncEvent) {
 		cudaEventDestroy(this->impl->syncEvent);
 		this->impl->syncEvent = nullptr;
