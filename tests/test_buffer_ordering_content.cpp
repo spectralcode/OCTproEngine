@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <cstring>
 
 const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
 
@@ -89,7 +90,7 @@ void testProgressiveDataContent() {
 		uint16_t* data = static_cast<uint16_t*>(inputBuffer.getDataPointer());
 
 		// Zero-fill entire buffer
-		std::memset(data, 0, signalLength * ascansPerBscan * bscansPerBuffer * sizeof(uint16_t));
+		memset(data, 0, signalLength * ascansPerBscan * bscansPerBuffer * sizeof(uint16_t));
 
 		// Fill first (bufferIdx + 1) A-scans with pattern
 		int linesToFill = (bufferIdx % ascansPerBscan) + 1;
