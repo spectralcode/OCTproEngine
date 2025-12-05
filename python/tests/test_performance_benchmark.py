@@ -57,7 +57,9 @@ else:
 ENABLE_RESAMPLING = True
 ENABLE_WINDOWING = True
 ENABLE_DISPERSION = True
-ENABLE_DC_REMOVAL = True
+ENABLE_DC_REMOVAL = False
+ENABLE_FIXED_PATTERN_NOISE_REMOVAL = True
+ENABLE_POSTPROCESS_BACKGROUND_SUBTRACTION = False
 ENABLE_LOG_SCALING = True
 ENABLE_BSCAN_FLIP = False
 
@@ -173,6 +175,16 @@ def configure_processor(processor, signal_length, ascans_per_bscan, bscans_per_b
         )
     
     processor.enable_background_removal(ENABLE_DC_REMOVAL)
+
+    processor.enable_fixed_pattern_noise_removal(ENABLE_FIXED_PATTERN_NOISE_REMOVAL)
+    if ENABLE_FIXED_PATTERN_NOISE_REMOVAL:
+        processor.request_fixed_pattern_noise_determination()
+
+
+    processor.enable_post_process_background_subtraction(ENABLE_POSTPROCESS_BACKGROUND_SUBTRACTION)
+    if ENABLE_POSTPROCESS_BACKGROUND_SUBTRACTION:
+        processor.request_post_process_background_recording()
+
     processor.enable_log_scaling(ENABLE_LOG_SCALING)
     processor.set_grayscale_range(GRAYSCALE_MIN, GRAYSCALE_MAX)
     processor.enable_bscan_flip(ENABLE_BSCAN_FLIP)
@@ -340,9 +352,13 @@ def print_configuration():
     if ENABLE_DISPERSION:
         enabled.append("Dispersion")
     if ENABLE_DC_REMOVAL:
-        enabled.append("BG-Removal")
+        enabled.append("DC-Removal")
+    if ENABLE_FIXED_PATTERN_NOISE_REMOVAL:
+        enabled.append("FPN-Removal")
     if ENABLE_LOG_SCALING:
         enabled.append("Log-Scale")
+    if ENABLE_POSTPROCESS_BACKGROUND_SUBTRACTION:
+        enabled.append("Post-Proc. BG-Subtraction")
 
     print(" + ".join(enabled))
     print(f"  Iterations per test: {ITERATIONS}")
