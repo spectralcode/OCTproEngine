@@ -149,6 +149,7 @@ public:
 				throw std::runtime_error("Unknown backend type");
 		}
 		this->backendType = type;
+		this->nextBufferId = 0;
 	}
 
 	// Helper methods: Get appropriate curve based on flags
