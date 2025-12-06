@@ -68,9 +68,12 @@ bool IOBuffer::allocateMemory(size_t sizeInBytes) {
 
 void IOBuffer::releaseMemory() {
 	if (this->dataPtr) {
-		free_aligned(this->dataPtr);
+		if (!this->externalMemory) {
+			free_aligned(this->dataPtr);
+		}
 		this->dataPtr = nullptr;
 		this->sizeInBytes = 0;
+		this->externalMemory = false;
 	}
 }
 
@@ -128,12 +131,33 @@ uint64_t IOBuffer::getBufferId() const {
 	return this->bufferId;
 }
 
+void IOBuffer::setBackendIndex(int index) {
+	this->backendIndex = index;
+}
+
+int IOBuffer::getBackendIndex() const {
+	return this->backendIndex;
+}
+
 void IOBuffer::setAllocationHint(AllocationHint hint) {
 	this->allocationHint = hint;
 }
 
 IOBuffer::AllocationHint IOBuffer::getAllocationHint() const {
 	return this->allocationHint;
+}
+
+//workaround to allow vulkan to use its own allocated memory
+// todo: think about a better way to handle this
+void IOBuffer::setExternalMemory(void* ptr, size_t size) { 
+	this->releaseMemory();
+	this->dataPtr = ptr;
+	this->sizeInBytes = size;
+	this->externalMemory = true;
+}
+
+bool IOBuffer::isUsingExternalMemory() const {
+	return this->externalMemory;
 }
 
 } // namespace ope

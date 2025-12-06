@@ -38,16 +38,29 @@ public:
 	void setBufferId(uint64_t id);
 	uint64_t getBufferId() const;
 
+	// Backend buffer index (for internal backend use to map IOBuffer to staging buffers/command buffers)
+	void setBackendIndex(int index);
+	int getBackendIndex() const;
+
 	// Allocation hint (must be set before allocateMemory)
 	void setAllocationHint(AllocationHint hint);
 	AllocationHint getAllocationHint() const;
+
+	// Zero-copy external memory support (for direct GPU staging buffer access)
+	// External memory is NOT owned by IOBuffer and will NOT be freed on destruction
+	// todo: think about a better way to handle this. 
+	// find a simple and clean way to handle memory for all backends in a unified way and not to have special cases like this here for vulkan
+	void setExternalMemory(void* ptr, size_t size);
+	bool isUsingExternalMemory() const;
 
 private:
 	void* dataPtr;
 	size_t sizeInBytes;
 	DataType dataType;
 	uint64_t bufferId;
+	int backendIndex = -1;  // Internal backend index (-1 = unset)
 	AllocationHint allocationHint;
+	bool externalMemory = false;  // If true, dataPtr points to external memory (don't free)
 };
 
 } // namespace ope

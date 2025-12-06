@@ -102,7 +102,7 @@ struct VulkanBackend::Impl {
 	ProcessorConfiguration config;
 
 	// Vulkan parameters
-	int numCommandBuffers = 2;  // Equivalent to CUDA streams
+	int numCommandBuffers = 3;
 	int deviceId = 0;
 	bool vulkanInitialized = false;
 
@@ -126,7 +126,14 @@ struct VulkanBackend::Impl {
 	VkCommandPool transferCommandPool = VK_NULL_HANDLE;
 	std::vector<VkCommandBuffer> transferCommandBuffers;
 	bool useSeparateTransferQueue = false;
-	std::vector<VkSemaphore> transferToComputeSemaphores;  // Signal from transfer, wait on compute
+	std::vector<VkSemaphore> transferToComputeSemaphores;  // Signal from H2D transfer, wait on compute
+
+	// D2H Transfer queue (for bidirectional DMA)
+	VkQueue d2hTransferQueue = VK_NULL_HANDLE;
+	VkCommandPool d2hTransferCommandPool = VK_NULL_HANDLE;
+	std::vector<VkCommandBuffer> d2hTransferCommandBuffers;
+	std::vector<VkSemaphore> computeToD2hSemaphores;  // Signal from compute, wait on D2H transfer
+	bool useBidirectionalTransfer = false;  // True if 2 transfer queues available
 
 	// Timeline semaphore for ordered output transfers (ensures buffer N completes before buffer N+1)
 	VkSemaphore outputOrderingSemaphore = VK_NULL_HANDLE;
@@ -140,11 +147,12 @@ struct VulkanBackend::Impl {
 	VkCommandPool commandPool = VK_NULL_HANDLE;
 	std::vector<VkCommandBuffer> commandBuffers;
 	std::vector<VkFence> fences;
-	int currentCommandBuffer = 0;
+	// Note: No round-robin index needed - zero-copy input determines CB from buffer pointer
 	bool commandBuffersValid = false;  // Track if command buffers need re-recording
 
 	// Input buffer management (queue-based, thread-safe)
-	int numInputBuffers = numCommandBuffers;  // Default 2
+	// Zero-copy: numInputBuffers == numCommandBuffers (each input buffer is backed by staging)
+	int numInputBuffers = numCommandBuffers;
 	std::vector<IOBuffer> hostInputBuffers;
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
@@ -163,14 +171,15 @@ struct VulkanBackend::Impl {
 	std::vector<VkBuffer> deviceInputBuffers;
 	std::vector<VkDeviceMemory> deviceInputMemory;
 
-	VkBuffer deviceFftBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory deviceFftMemory = VK_NULL_HANDLE;
+	// Per-command-buffer processing buffers (eliminates data races, enables parallel execution)
+	std::vector<VkBuffer> deviceFftBuffers;
+	std::vector<VkDeviceMemory> deviceFftMemory;
 
-	VkBuffer deviceIntermediateBuffer = VK_NULL_HANDLE;  // For preprocessing ping-pong
-	VkDeviceMemory deviceIntermediateMemory = VK_NULL_HANDLE;
+	std::vector<VkBuffer> deviceIntermediateBuffers;  // For preprocessing ping-pong
+	std::vector<VkDeviceMemory> deviceIntermediateMemory;
 
-	VkBuffer deviceProcessedBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory deviceProcessedMemory = VK_NULL_HANDLE;
+	std::vector<VkBuffer> deviceProcessedBuffers;
+	std::vector<VkDeviceMemory> deviceProcessedMemory;
 
 	// Curve buffers
 	VkBuffer resampleCurveBuffer = VK_NULL_HANDLE;
@@ -196,6 +205,7 @@ struct VulkanBackend::Impl {
 	void* postProcBackgroundStagingMapped = nullptr;  // Mapped pointer for readback
 	bool postProcessBackgroundRecordingRequested = false;
 	bool hasValidBackgroundProfile = false;  // Track whether background profile has been set
+	std::atomic<bool> needRerecordAfterBgCapture{false};  // Trigger CB re-record after bg capture completes
 	std::vector<float> recordedPostProcessBackground;
 
 	// Compute pipelines (will be created later)
@@ -267,6 +277,7 @@ struct VulkanBackend::Impl {
 		VkFence fence;
 		int commandBufferIdx;
 		IOBuffer* outputBuffer;
+		IOBuffer* inputBuffer;   // Zero-copy: return to free queue after callback
 		size_t outputSize;
 		int outputSignalLength;
 		uint64_t timelineValue;  // Timeline semaphore value to wait for
@@ -326,10 +337,6 @@ struct VulkanBackend::Impl {
 				continue;
 			}
 
-			// Copy output from staging to output buffer
-			std::memcpy(work.outputBuffer->getDataPointer(),
-			            this->stagingOutputMapped[work.commandBufferIdx],
-			            work.outputSize);
 
 			// If background recording was requested, copy the recorded profile from staging buffer
 			if (this->postProcessBackgroundRecordingRequested) {
@@ -343,9 +350,9 @@ struct VulkanBackend::Impl {
 				this->hasValidBackgroundProfile = true;
 				this->postProcessBackgroundRecordingRequested = false;
 
-				// Re-record command buffers to now apply background subtraction (if enabled)
-				// This must be done on the main thread or with proper synchronization
-				// For now, just mark the profile as recorded; it will be applied on next call to process()
+				// Trigger re-record of command buffers on next process() call
+				// This removes the background recording dispatch (now only subtraction will run)
+				this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
 			}
 
 			// Restore buffer ID and invoke callback if registered
@@ -362,12 +369,23 @@ struct VulkanBackend::Impl {
 				this->lastProcessedTimelineValue = work.timelineValue;
 			}
 			this->stagingBufferCV.notify_all();
+
+			// Return input buffer to free queue now that GPU and callback are done
+			// Input buffer is backed by staging memory, which is now safe to write to
+			{
+				std::lock_guard<std::mutex> lock(this->freeQueueMutex);
+				this->freeBuffersQueue.push(work.inputBuffer);
+			}
+			this->freeQueueCV.notify_one();
 		}
 	}
 
 	// Record all command buffers with current configuration
 	// Called when commandBuffersValid is false (first run or after config change)
 	void recordAllCommandBuffers();
+
+	// Record D2H transfer command buffers (separate from compute for bidirectional DMA)
+	void recordD2hTransferCommandBuffers();
 };
 
 // ============================================
@@ -489,7 +507,6 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                   0, sizeof(pushConstants), pushConstants);
 
 	// Dispatch compute shader
-	uint32_t numWorkgroups = (this->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 	vkCmdDispatch(cmd, numWorkgroups, 1, 1);
 
 	// Barrier after input conversion
@@ -499,7 +516,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	preprocessBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	preprocessBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	preprocessBarrier.buffer = this->deviceFftBuffer;
+	preprocessBarrier.buffer = this->deviceFftBuffers[idx];
 	preprocessBarrier.offset = 0;
 	preprocessBarrier.size = VK_WHOLE_SIZE;
 
@@ -550,7 +567,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
 
 		// Barrier after DC removal
-		preprocessBarrier.buffer = this->deviceIntermediateBuffer;
+		preprocessBarrier.buffer = this->deviceIntermediateBuffers[idx];
 		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -592,11 +609,11 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Dispatch universal pre-FFT shader
 		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
 
-		// Barrier after universal pre-FFT operation
+		// Barrier after universal pre-FFT operation (also serves as FFT input barrier)
 		// Output buffer depends on input: if reading from intermediate (DC enabled), writes to fft
-		preprocessBarrier.buffer = dcRemoval ? this->deviceFftBuffer : this->deviceIntermediateBuffer;
+		preprocessBarrier.buffer = dcRemoval ? this->deviceFftBuffers[idx] : this->deviceIntermediateBuffers[idx];
 		preprocessBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		preprocessBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // VkFFT needs both
 		vkCmdPipelineBarrier(cmd,
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -610,26 +627,10 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 
 	// Select FFT buffer dynamically based on where data is (eliminates unnecessary buffer copy)
-	VkBuffer* fftBuffer = dataInFftBuffer ? &this->deviceFftBuffer : &this->deviceIntermediateBuffer;
+	VkBuffer* fftBuffer = dataInFftBuffer ? &this->deviceFftBuffers[idx] : &this->deviceIntermediateBuffers[idx];
 
-	// Final barrier before FFT
-	VkBufferMemoryBarrier fftInputBarrier = {};
-	fftInputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	fftInputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	fftInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-	fftInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	fftInputBarrier.buffer = *fftBuffer;
-	fftInputBarrier.offset = 0;
-	fftInputBarrier.size = VK_WHOLE_SIZE;
-
-	vkCmdPipelineBarrier(cmd,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0,
-	                     0, nullptr,
-	                     1, &fftInputBarrier,
-	                     0, nullptr);
+	// Note: barrier before FFT is already handled by the universal pre-FFT barrier above
+	// (both are on the same buffer, so the second barrier would be redundant)
 
 	// ============================================
 	// Execute VkFFT (Inverse FFT)
@@ -668,6 +669,17 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	int requiredAscans = this->config.processingParams.fixedPatternNoise.bscanAverageCount * this->ascansPerBscan;
 	int availableAscans = this->ascansPerBscan * this->bscansPerBuffer;
 
+	// Warn if FPN is enabled but not enough A-scans available (once per recording)
+	static bool fpnWarningShown = false;
+	if (this->config.processingParams.fixedPatternNoise.enabled &&
+	    !this->fixedPatternNoiseDetermined &&
+	    requiredAscans > availableAscans &&
+	    !fpnWarningShown) {
+		std::cerr << "[VulkanBackend] Warning: FPN determination requires " << requiredAscans
+		          << " A-scans but only " << availableAscans << " available per buffer" << std::endl;
+		fpnWarningShown = true;
+	}
+
 	if (this->config.processingParams.fixedPatternNoise.enabled &&
 	    !this->fixedPatternNoiseDetermined &&
 	    requiredAscans <= availableAscans) {
@@ -691,7 +703,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 			uint32_t outputSignalLength;  // Same as width
 		} fpnPush;
 
-		int outputSignalLength = this->signalLength / 2;
+		int outputSignalLength = this->signalLength / 2; // todo: when truncate step becomes optional, outputSignalLength needs to be obtained differently
 		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
 		fpnPush.height = static_cast<uint32_t>(requiredAscans);  // Use bscanAverageCount * ascansPerBscan (like CUDA/OpenCL)
 		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
@@ -786,7 +798,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	postFFTBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;  // Background subtraction reads and writes
 	postFFTBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	postFFTBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	postFFTBarrier.buffer = this->deviceProcessedBuffer;
+	postFFTBarrier.buffer = this->deviceProcessedBuffers[idx];
 	postFFTBarrier.offset = 0;
 	postFFTBarrier.size = VK_WHOLE_SIZE;
 
@@ -903,60 +915,89 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Dispatch background subtraction shader
 		uint32_t bgWorkgroups = (bgPush.samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 		vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
-
-		// Barrier after background subtraction (wait for writes to complete before copy)
-		VkBufferMemoryBarrier bgBarrier = {};
-		bgBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		bgBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		bgBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		bgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		bgBarrier.buffer = this->deviceProcessedBuffer;
-		bgBarrier.offset = 0;
-		bgBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &bgBarrier,
-		                     0, nullptr);
-	} else {
-		// No background subtraction, add barrier for transfer
-		VkBufferMemoryBarrier transferBarrier = {};
-		transferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		transferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		transferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		transferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		transferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		transferBarrier.buffer = this->deviceProcessedBuffer;
-		transferBarrier.offset = 0;
-		transferBarrier.size = VK_WHOLE_SIZE;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &transferBarrier,
-		                     0, nullptr);
 	}
 
-	// ============================================
-	// Copy Truncated Output to Staging
-	// ============================================
+	// Release barrier for D2H on separate queue (shared by both paths)
+	// Only set queue family indices when actually transferring between different families
+	VkBufferMemoryBarrier d2hReleaseBarrier = {};
+	d2hReleaseBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	d2hReleaseBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	d2hReleaseBarrier.dstAccessMask = 0;  // Release barrier
+	if (this->useSeparateTransferQueue) {
+		d2hReleaseBarrier.srcQueueFamilyIndex = this->queueFamilyIndex;
+		d2hReleaseBarrier.dstQueueFamilyIndex = this->transferQueueFamilyIndex;
+	} else {
+		d2hReleaseBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		d2hReleaseBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	}
+	d2hReleaseBarrier.buffer = this->deviceProcessedBuffers[idx];
+	d2hReleaseBarrier.offset = 0;
+	d2hReleaseBarrier.size = VK_WHOLE_SIZE;
 
-	// Copy processed buffer (truncated) to staging output (GPU → CPU transfer)
-	size_t truncatedOutputSize = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
-	VkBufferCopy finalCopy = {};
-	finalCopy.size = truncatedOutputSize;
-	vkCmdCopyBuffer(cmd, this->deviceProcessedBuffer, this->stagingOutputBuffers[idx], 1, &finalCopy);
+	vkCmdPipelineBarrier(cmd,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+	                     0,
+	                     0, nullptr,
+	                     1, &d2hReleaseBarrier,
+	                     0, nullptr);
+
+	// D2H transfer is now handled by separate D2H command buffer (see recordD2hTransferCommandBuffers)
 
 	checkVulkanErrors(vkEndCommandBuffer(cmd));
 	}  // End of loop through all command buffers
 
+	// Record D2H transfer command buffers
+	this->recordD2hTransferCommandBuffers();
+
 	this->commandBuffersValid = true;
+}
+
+void VulkanBackend::Impl::recordD2hTransferCommandBuffers() {
+	int outputSignalLength = this->signalLength / 2;
+	size_t outputSize = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = 0;
+
+	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
+		VkCommandBuffer d2hCmd = this->d2hTransferCommandBuffers[idx];
+
+		checkVulkanErrors(vkBeginCommandBuffer(d2hCmd, &beginInfo));
+
+		// Acquire barrier (for queue family ownership transfer) only if different queue families
+		// useSeparateTransferQueue means transfer queue is in a DIFFERENT family from compute
+		// useBidirectionalTransfer can be true even with same-family multi-queue (no ownership transfer needed)
+		if (this->useSeparateTransferQueue) {
+			VkBufferMemoryBarrier acquireBarrier = {};
+			acquireBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			acquireBarrier.srcAccessMask = 0;  // Acquire barrier
+			acquireBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			acquireBarrier.srcQueueFamilyIndex = this->queueFamilyIndex;  // From compute
+			acquireBarrier.dstQueueFamilyIndex = this->transferQueueFamilyIndex;  // To D2H queue
+			acquireBarrier.buffer = this->deviceProcessedBuffers[idx];
+			acquireBarrier.offset = 0;
+			acquireBarrier.size = VK_WHOLE_SIZE;
+
+			vkCmdPipelineBarrier(d2hCmd,
+			                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                     0,
+			                     0, nullptr,
+			                     1, &acquireBarrier,
+			                     0, nullptr);
+		}
+
+		// D2H copy: device processed buffer → staging output buffer
+		VkBufferCopy copyRegion = {};
+		copyRegion.srcOffset = 0;
+		copyRegion.dstOffset = 0;
+		copyRegion.size = outputSize;
+		vkCmdCopyBuffer(d2hCmd, this->deviceProcessedBuffers[idx], this->stagingOutputBuffers[idx], 1, &copyRegion);
+
+		checkVulkanErrors(vkEndCommandBuffer(d2hCmd));
+	}
 }
 
 
@@ -1050,7 +1091,7 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
 	appInfo.pEngineName = "OCTproEngine";
 	appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-	appInfo.apiVersion = VK_API_VERSION_1_1;  // Use Vulkan 1.1 for better VkFFT compatibility
+	appInfo.apiVersion = VK_API_VERSION_1_2;  // Use Vulkan 1.2 for timeline semaphores
 
 	VkInstanceCreateInfo instanceCreateInfo = {};
 	instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -1105,57 +1146,121 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		throw std::runtime_error("No compute queue family found");
 	}
 
-	// Fallback: use compute queue for transfers if no dedicated queue
 	this->impl->queueFamilyIndex = computeFamily;
 	this->impl->transferQueueFamilyIndex = (transferFamily != UINT32_MAX) ? transferFamily : computeFamily;
 	this->impl->useSeparateTransferQueue = (transferFamily != UINT32_MAX);
 
-	// For debug/info purposes
-	//std::cout << "Queue families: Compute=" << computeFamily;
-	//if (this->impl->useSeparateTransferQueue) {
-	//	std::cout << ", Dedicated Transfer=" << transferFamily << " (async GPU transfers enabled!)";
-	//} else {
-	//	std::cout << ", Transfer=" << this->impl->transferQueueFamilyIndex << " (shared with compute)";
-	//}
-	//std::cout << std::endl;
+	// Determine how many queues are available for parallelism
+	uint32_t computeFamilyQueueCount = queueFamilies[computeFamily].queueCount;
+	uint32_t transferFamilyQueueCount = (transferFamily != UINT32_MAX) ? queueFamilies[transferFamily].queueCount : 0;
+
+	// Check if bidirectional DMA is available:
+	// Option 1: Dedicated transfer family with 2+ queues
+	// Option 2: Compute family with 3+ queues (compute + H2D + D2H)
+	// Option 3: Compute family with 2+ queues (compute + shared transfer)
+	if (this->impl->useSeparateTransferQueue && transferFamilyQueueCount >= 2) {
+		this->impl->useBidirectionalTransfer = true;
+	} else if (!this->impl->useSeparateTransferQueue && computeFamilyQueueCount >= 2) {
+		// Use multiple queues from compute family for transfer parallelism
+		this->impl->useBidirectionalTransfer = (computeFamilyQueueCount >= 3);
+	} else {
+		this->impl->useBidirectionalTransfer = false;
+	}
 
 	// Create logical device
 	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-	std::vector<float> queuePriorities = {1.0f};
+	std::vector<float> multiQueuePriorities = {1.0f, 1.0f, 1.0f};  // Up to 3 queues
 
-	// Compute queue
+	// Compute queue(s) - request multiple if no separate transfer family
 	VkDeviceQueueCreateInfo computeQueueInfo = {};
 	computeQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 	computeQueueInfo.queueFamilyIndex = this->impl->queueFamilyIndex;
-	computeQueueInfo.queueCount = 1;
-	computeQueueInfo.pQueuePriorities = queuePriorities.data();
+	computeQueueInfo.pQueuePriorities = multiQueuePriorities.data();
+
+	if (this->impl->useSeparateTransferQueue) {
+		// Dedicated transfer family exists - only need 1 compute queue
+		computeQueueInfo.queueCount = 1;
+	} else {
+		// No dedicated transfer family - request multiple queues from compute family
+		// Request up to 3 queues: compute, H2D transfer, D2H transfer
+		computeQueueInfo.queueCount = std::min(computeFamilyQueueCount, 3u);
+	}
 	queueCreateInfos.push_back(computeQueueInfo);
 
-	// Transfer queue (if different family)
+	// Transfer queue(s) (only if different family)
 	if (this->impl->useSeparateTransferQueue) {
 		VkDeviceQueueCreateInfo transferQueueInfo = {};
 		transferQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 		transferQueueInfo.queueFamilyIndex = this->impl->transferQueueFamilyIndex;
-		transferQueueInfo.queueCount = 1;
-		transferQueueInfo.pQueuePriorities = queuePriorities.data();
+		transferQueueInfo.pQueuePriorities = multiQueuePriorities.data();
+		// Request up to 2 queues for bidirectional DMA (H2D + D2H)
+		transferQueueInfo.queueCount = std::min(transferFamilyQueueCount, 2u);
 		queueCreateInfos.push_back(transferQueueInfo);
 	}
 
-	// Query device features and enable what we need
-	VkPhysicalDeviceFeatures deviceFeatures = {};
-	vkGetPhysicalDeviceFeatures(this->impl->physicalDevice, &deviceFeatures);
+	// Query Vulkan 1.2 features and enable timeline semaphores
+	VkPhysicalDeviceVulkan12Features features12 = {};
+	features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+
+	VkPhysicalDeviceFeatures2 features2 = {};
+	features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	features2.pNext = &features12;
+
+	vkGetPhysicalDeviceFeatures2(this->impl->physicalDevice, &features2);
+
+	if (!features12.timelineSemaphore) {
+		throw std::runtime_error("Device does not support timeline semaphores (Vulkan 1.2 required)");
+	}
+
+	// Enable timeline semaphores
+	features12.timelineSemaphore = VK_TRUE;
 
 	VkDeviceCreateInfo deviceCreateInfo = {};
 	deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	deviceCreateInfo.pNext = &features12;
 	deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
 	deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
-	deviceCreateInfo.pEnabledFeatures = &deviceFeatures;
+	deviceCreateInfo.pEnabledFeatures = &features2.features;
 
 	checkVulkanErrors(vkCreateDevice(this->impl->physicalDevice, &deviceCreateInfo, nullptr, &this->impl->device));
 
-	// Get compute and transfer queues
-	vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 0, &this->impl->computeQueue);
-	vkGetDeviceQueue(this->impl->device, this->impl->transferQueueFamilyIndex, 0, &this->impl->transferQueue);
+	// Get queues. strategy depends on whether we have a dedicated transfer family
+	if (this->impl->useSeparateTransferQueue) {
+		// Dedicated transfer family exists
+		vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 0, &this->impl->computeQueue);
+		vkGetDeviceQueue(this->impl->device, this->impl->transferQueueFamilyIndex, 0, &this->impl->transferQueue);
+		
+		if (this->impl->useBidirectionalTransfer) {
+			vkGetDeviceQueue(this->impl->device, this->impl->transferQueueFamilyIndex, 1, &this->impl->d2hTransferQueue);
+		//	std::cout << "[VulkanBackend] Bidirectional DMA: dedicated transfer family with 2 queues" << std::endl;
+		} else {
+			this->impl->d2hTransferQueue = this->impl->transferQueue;
+		//	std::cout << "[VulkanBackend] DMA: dedicated transfer family with 1 queue" << std::endl;
+		}
+	} else {
+		// No dedicated transfer family. use multiple queues from compute family
+		vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 0, &this->impl->computeQueue);
+
+		if (computeFamilyQueueCount >= 2) {
+			// Use queue 1 for H2D transfers (separate from compute)
+			vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 1, &this->impl->transferQueue);
+
+			if (computeFamilyQueueCount >= 3) {
+				// Use queue 2 for D2H transfers (full bidirectional)
+				vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 2, &this->impl->d2hTransferQueue);
+				std::cout << "[VulkanBackend] Bidirectional DMA: 3 queues from compute family (compute + H2D + D2H)" << std::endl;
+			} else {
+				// Only 2 queues - share queue 1 for both H2D and D2H
+				this->impl->d2hTransferQueue = this->impl->transferQueue;
+				std::cout << "[VulkanBackend] DMA: 2 queues from compute family (compute + transfers)" << std::endl;
+			}
+		} else {
+			// Only 1 queue - everything serialized (worst case)
+			this->impl->transferQueue = this->impl->computeQueue;
+			this->impl->d2hTransferQueue = this->impl->computeQueue;
+			std::cout << "[VulkanBackend] Warning: Only 1 queue available - all operations serialized" << std::endl;
+		}
+	}
 
 	// Create compute command pool
 	VkCommandPoolCreateInfo poolInfo = {};
@@ -1172,6 +1277,15 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	transferPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
 	checkVulkanErrors(vkCreateCommandPool(this->impl->device, &transferPoolInfo, nullptr, &this->impl->transferCommandPool));
+
+	// Create D2H transfer command pool
+	// D2H uses transfer family if available, otherwise compute family (same as H2D in that case)
+	VkCommandPoolCreateInfo d2hPoolInfo = {};
+	d2hPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	d2hPoolInfo.queueFamilyIndex = this->impl->transferQueueFamilyIndex;
+	d2hPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+
+	checkVulkanErrors(vkCreateCommandPool(this->impl->device, &d2hPoolInfo, nullptr, &this->impl->d2hTransferCommandPool));
 
 	// Allocate buffers
 	this->allocateDeviceBuffers();
@@ -1206,8 +1320,8 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->fftConfig.fence = &this->impl->fftFence;  // Use dedicated fence for FFT operations
 	this->impl->fftConfig.isCompilerInitialized = 1;  // glslang initialized above
 
-	// Provide FFT buffer for VkFFT to use
-	this->impl->fftConfig.buffer = &this->impl->deviceFftBuffer;
+	// Provide FFT buffer for VkFFT initialization (actual buffer selected at launch time for per-CB execution)
+	this->impl->fftConfig.buffer = &this->impl->deviceFftBuffers[0];
 	this->impl->fftBufferSize = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float (2 floats per sample)
 	this->impl->fftConfig.bufferSize = &this->impl->fftBufferSize;
 
@@ -1237,15 +1351,14 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	// -1 = off, 0 = auto, 1 = on
 	this->impl->fftConfig.useLUT = 0;
 
-	// Target threads per block to match our shader work group size
+	// Target threads per block for VkFFT FFT kernel
 	this->impl->fftConfig.aimThreads = VULKAN_WORKGROUP_SIZE;
 
 	// Number of shared memory banks (NVIDIA has 32)
 	this->impl->fftConfig.numSharedBanks = 32;
 
-	// Try bandwidth boost optimization for better memory coalescing
-	// This reduces coalesced number to get bigger sequences in one upload
-	this->impl->fftConfig.performBandwidthBoost = 2;
+	// Bandwidth boost optimization //todo: test if different value has impact on performance
+	this->impl->fftConfig.performBandwidthBoost = 0;
 
 	// Initialize VkFFT
 	checkVkFFTErrors(initializeVkFFT(&this->impl->fftApp, this->impl->fftConfig));
@@ -1275,13 +1388,15 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	// AND after curve buffers are created so descriptor sets can reference them
 	this->createComputePipelines();
 
-	// Allocate and initialize host input buffers
+	// Setup input buffers using zero-copy (direct access to staging buffers)
+	// Each IOBuffer points directly to stagingInputMapped memory, eliminating memcpy in process()
 	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
-	this->impl->hostInputBuffers.resize(this->impl->numInputBuffers);
+	this->impl->hostInputBuffers.resize(this->impl->numCommandBuffers);
 
-	for (int i = 0; i < this->impl->numInputBuffers; ++i) {
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		this->impl->hostInputBuffers[i].setBackendIndex(i);
 		this->impl->hostInputBuffers[i].setDataType(config.dataParams.inputDataType);
-		this->impl->hostInputBuffers[i].allocateMemory(inputSize);
+		this->impl->hostInputBuffers[i].setExternalMemory(this->impl->stagingInputMapped[i], inputSize);
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
 	}
 
@@ -1293,8 +1408,9 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->outputBuffers.resize(this->impl->numCommandBuffers);
 
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		this->impl->outputBuffers[i].setBackendIndex(i);
 		this->impl->outputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
-		this->impl->outputBuffers[i].allocateMemory(outputSize);
+		this->impl->outputBuffers[i].setExternalMemory(this->impl->stagingOutputMapped[i], outputSize);
 	}
 
 	// Pre-record all command buffers for maximum performance
@@ -1380,6 +1496,12 @@ void VulkanBackend::cleanup() {
 		this->impl->transferCommandPool = VK_NULL_HANDLE;
 	}
 
+	// Destroy D2H transfer command pool
+	if (this->impl->d2hTransferCommandPool != VK_NULL_HANDLE) {
+		vkDestroyCommandPool(this->impl->device, this->impl->d2hTransferCommandPool, nullptr);
+		this->impl->d2hTransferCommandPool = VK_NULL_HANDLE;
+	}
+
 	// Destroy device
 	if (this->impl->device != VK_NULL_HANDLE) {
 		vkDestroyDevice(this->impl->device, nullptr);
@@ -1408,47 +1530,26 @@ void VulkanBackend::process(IOBuffer& input) {
 		throw std::runtime_error("Backend not initialized");
 	}
 
-	// Select command buffer (round-robin)
-	int idx = this->impl->currentCommandBuffer;
-	this->impl->currentCommandBuffer = (this->impl->currentCommandBuffer + 1) % this->impl->numCommandBuffers;
+	// Get the backend index that was set during buffer initialization
+	// Each input buffer has a fixed relationship to a command buffer
+	int idx = input.getBackendIndex(); 
+
 
 	VkCommandBuffer cmd = this->impl->commandBuffers[idx];
 	VkFence fence = this->impl->fences[idx];
 
-	// Wait for this CB to be available before writing to its staging buffers
-	// This ensures we don't overwrite staging buffers while GPU is reading them
-	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
-	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
-
-	// Wait for completion thread to finish with this CB's staging buffers
-	// This prevents overwriting staging output buffer while completion thread is copying from it
-	uint64_t lastTimelineValue = this->impl->lastTimelineValuePerCB[idx];
-	if (lastTimelineValue > 0) {
-		std::unique_lock<std::mutex> lock(this->impl->stagingBufferMutex);
-		this->impl->stagingBufferCV.wait(lock, [this, lastTimelineValue] {
-			return this->impl->lastProcessedTimelineValue >= lastTimelineValue;
-		});
-	}
-
-	// Copy input data to staging buffer (CPU → GPU transfer preparation)
-	// Now safe to write - GPU is done reading and completion thread is done copying
-	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
-	std::memcpy(this->impl->stagingInputMapped[idx], input.getDataPointer(), inputSize);
-
-	// Return input buffer - we've copied the data, don't need it anymore
-	{
-		std::lock_guard<std::mutex> lock(this->impl->freeQueueMutex);
-		this->impl->freeBuffersQueue.push(&input);
-	}
-	this->impl->freeQueueCV.notify_one();
+	// Zero-copy: Synchronization (fence wait + reset, timeline semaphore wait)
+	// is done in getNextAvailableInputBuffer() before user writes to buffer.
+	// User's data is already in staging buffer - no memcpy needed.
 
 	// Get output buffer for this command buffer
 	// Note: Don't set bufferId here - it would race with consumer threads reading it
 	// The completion thread restores bufferId from work.bufferId before callback
 	IOBuffer* outputBuf = &this->impl->outputBuffers[idx];
 
-	// Record all command buffers if needed (first call or after config change)
-	if (!this->impl->commandBuffersValid) {
+	// Record all command buffers if needed (first call, after config change, or after bg capture)
+	if (!this->impl->commandBuffersValid ||
+	    this->impl->needRerecordAfterBgCapture.exchange(false, std::memory_order_acq_rel)) {
 		this->impl->recordAllCommandBuffers();
 		cmd = this->impl->commandBuffers[idx];  // Restore cmd to current frame buffer
 	}
@@ -1472,42 +1573,56 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
 
-	// Submit compute command buffer with timeline semaphore for ordered output transfers
-	uint64_t waitValue = (this->impl->nextOutputSignalValue > this->impl->numCommandBuffers) 
-                      ? (this->impl->nextOutputSignalValue - this->impl->numCommandBuffers) 
-                      : 0;
+	// Submit compute command buffer. signals computeToD2hSemaphore when done
+	// Compute only waits on H2D transfer
 	uint64_t signalValue = this->impl->nextOutputSignalValue;
-	
-	// VkTimelineSemaphoreSubmitInfo specifies values for timeline semaphore operations
-	// Value arrays must match semaphore arrays in VkSubmitInfo
-	uint64_t waitValues[2] = {0, waitValue};      // [binary sem (ignored), timeline sem]
-	uint64_t signalValues[1] = {signalValue};     // Timeline semaphore signal value
 
-	VkTimelineSemaphoreSubmitInfo timelineSubmitInfo = {};
-	timelineSubmitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-	timelineSubmitInfo.pNext = nullptr;
-	timelineSubmitInfo.waitSemaphoreValueCount = 2;
-	timelineSubmitInfo.pWaitSemaphoreValues = waitValues;
-	timelineSubmitInfo.signalSemaphoreValueCount = 1;
-	timelineSubmitInfo.pSignalSemaphoreValues = signalValues;
-
-	// Wait on: transfer semaphore (binary) AND output ordering semaphore (timeline)
-	VkSemaphore waitSemaphores[2] = {transferCompleteSemaphore, this->impl->outputOrderingSemaphore};
-	VkPipelineStageFlags waitStages[2] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                                       VK_PIPELINE_STAGE_TRANSFER_BIT};
+	// Compute signals computeToD2hSemaphore (binary) to trigger D2H transfer
+	VkSemaphore computeToD2hSemaphore = this->impl->computeToD2hSemaphores[idx];
+	VkPipelineStageFlags computeWaitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
 	VkSubmitInfo computeSubmit = {};
 	computeSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	computeSubmit.pNext = &timelineSubmitInfo;
-	computeSubmit.waitSemaphoreCount = 2;
-	computeSubmit.pWaitSemaphores = waitSemaphores;
-	computeSubmit.pWaitDstStageMask = waitStages;
+	computeSubmit.waitSemaphoreCount = 1;
+	computeSubmit.pWaitSemaphores = &transferCompleteSemaphore;
+	computeSubmit.pWaitDstStageMask = &computeWaitStage;
 	computeSubmit.commandBufferCount = 1;
 	computeSubmit.pCommandBuffers = &cmd;
 	computeSubmit.signalSemaphoreCount = 1;
-	computeSubmit.pSignalSemaphores = &this->impl->outputOrderingSemaphore;
+	computeSubmit.pSignalSemaphores = &computeToD2hSemaphore;
 
-	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, fence));
+	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, VK_NULL_HANDLE));
+
+	// Submit D2H transfer command buffer. signals timeline semaphore for ordered completion
+	// D2H waits on: compute complete
+	// D2H signals: timeline semaphore (for completion thread ordering)
+	VkCommandBuffer d2hCmd = this->impl->d2hTransferCommandBuffers[idx];
+
+	uint64_t d2hWaitValues[1] = {0};         // Binary semaphore (ignored)
+	uint64_t d2hSignalValues[1] = {signalValue};  // Timeline semaphore signal value
+
+	VkTimelineSemaphoreSubmitInfo d2hTimelineInfo = {};
+	d2hTimelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+	d2hTimelineInfo.pNext = nullptr;
+	d2hTimelineInfo.waitSemaphoreValueCount = 1;
+	d2hTimelineInfo.pWaitSemaphoreValues = d2hWaitValues;
+	d2hTimelineInfo.signalSemaphoreValueCount = 1;
+	d2hTimelineInfo.pSignalSemaphoreValues = d2hSignalValues;
+
+	VkPipelineStageFlags d2hWaitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+	VkSubmitInfo d2hSubmit = {};
+	d2hSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	d2hSubmit.pNext = &d2hTimelineInfo;
+	d2hSubmit.waitSemaphoreCount = 1;
+	d2hSubmit.pWaitSemaphores = &computeToD2hSemaphore;
+	d2hSubmit.pWaitDstStageMask = &d2hWaitStage;
+	d2hSubmit.commandBufferCount = 1;
+	d2hSubmit.pCommandBuffers = &d2hCmd;
+	d2hSubmit.signalSemaphoreCount = 1;
+	d2hSubmit.pSignalSemaphores = &this->impl->outputOrderingSemaphore;
+
+	checkVulkanErrors(vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence));
 
 	this->impl->nextOutputSignalValue++;
 
@@ -1520,6 +1635,7 @@ void VulkanBackend::process(IOBuffer& input) {
 			fence,
 			idx,
 			outputBuf,
+			&input,                // Zero-copy: return input buffer to free queue after callback
 			outputSize,
 			outputSignalLength,
 			signalValue,           // Timeline semaphore value for this frame
@@ -1751,27 +1867,47 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 // ============================================
 
 IOBuffer& VulkanBackend::getInputBuffer(int index) {
-	if (index < 0 || index >= this->impl->numInputBuffers) {
+	// Zero-copy: Input buffers are tied to staging buffers (one per command buffer)
+	if (index < 0 || index >= this->impl->numCommandBuffers) {
 		throw std::out_of_range("Input buffer index out of range");
 	}
 	return this->impl->hostInputBuffers[index];
 }
 
 IOBuffer& VulkanBackend::getNextAvailableInputBuffer() {
-	std::unique_lock<std::mutex> lock(this->impl->freeQueueMutex);
+	IOBuffer* buffer = nullptr;
+	{
+		std::unique_lock<std::mutex> lock(this->impl->freeQueueMutex);
 
-	// Block until a buffer is available
-	while (this->impl->freeBuffersQueue.empty()) {
-		this->impl->freeQueueCV.wait(lock);
+		// Block until a buffer is available
+		while (this->impl->freeBuffersQueue.empty()) {
+			this->impl->freeQueueCV.wait(lock);
+		}
+
+		buffer = this->impl->freeBuffersQueue.front();
+		this->impl->freeBuffersQueue.pop();
 	}
 
-	IOBuffer* buffer = this->impl->freeBuffersQueue.front();
-	this->impl->freeBuffersQueue.pop();
+	// Get input buffer index that was set during initialization
+	int idx = buffer->getBackendIndex();
+
+	VkFence fence = this->impl->fences[idx];
+
+	// Wait for this CB to be available before writing to its input buffers
+	// This ensures we don't overwrite input buffers while GPU is reading them
+	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
+
+	// Note: No timeline wait needed here. freeBuffersQueue gating already guarantees
+	// completion thread has finished with this buffer (it only pushes after callback)
+
 	return *buffer;
 }
 
 int VulkanBackend::getNumInputBuffers() const {
-	return this->impl->numInputBuffers;
+	// there is one input buffer per command buffer
+	return this->impl->numCommandBuffers;
 }
 
 // ============================================
@@ -1780,6 +1916,7 @@ int VulkanBackend::getNumInputBuffers() const {
 
 void VulkanBackend::requestPostProcessBackgroundRecording() {
 	this->impl->postProcessBackgroundRecordingRequested = true;
+	this->impl->commandBuffersValid = false;  // Force re-record on next process()
 }
 
 void VulkanBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
@@ -1870,6 +2007,7 @@ const std::vector<float>& VulkanBackend::getPostProcessBackgroundProfile() const
 
 void VulkanBackend::requestFixedPatternNoiseDetermination() {
 	this->impl->fixedPatternNoiseDetermined = false;
+	this->impl->commandBuffersValid = false;  // Force re-record to include FPN determination shader
 }
 
 void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
@@ -2188,10 +2326,21 @@ void VulkanBackend::allocateDeviceBuffers() {
 	this->impl->stagingInputMapped.resize(this->impl->numCommandBuffers);
 
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		createBuffer(this->impl->device, this->impl->physicalDevice, inputSize,
-		             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		             this->impl->stagingInputBuffers[i], this->impl->stagingInputMemory[i]);
+		// Try to allocate with cached memory for fast CPU writes (uses cache hierarchy)
+		// HOST_CACHED + HOST_COHERENT = fast writes + automatic sync
+		// Fallback to non-cached if cached memory is not available on this platform
+		try {
+			createBuffer(this->impl->device, this->impl->physicalDevice, inputSize,
+			             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+			             this->impl->stagingInputBuffers[i], this->impl->stagingInputMemory[i]);
+		} catch (const std::runtime_error&) {
+			// HOST_CACHED not available - fall back to non-cached
+			createBuffer(this->impl->device, this->impl->physicalDevice, inputSize,
+			             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			             this->impl->stagingInputBuffers[i], this->impl->stagingInputMemory[i]);
+		}
 
 		// Map staging buffer memory
 		vkMapMemory(this->impl->device, this->impl->stagingInputMemory[i], 0, inputSize, 0, &this->impl->stagingInputMapped[i]);
@@ -2205,10 +2354,19 @@ void VulkanBackend::allocateDeviceBuffers() {
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		// Try to allocate with cached memory for fast CPU reads (60x faster than uncached!)
 		// HOST_CACHED + HOST_COHERENT = best of both worlds: fast reads + automatic sync
-		createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
-		             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-		             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+		// Fallback to non-cached if cached memory is not available on this platform
+		try {
+			createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+			             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+			             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+		} catch (const std::runtime_error&) {
+			// HOST_CACHED not available - fall back to non-cached (slower reads but still functional)
+			createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+			             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+		}
 
 		// Map staging buffer memory
 		vkMapMemory(this->impl->device, this->impl->stagingOutputMemory[i], 0, outputSize, 0, &this->impl->stagingOutputMapped[i]);
@@ -2225,23 +2383,33 @@ void VulkanBackend::allocateDeviceBuffers() {
 		             this->impl->deviceInputBuffers[i], this->impl->deviceInputMemory[i]);
 	}
 
-	// FFT buffer (complex float)
-	createBuffer(this->impl->device, this->impl->physicalDevice, complexSize,
-	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-	             this->impl->deviceFftBuffer, this->impl->deviceFftMemory);
+	// Per-command-buffer processing buffers (eliminates data races, enables parallel execution like CUDA)
+	this->impl->deviceFftBuffers.resize(this->impl->numCommandBuffers);
+	this->impl->deviceFftMemory.resize(this->impl->numCommandBuffers);
+	this->impl->deviceIntermediateBuffers.resize(this->impl->numCommandBuffers);
+	this->impl->deviceIntermediateMemory.resize(this->impl->numCommandBuffers);
+	this->impl->deviceProcessedBuffers.resize(this->impl->numCommandBuffers);
+	this->impl->deviceProcessedMemory.resize(this->impl->numCommandBuffers);
 
-	// Intermediate buffer for preprocessing ping-pong (same size as FFT buffer)
-	createBuffer(this->impl->device, this->impl->physicalDevice, complexSize,
-	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-	             this->impl->deviceIntermediateBuffer, this->impl->deviceIntermediateMemory);
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		// FFT buffer (complex float)
+		createBuffer(this->impl->device, this->impl->physicalDevice, complexSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->deviceFftBuffers[i], this->impl->deviceFftMemory[i]);
 
-	// Processed buffer (output)
-	createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
-	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-	             this->impl->deviceProcessedBuffer, this->impl->deviceProcessedMemory);
+		// Intermediate buffer for preprocessing ping-pong (same size as FFT buffer)
+		createBuffer(this->impl->device, this->impl->physicalDevice, complexSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->deviceIntermediateBuffers[i], this->impl->deviceIntermediateMemory[i]);
+
+		// Processed buffer (output)
+		createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->deviceProcessedBuffers[i], this->impl->deviceProcessedMemory[i]);
+	}
 
 	// Curve buffers
 	size_t curveSize = this->impl->signalLength * sizeof(float);
@@ -2262,7 +2430,9 @@ void VulkanBackend::allocateDeviceBuffers() {
 	             this->impl->dispersionCurveBuffer, this->impl->dispersionCurveMemory);
 
 	// Mean A-line buffer for fixed pattern noise (complex float, outputSignalLength size)
-	size_t meanALineSize = curveSize * 2;  // outputSignalLength * sizeof(complex float)
+	// outputSignalLength = signalLength / 2, complex float = 2 floats
+	// So size = (signalLength / 2) * 2 * sizeof(float) = signalLength * sizeof(float) = curveSize
+	size_t meanALineSize = curveSize;
 	createBuffer(this->impl->device, this->impl->physicalDevice, meanALineSize,
 	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -2351,25 +2521,32 @@ void VulkanBackend::releaseDeviceBuffers() {
 		}
 	}
 
-	if (this->impl->deviceFftBuffer != VK_NULL_HANDLE) {
-		vkDestroyBuffer(this->impl->device, this->impl->deviceFftBuffer, nullptr);
-	}
-	if (this->impl->deviceFftMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(this->impl->device, this->impl->deviceFftMemory, nullptr);
-	}
-
-	if (this->impl->deviceIntermediateBuffer != VK_NULL_HANDLE) {
-		vkDestroyBuffer(this->impl->device, this->impl->deviceIntermediateBuffer, nullptr);
-	}
-	if (this->impl->deviceIntermediateMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(this->impl->device, this->impl->deviceIntermediateMemory, nullptr);
+	// Destroy per-CB processing buffers (FFT, Intermediate, Processed)
+	for (size_t i = 0; i < this->impl->deviceFftBuffers.size(); ++i) {
+		if (this->impl->deviceFftBuffers[i] != VK_NULL_HANDLE) {
+			vkDestroyBuffer(this->impl->device, this->impl->deviceFftBuffers[i], nullptr);
+		}
+		if (this->impl->deviceFftMemory[i] != VK_NULL_HANDLE) {
+			vkFreeMemory(this->impl->device, this->impl->deviceFftMemory[i], nullptr);
+		}
 	}
 
-	if (this->impl->deviceProcessedBuffer != VK_NULL_HANDLE) {
-		vkDestroyBuffer(this->impl->device, this->impl->deviceProcessedBuffer, nullptr);
+	for (size_t i = 0; i < this->impl->deviceIntermediateBuffers.size(); ++i) {
+		if (this->impl->deviceIntermediateBuffers[i] != VK_NULL_HANDLE) {
+			vkDestroyBuffer(this->impl->device, this->impl->deviceIntermediateBuffers[i], nullptr);
+		}
+		if (this->impl->deviceIntermediateMemory[i] != VK_NULL_HANDLE) {
+			vkFreeMemory(this->impl->device, this->impl->deviceIntermediateMemory[i], nullptr);
+		}
 	}
-	if (this->impl->deviceProcessedMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(this->impl->device, this->impl->deviceProcessedMemory, nullptr);
+
+	for (size_t i = 0; i < this->impl->deviceProcessedBuffers.size(); ++i) {
+		if (this->impl->deviceProcessedBuffers[i] != VK_NULL_HANDLE) {
+			vkDestroyBuffer(this->impl->device, this->impl->deviceProcessedBuffers[i], nullptr);
+		}
+		if (this->impl->deviceProcessedMemory[i] != VK_NULL_HANDLE) {
+			vkFreeMemory(this->impl->device, this->impl->deviceProcessedMemory[i], nullptr);
+		}
 	}
 
 	// Curve buffers
@@ -2446,6 +2623,17 @@ void VulkanBackend::createCommandBuffersAndFences() {
 
 	checkVulkanErrors(vkAllocateCommandBuffers(this->impl->device, &transferAllocInfo, this->impl->transferCommandBuffers.data()));
 
+	// Allocate D2H transfer command buffers
+	this->impl->d2hTransferCommandBuffers.resize(this->impl->numCommandBuffers);
+
+	VkCommandBufferAllocateInfo d2hAllocInfo = {};
+	d2hAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	d2hAllocInfo.commandPool = this->impl->d2hTransferCommandPool;
+	d2hAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	d2hAllocInfo.commandBufferCount = this->impl->numCommandBuffers;
+
+	checkVulkanErrors(vkAllocateCommandBuffers(this->impl->device, &d2hAllocInfo, this->impl->d2hTransferCommandBuffers.data()));
+
 	// Create fences
 	this->impl->fences.resize(this->impl->numCommandBuffers);
 
@@ -2468,6 +2656,13 @@ void VulkanBackend::createCommandBuffersAndFences() {
 
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		checkVulkanErrors(vkCreateSemaphore(this->impl->device, &semaphoreInfo, nullptr, &this->impl->transferToComputeSemaphores[i]));
+	}
+
+	// Create semaphores for compute to D2H synchronization
+	this->impl->computeToD2hSemaphores.resize(this->impl->numCommandBuffers);
+
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		checkVulkanErrors(vkCreateSemaphore(this->impl->device, &semaphoreInfo, nullptr, &this->impl->computeToD2hSemaphores[i]));
 	}
 
 	// Create timeline semaphore for ordered output transfers
@@ -2508,6 +2703,14 @@ void VulkanBackend::destroyCommandBuffersAndFences() {
 		this->impl->transferCommandBuffers.clear();
 	}
 
+	// Free D2H transfer command buffers
+	if (!this->impl->d2hTransferCommandBuffers.empty() && this->impl->d2hTransferCommandPool != VK_NULL_HANDLE) {
+		vkFreeCommandBuffers(this->impl->device, this->impl->d2hTransferCommandPool,
+		                     static_cast<uint32_t>(this->impl->d2hTransferCommandBuffers.size()),
+		                     this->impl->d2hTransferCommandBuffers.data());
+		this->impl->d2hTransferCommandBuffers.clear();
+	}
+
 	// Destroy fences
 	for (auto& fence : this->impl->fences) {
 		if (fence != VK_NULL_HANDLE) {
@@ -2530,6 +2733,14 @@ void VulkanBackend::destroyCommandBuffersAndFences() {
 	}
 	this->impl->transferToComputeSemaphores.clear();
 
+	// Destroy compute to D2H semaphores
+	for (auto& semaphore : this->impl->computeToD2hSemaphores) {
+		if (semaphore != VK_NULL_HANDLE) {
+			vkDestroySemaphore(this->impl->device, semaphore, nullptr);
+		}
+	}
+	this->impl->computeToD2hSemaphores.clear();
+
 	// Destroy timeline semaphore for output ordering
 	if (this->impl->outputOrderingSemaphore != VK_NULL_HANDLE) {
 		vkDestroySemaphore(this->impl->device, this->impl->outputOrderingSemaphore, nullptr);
@@ -2542,65 +2753,7 @@ void VulkanBackend::destroyCommandBuffersAndFences() {
 // ============================================
 
 void VulkanBackend::recordCommandBuffers() {
-	// Pre-record all command buffers for maximum performance
-	// This avoids the expensive vkBeginCommandBuffer/vkEndCommandBuffer overhead every frame
-
-	for (int idx = 0; idx < this->impl->numCommandBuffers; ++idx) {
-		VkCommandBuffer cmd = this->impl->commandBuffers[idx];
-
-		VkCommandBufferBeginInfo beginInfo = {};
-		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		beginInfo.flags = 0;  // Reusable command buffer (not ONE_TIME_SUBMIT)
-
-		checkVulkanErrors(vkBeginCommandBuffer(cmd, &beginInfo));
-
-		// Copy from staging to device buffer
-		size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
-		VkBufferCopy copyRegion = {};
-		copyRegion.size = inputSize;
-		vkCmdCopyBuffer(cmd, this->impl->stagingInputBuffers[idx], this->impl->deviceInputBuffers[idx], 1, &copyRegion);
-
-		// Memory barrier after input copy
-		VkBufferMemoryBarrier barrier = {};
-		barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.buffer = this->impl->deviceInputBuffers[idx];
-		barrier.offset = 0;
-		barrier.size = inputSize;
-
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &barrier,
-		                     0, nullptr);
-
-		// Bind input conversion pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->getPipeline(Impl::PipelineIndex::InputConversion));
-
-		// Bind descriptor set
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->impl->pipelineLayout,
-		                        0, 1, &this->impl->descriptorSets[idx], 0, nullptr);
-
-		// Push constants
-		uint32_t pushConstants[3] = {
-			static_cast<uint32_t>(this->impl->samplesPerBuffer),
-			static_cast<uint32_t>(this->impl->config.dataParams.getBitDepth()),
-			static_cast<uint32_t>(this->impl->bytesPerSample)
-		};
-		vkCmdPushConstants(cmd, this->impl->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(pushConstants), pushConstants);
-
-		// Dispatch
-		uint32_t numWorkgroups = (this->impl->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
-		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
-
-		checkVulkanErrors(vkEndCommandBuffer(cmd));
-	}
+	this->impl->recordAllCommandBuffers(); //todo: using pimpl pattern in the backend probably does not make sense. think about it, and come up with clean backend implementation 
 }
 
 // ============================================
@@ -2813,7 +2966,7 @@ void VulkanBackend::createComputePipelines() {
 
 		// Binding 1: FFT buffer (output of input conversion)
 		VkDescriptorBufferInfo outputBufferInfo = {};
-		outputBufferInfo.buffer = this->impl->deviceFftBuffer;
+		outputBufferInfo.buffer = this->impl->deviceFftBuffers[i];
 		outputBufferInfo.offset = 0;
 		outputBufferInfo.range = VK_WHOLE_SIZE;
 
@@ -2942,12 +3095,12 @@ void VulkanBackend::createComputePipelines() {
 	// Update DC removal descriptor sets
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		VkDescriptorBufferInfo dcRemovalInputBufferInfo = {};
-		dcRemovalInputBufferInfo.buffer = this->impl->deviceFftBuffer;
+		dcRemovalInputBufferInfo.buffer = this->impl->deviceFftBuffers[i];
 		dcRemovalInputBufferInfo.offset = 0;
 		dcRemovalInputBufferInfo.range = this->impl->fftBufferSize;
 
 		VkDescriptorBufferInfo dcRemovalOutputBufferInfo = {};
-		dcRemovalOutputBufferInfo.buffer = this->impl->deviceIntermediateBuffer;  // Write to separate buffer
+		dcRemovalOutputBufferInfo.buffer = this->impl->deviceIntermediateBuffers[i];  // Write to separate buffer
 		dcRemovalOutputBufferInfo.offset = 0;
 		dcRemovalOutputBufferInfo.range = VK_WHOLE_SIZE;
 
@@ -3232,7 +3385,7 @@ void VulkanBackend::createComputePipelines() {
 	VkPushConstantRange universalPreFFTPushConstantRange = {};
 	universalPreFFTPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	universalPreFFTPushConstantRange.offset = 0;
-	universalPreFFTPushConstantRange.size = sizeof(uint32_t) * 4;  // signalLength, samplesPerBuffer, ascansPerBscan, rollingAverageWindowSize
+	universalPreFFTPushConstantRange.size = sizeof(uint32_t) * 2;  // signalLength, samplesPerBuffer
 
 	VkPipelineLayoutCreateInfo universalPreFFTPipelineLayoutInfo = {};
 	universalPreFFTPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -3317,9 +3470,9 @@ void VulkanBackend::createComputePipelines() {
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		std::vector<VkWriteDescriptorSet> descriptorWrites(7);
 
-		// Binding 0: Input buffer A (deviceFftBuffer)
+		// Binding 0: Input buffer A (deviceFftBuffers[i])
 		VkDescriptorBufferInfo inputBufferAInfo = {};
-		inputBufferAInfo.buffer = this->impl->deviceFftBuffer;
+		inputBufferAInfo.buffer = this->impl->deviceFftBuffers[i];
 		inputBufferAInfo.offset = 0;
 		inputBufferAInfo.range = VK_WHOLE_SIZE;
 
@@ -3331,9 +3484,9 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[0].descriptorCount = 1;
 		descriptorWrites[0].pBufferInfo = &inputBufferAInfo;
 
-		// Binding 1: Input buffer B (deviceIntermediateBuffer)
+		// Binding 1: Input buffer B (deviceIntermediateBuffers[i])
 		VkDescriptorBufferInfo inputBufferBInfo = {};
-		inputBufferBInfo.buffer = this->impl->deviceIntermediateBuffer;
+		inputBufferBInfo.buffer = this->impl->deviceIntermediateBuffers[i];
 		inputBufferBInfo.offset = 0;
 		inputBufferBInfo.range = VK_WHOLE_SIZE;
 
@@ -3387,9 +3540,9 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[4].descriptorCount = 1;
 		descriptorWrites[4].pBufferInfo = &dispersionInfo;
 
-		// Binding 5: Output buffer A (deviceIntermediateBuffer)
+		// Binding 5: Output buffer A (deviceIntermediateBuffers[i])
 		VkDescriptorBufferInfo outputInfoA = {};
-		outputInfoA.buffer = this->impl->deviceIntermediateBuffer;
+		outputInfoA.buffer = this->impl->deviceIntermediateBuffers[i];
 		outputInfoA.offset = 0;
 		outputInfoA.range = VK_WHOLE_SIZE;
 
@@ -3401,9 +3554,9 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[5].descriptorCount = 1;
 		descriptorWrites[5].pBufferInfo = &outputInfoA;
 
-		// Binding 6: Output buffer B (deviceFftBuffer)
+		// Binding 6: Output buffer B (deviceFftBuffers[i])
 		VkDescriptorBufferInfo outputInfoB = {};
-		outputInfoB.buffer = this->impl->deviceFftBuffer;
+		outputInfoB.buffer = this->impl->deviceFftBuffers[i];
 		outputInfoB.offset = 0;
 		outputInfoB.range = VK_WHOLE_SIZE;
 
@@ -3557,17 +3710,17 @@ void VulkanBackend::createComputePipelines() {
 
 		// Output buffer info (same for both variants)
 		VkDescriptorBufferInfo outputInfo = {};
-		outputInfo.buffer = this->impl->deviceProcessedBuffer;
+		outputInfo.buffer = this->impl->deviceProcessedBuffers[i];
 		outputInfo.offset = 0;
 		outputInfo.range = VK_WHOLE_SIZE;
 
-		// --- Variant 0: Input from deviceFftBuffer ---
+		// --- Variant 0: Input from deviceFftBuffers[i] ---
 		{
 			std::vector<VkWriteDescriptorSet> descriptorWrites(3);
 
-			// Binding 0: Input buffer (deviceFftBuffer)
+			// Binding 0: Input buffer (deviceFftBuffers[i])
 			VkDescriptorBufferInfo inputInfo = {};
-			inputInfo.buffer = this->impl->deviceFftBuffer;
+			inputInfo.buffer = this->impl->deviceFftBuffers[i];
 			inputInfo.offset = 0;
 			inputInfo.range = VK_WHOLE_SIZE;
 
@@ -3600,13 +3753,13 @@ void VulkanBackend::createComputePipelines() {
 			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
 		}
 
-		// --- Variant 1: Input from deviceIntermediateBuffer ---
+		// --- Variant 1: Input from deviceIntermediateBuffers[i] ---
 		{
 			std::vector<VkWriteDescriptorSet> descriptorWrites(3);
 
-			// Binding 0: Input buffer (deviceIntermediateBuffer)
+			// Binding 0: Input buffer (deviceIntermediateBuffers[i])
 			VkDescriptorBufferInfo inputInfo = {};
-			inputInfo.buffer = this->impl->deviceIntermediateBuffer;
+			inputInfo.buffer = this->impl->deviceIntermediateBuffers[i];
 			inputInfo.offset = 0;
 			inputInfo.range = VK_WHOLE_SIZE;
 
@@ -3679,13 +3832,13 @@ void VulkanBackend::createComputePipelines() {
 		meanALineInfo.offset = 0;
 		meanALineInfo.range = VK_WHOLE_SIZE;
 
-		// --- Variant 0: Input from deviceFftBuffer ---
+		// --- Variant 0: Input from deviceFftBuffers[i] ---
 		{
 			std::vector<VkWriteDescriptorSet> fpnDescriptorWrites(2);
 
-			// Binding 0: Input buffer (deviceFftBuffer)
+			// Binding 0: Input buffer (deviceFftBuffers[i])
 			VkDescriptorBufferInfo inputInfo = {};
-			inputInfo.buffer = this->impl->deviceFftBuffer;
+			inputInfo.buffer = this->impl->deviceFftBuffers[i];
 			inputInfo.offset = 0;
 			inputInfo.range = VK_WHOLE_SIZE;
 
@@ -3709,13 +3862,13 @@ void VulkanBackend::createComputePipelines() {
 			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
 		}
 
-		// --- Variant 1: Input from deviceIntermediateBuffer ---
+		// --- Variant 1: Input from deviceIntermediateBuffers[i] ---
 		{
 			std::vector<VkWriteDescriptorSet> fpnDescriptorWrites(2);
 
-			// Binding 0: Input buffer (deviceIntermediateBuffer)
+			// Binding 0: Input buffer (deviceIntermediateBuffers[i])
 			VkDescriptorBufferInfo inputInfo = {};
-			inputInfo.buffer = this->impl->deviceIntermediateBuffer;
+			inputInfo.buffer = this->impl->deviceIntermediateBuffers[i];
 			inputInfo.offset = 0;
 			inputInfo.range = VK_WHOLE_SIZE;
 
@@ -3759,9 +3912,9 @@ void VulkanBackend::createComputePipelines() {
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		std::vector<VkWriteDescriptorSet> bgDescriptorWrites(2);
 
-		// Binding 0: Data buffer (deviceProcessedBuffer - magnitude data)
+		// Binding 0: Data buffer (deviceProcessedBuffers[i] - magnitude data)
 		VkDescriptorBufferInfo dataInfo = {};
-		dataInfo.buffer = this->impl->deviceProcessedBuffer;
+		dataInfo.buffer = this->impl->deviceProcessedBuffers[i];
 		dataInfo.offset = 0;
 		dataInfo.range = VK_WHOLE_SIZE;
 
@@ -3809,9 +3962,9 @@ void VulkanBackend::createComputePipelines() {
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		std::vector<VkWriteDescriptorSet> bgRecDescriptorWrites(2);
 
-		// Binding 0: Input buffer (deviceProcessedBuffer - magnitude data)
+		// Binding 0: Input buffer (deviceProcessedBuffers[i] - magnitude data)
 		VkDescriptorBufferInfo inputInfo = {};
-		inputInfo.buffer = this->impl->deviceProcessedBuffer;
+		inputInfo.buffer = this->impl->deviceProcessedBuffers[i];
 		inputInfo.offset = 0;
 		inputInfo.range = VK_WHOLE_SIZE;
 
