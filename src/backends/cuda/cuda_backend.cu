@@ -366,6 +366,9 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	}
 
 	// Start callback worker thread for ordered delivery
+	// we need this here because the relative order of stream completions is not defined
+	// especially on jetson orin nano this causes issues where later buffers complete before earlier ones
+	// this callback worker thread ensures that buffers are delivered in the correct order to all consumers
 	this->impl->callbackWorkerRunning = true;
 	this->impl->nextExpectedCallback = 0;
 	this->impl->callbackWorkerThread = std::thread([this]() {
