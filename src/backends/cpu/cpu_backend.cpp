@@ -314,6 +314,10 @@ struct CpuBackend::Impl {
 };
 
 void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans) {
+	if (!(this->fixedPatternNoiseDeterminationRequested || config.processingParams.fixedPatternNoise.continuous)) {
+		return;  
+	}
+
 	const int FPN_SEGMENTS = 8; // match CUDA //todo: make configurable?
 
 	for (const auto& ifftOutput : this->allIfftOutputs) {
@@ -321,13 +325,8 @@ void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfig
 		this->accumulatedAscanCount++;
 	}
 
-	int requiredAscanCount = config.processingParams.fixedPatternNoise.bscanAverageCount *
-							 config.dataParams.ascansPerBscan;
+	int requiredAscanCount = config.processingParams.fixedPatternNoise.bscanAverageCount * config.dataParams.ascansPerBscan;
 
-	// Only compute when we have at least the required number of A-scans.
-	if (!(this->fixedPatternNoiseDeterminationRequested || config.processingParams.fixedPatternNoise.continuous)) {
-		return;
-	}
 	if (this->accumulatedAscanCount < requiredAscanCount) {
 		return;
 	}
@@ -467,6 +466,20 @@ void CpuBackend::cleanup() {
 		this->impl->processingThread.join();
 	}
 	
+	// Release FFTW resources
+	if (this->impl->fftPlan) {
+		fftwf_destroy_plan(this->impl->fftPlan);
+		this->impl->fftPlan = nullptr;
+	}
+	if (this->impl->fftIn) {
+		fftwf_free(this->impl->fftIn);
+		this->impl->fftIn = nullptr;
+	}
+	if (this->impl->fftOut) {
+		fftwf_free(this->impl->fftOut);
+		this->impl->fftOut = nullptr;
+	}
+	
 	// Release output buffers
 	this->impl->outputBuffer1.releaseMemory();
 	this->impl->outputBuffer2.releaseMemory();
@@ -484,6 +497,20 @@ void CpuBackend::cleanup() {
 	while (!this->impl->workQueue.empty()) {
 		this->impl->workQueue.pop();
 	}
+	while (!this->impl->workQueue.empty()) {
+	this->impl->workQueue.pop();
+	}
+	
+	// Release vector memory
+	std::vector<std::vector<std::complex<float>>>().swap(this->impl->accumulatedIfftOutputs);
+	this->impl->accumulatedAscanCount = 0;
+	std::vector<std::vector<std::complex<float>>>().swap(this->impl->allIfftOutputs);
+	std::vector<uint8_t>().swap(this->impl->processingBuffer);
+	std::vector<float>().swap(this->impl->resampleCurve);
+	std::vector<std::complex<float>>().swap(this->impl->dispersionPhaseComplex);
+	std::vector<float>().swap(this->impl->windowCurve);
+	std::vector<float>().swap(this->impl->recordedFixedPatternNoise);
+	std::vector<float>().swap(this->impl->postProcessBackgroundProfile);
 }
 
 void CpuBackend::setOutputCallback(std::function<void(const IOBuffer&)> callback) {
