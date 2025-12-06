@@ -47,7 +47,7 @@ void testProgressiveDataContent() {
 	std::chrono::high_resolution_clock::time_point endTime;
 
 	// Add callback that counts A-scans with significant signal
-	const float SIGNAL_THRESHOLD = 0.01f;  // Threshold to distinguish signal from background
+	const float SIGNAL_THRESHOLD = 0.1f;  // Threshold to distinguish signal from background
 	
 	processor.setOutputCallback([&](const ope::IOBuffer& buf) {
 		uint64_t bufferId = buf.getBufferId();
