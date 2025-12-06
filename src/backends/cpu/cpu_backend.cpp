@@ -70,7 +70,13 @@ struct CpuBackend::Impl {
 
 	bool postProcessBackgroundRecordingRequested;
 
-	// Compute Fixed-pattern noise helper 
+	// Temporary buffers for per-A-scan processing
+	std::vector<std::complex<float>> spectrum;
+	std::vector<std::complex<float>> linearizedSpectrum;
+	std::vector<std::complex<float>> ifftOutput;
+	std::vector<float> processedAscan;
+
+	// Compute Fixed-pattern noise helper
 	void computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans);
 	
 	Impl() 
@@ -193,64 +199,63 @@ struct CpuBackend::Impl {
 
 		// Process each A-scan
 		for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
-			const void* ascanStart = static_cast<const uint8_t*>(inputData) + 
+			const void* ascanStart = static_cast<const uint8_t*>(inputData) +
 			                         (ascanIdx * signalLength * (config.dataParams.getBitDepth() / 8));
 			
 			// 1. Convert input data
-			std::vector<std::complex<float>> spectrum(signalLength);
 			cpu_kernels::convertInputData<float>(
 				ascanStart,
 				signalLength,
 				config.dataParams.getBitDepth(),
-				spectrum
+				this->spectrum
 			);
 			
 			// 2. Background removal (if enabled)
 			if (config.processingParams.dcRemoval.enabled) {
 				cpu_kernels::rollingAverageDCRemoval<float>(
-					spectrum,
+					this->spectrum,
 					config.processingParams.dcRemoval.windowSize
 				);
 			}
-			
+
 			// 3. K-linearization (if enabled)
-			std::vector<std::complex<float>> linearizedSpectrum = spectrum;
 			if (config.processingParams.resampling.enabled) {
 				switch (config.processingParams.resampling.method) {
 					case InterpolationMethod::LINEAR:
-						cpu_kernels::kLinearizationLinear<float>(spectrum, this->resampleCurve, linearizedSpectrum);
+						cpu_kernels::kLinearizationLinear<float>(this->spectrum, this->resampleCurve, this->linearizedSpectrum);
 						break;
 					case InterpolationMethod::CUBIC:
-						cpu_kernels::kLinearizationCubic<float>(spectrum, this->resampleCurve, linearizedSpectrum);
+						cpu_kernels::kLinearizationCubic<float>(this->spectrum, this->resampleCurve, this->linearizedSpectrum);
 						break;
 					case InterpolationMethod::LANCZOS:
-						cpu_kernels::kLinearizationLanczos<float>(spectrum, this->resampleCurve, linearizedSpectrum);
+						cpu_kernels::kLinearizationLanczos<float>(this->spectrum, this->resampleCurve, this->linearizedSpectrum);
 						break;
 				}
+			} else {
+				this->linearizedSpectrum = this->spectrum;
 			}
 			
 			// 4. Windowing (if enabled)
 			if (config.processingParams.windowing.enabled) {
-				cpu_kernels::applyWindow<float>(linearizedSpectrum, this->windowCurve);
+				cpu_kernels::applyWindow<float>(this->linearizedSpectrum, this->windowCurve);
 			}
-			
+
 			// 5. Dispersion compensation (if enabled)
 			if (config.processingParams.dispersion.enabled) {
-				cpu_kernels::dispersionCompensation<float>(linearizedSpectrum, this->dispersionPhaseComplex);
+				cpu_kernels::dispersionCompensation<float>(this->linearizedSpectrum, this->dispersionPhaseComplex);
 			}
 			
 			// 6. IFFT
-			std::vector<std::complex<float>> ifftOutput(signalLength);
 			cpu_kernels::computeIFFT<float>(
-				linearizedSpectrum,
-				ifftOutput,
+				this->linearizedSpectrum,
+				this->ifftOutput,
 				this->fftPlan,
 				this->fftIn,
 				this->fftOut
 			);
 
 			// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
-			this->allIfftOutputs[ascanIdx] = std::move(ifftOutput);
+			this->allIfftOutputs[ascanIdx] = this->ifftOutput;
 		}
 
 			// 7. Fixed-pattern-noise determination
@@ -265,11 +270,10 @@ struct CpuBackend::Impl {
 					}
 				}
 				// 8. Magnitude calculation, grayscale conversion, truncation
-				std::vector<float> processedAscan;
 				if (config.processingParams.intensity.logScale) {
 					cpu_kernels::logScaleAndTruncate<float>(
 						ifftOutputRef,
-						processedAscan,
+						this->processedAscan,
 						config.processingParams.intensity.preScale,
 						config.processingParams.intensity.rangeMin,
 						config.processingParams.intensity.rangeMax,
@@ -279,7 +283,7 @@ struct CpuBackend::Impl {
 				} else {
 					cpu_kernels::linearScaleAndTruncate<float>(
 						ifftOutputRef,
-						processedAscan,
+						this->processedAscan,
 						config.processingParams.intensity.preScale,
 						config.processingParams.intensity.rangeMin,
 						config.processingParams.intensity.rangeMax,
@@ -288,7 +292,7 @@ struct CpuBackend::Impl {
 				}
 				// Copy to output
 				int outputStartIdx = ascanIdx * outputSamplesPerAscan;
-				std::copy(processedAscan.begin(), processedAscan.end(), outputPtr + outputStartIdx);
+				std::copy(this->processedAscan.begin(), this->processedAscan.begin() + outputSamplesPerAscan, outputPtr + outputStartIdx);
 			}
 
 			// 9. Post-process background profile subtraction
@@ -439,6 +443,12 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->dispersionPhaseComplex.resize(signalLength);
 	this->impl->windowCurve.resize(signalLength);
 
+	// Pre-allocate temporary processing buffers
+	this->impl->spectrum.resize(signalLength);
+	this->impl->linearizedSpectrum.resize(signalLength);
+	this->impl->ifftOutput.resize(signalLength);
+	this->impl->processedAscan.resize(signalLength / 2);
+
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
 		this->impl->postProcessBackgroundProfile = config.getBackgroundProfile();
@@ -511,6 +521,10 @@ void CpuBackend::cleanup() {
 	std::vector<float>().swap(this->impl->windowCurve);
 	std::vector<float>().swap(this->impl->recordedFixedPatternNoise);
 	std::vector<float>().swap(this->impl->postProcessBackgroundProfile);
+	std::vector<std::complex<float>>().swap(this->impl->spectrum);
+	std::vector<std::complex<float>>().swap(this->impl->linearizedSpectrum);
+	std::vector<std::complex<float>>().swap(this->impl->ifftOutput);
+	std::vector<float>().swap(this->impl->processedAscan);
 }
 
 void CpuBackend::setOutputCallback(std::function<void(const IOBuffer&)> callback) {
