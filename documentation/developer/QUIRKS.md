@@ -40,7 +40,9 @@ To see in which state your GPU is running, you can use [nvidia-smi](https://docs
 My GPU switched to P5 in some cases which caused a huge decrease in performance.
 
 The Fix:  
-Open NVIDIA Control Panel, go to Manage 3D Settings -> Program Settings, add/select your application, and set the Power management mode to "Prefer maximum performance". With this my GPU switched to P2 during benchmarks. 
+Open NVIDIA Control Panel, go to Manage 3D Settings -> Program Settings, add/select your application, and set the Power management mode to "Prefer maximum performance". With this my GPU switched to P2 during benchmarks.  
+
+Adendum 2025-12-07: you can use [NVIDIA Profile Inspector](https://github.com/Orbmu2k/nvidiaProfileInspector) to disable the setting "CUDA - Force P2 State", which allows your GPU to use P0 mode (however, in quick tests I did not notice a huge performance difference between P0 and P2).
 
 
 ## Jetson Orin Nano Performance Benchmark
