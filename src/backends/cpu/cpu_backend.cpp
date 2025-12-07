@@ -190,12 +190,19 @@ struct CpuBackend::Impl {
 		const int bscansPerBuffer = config.dataParams.bscansPerBuffer;
 		const int totalAscans = ascansPerBscan * bscansPerBuffer;
 		const int outputSamplesPerAscan = signalLength / 2;
-		
+
 		float* outputPtr = static_cast<float*>(output.getDataPointer());
-		
-		// Prepare storage for per-A-scan IFFT outputs (some post-processing needs whole buffer)
-		this->allIfftOutputs.clear();
-		this->allIfftOutputs.resize(totalAscans);
+
+		// Check if we need FPN processing (requires allIfftOutputs storage)
+		bool needsFPN = this->fixedPatternNoiseDeterminationRequested ||
+		                config.processingParams.fixedPatternNoise.enabled ||
+		                config.processingParams.fixedPatternNoise.continuous;
+
+		// Prepare storage for per-A-scan IFFT outputs (only if FPN needed)
+		if (needsFPN) {
+			this->allIfftOutputs.clear();
+			this->allIfftOutputs.resize(totalAscans);
+		}
 
 		// Process each A-scan
 		for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
@@ -254,10 +261,39 @@ struct CpuBackend::Impl {
 				this->fftOut
 			);
 
-			// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
-			this->allIfftOutputs[ascanIdx] = this->ifftOutput;
+			if (needsFPN) {
+				// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
+				this->allIfftOutputs[ascanIdx] = this->ifftOutput;
+			} else {
+				// Process immediately to output (no storage, better performance)
+				// 8. Magnitude calculation, grayscale conversion, truncation
+				if (config.processingParams.intensity.logScale) {
+					cpu_kernels::logScaleAndTruncate<float>(
+						this->ifftOutput,
+						this->processedAscan,
+						config.processingParams.intensity.preScale,
+						config.processingParams.intensity.rangeMin,
+						config.processingParams.intensity.rangeMax,
+						config.processingParams.intensity.postOffset,
+						(config.processingParams.intensity.rangeMin == config.processingParams.intensity.rangeMax)
+					);
+				} else {
+					cpu_kernels::linearScaleAndTruncate<float>(
+						this->ifftOutput,
+						this->processedAscan,
+						config.processingParams.intensity.preScale,
+						config.processingParams.intensity.rangeMin,
+						config.processingParams.intensity.rangeMax,
+						config.processingParams.intensity.postOffset
+					);
+				}
+				// Copy to output
+				int outputStartIdx = ascanIdx * outputSamplesPerAscan;
+				std::copy(this->processedAscan.begin(), this->processedAscan.begin() + outputSamplesPerAscan, outputPtr + outputStartIdx);
+			}
 		}
 
+		if (needsFPN) {
 			// 7. Fixed-pattern-noise determination
 			this->computeFixedPatternNoiseIfRequested(config, signalLength, totalAscans);
 
@@ -294,8 +330,9 @@ struct CpuBackend::Impl {
 				int outputStartIdx = ascanIdx * outputSamplesPerAscan;
 				std::copy(this->processedAscan.begin(), this->processedAscan.begin() + outputSamplesPerAscan, outputPtr + outputStartIdx);
 			}
+		}
 
-			// 9. Post-process background profile subtraction
+		// 9. Post-process background profile subtraction
 		if (config.processingParams.background.enabled) {
 			// Record background if requested (must happen BEFORE removal)
 			if (this->postProcessBackgroundRecordingRequested) {
