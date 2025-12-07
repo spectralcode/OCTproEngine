@@ -196,7 +196,7 @@ public:
 	// OpenCL-Specific Configuration Methods
 	// ============================================
 
-	void setNumInputBuffers(int count);  // Must be called before initialize()
+	void setNumInputBuffers(int count);  // Must be called before initialize()  //todo: remove and only use setNumCommandQueues
 	void setNumCommandQueues(int numQueues);
 	void setWorkGroupSize(int workGroupSize);
 	void setPlatformId(int platformId);

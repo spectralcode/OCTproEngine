@@ -92,10 +92,6 @@ struct OpenClBackend::Impl {
 	std::vector<cl_command_queue> commandQueues;
 	cl_program program = nullptr;
 
-	//	Event tracking for async operations
-	std::vector<cl_event> transferEvents;
-	std::vector<cl_event> outputEvents;
-	std::mutex eventMutex;
 
 	//	OpenCL kernels
 	cl_kernel kernelInputToComplex = nullptr;
@@ -108,7 +104,6 @@ struct OpenClBackend::Impl {
 	cl_kernel kernelKLinearizationAndWindowing = nullptr;
 	cl_kernel kernelKLinearizationCubicAndWindowing = nullptr;
 	cl_kernel kernelKLinearizationLanczosAndWindowing = nullptr;
-	cl_kernel kernelFillDispersivePhase = nullptr;
 	cl_kernel kernelDispersionCompensation = nullptr;
 	cl_kernel kernelKLinearizationAndWindowingAndDispersion = nullptr;
 	cl_kernel kernelKLinearizationCubicAndWindowingAndDispersion = nullptr;
@@ -148,7 +143,6 @@ struct OpenClBackend::Impl {
 	//	Curve buffers
 	cl_mem d_resampleCurve = nullptr;
 	cl_mem d_windowCurve = nullptr;
-	cl_mem d_dispersionCurve = nullptr;
 	cl_mem d_phaseCartesian = nullptr;
 
 	//	Fixed pattern noise removal
@@ -448,9 +442,6 @@ void OpenClBackend::loadAndBuildKernels() {
 	this->impl->kernelKLinearizationLanczosAndWindowing = clCreateKernel(this->impl->program, ope::opencl::KERNEL_KLINEARIZATION_LANCZOS_AND_WINDOWING, &err);
 	checkOpenClError(err, "create kLinearizationLanczosAndWindowing kernel");
 
-	this->impl->kernelFillDispersivePhase = clCreateKernel(this->impl->program, ope::opencl::KERNEL_FILL_DISPERSIVE_PHASE, &err);
-	checkOpenClError(err, "create fillDispersivePhase kernel");
-
 	this->impl->kernelDispersionCompensation = clCreateKernel(this->impl->program, ope::opencl::KERNEL_DISPERSION_COMPENSATION, &err);
 	checkOpenClError(err, "create dispersionCompensation kernel");
 
@@ -502,7 +493,6 @@ void OpenClBackend::releaseKernels() {
 	if (this->impl->kernelKLinearizationAndWindowing) { clReleaseKernel(this->impl->kernelKLinearizationAndWindowing); this->impl->kernelKLinearizationAndWindowing = nullptr; }
 	if (this->impl->kernelKLinearizationCubicAndWindowing) { clReleaseKernel(this->impl->kernelKLinearizationCubicAndWindowing); this->impl->kernelKLinearizationCubicAndWindowing = nullptr; }
 	if (this->impl->kernelKLinearizationLanczosAndWindowing) { clReleaseKernel(this->impl->kernelKLinearizationLanczosAndWindowing); this->impl->kernelKLinearizationLanczosAndWindowing = nullptr; }
-	if (this->impl->kernelFillDispersivePhase) { clReleaseKernel(this->impl->kernelFillDispersivePhase); this->impl->kernelFillDispersivePhase = nullptr; }
 	if (this->impl->kernelDispersionCompensation) { clReleaseKernel(this->impl->kernelDispersionCompensation); this->impl->kernelDispersionCompensation = nullptr; }
 	if (this->impl->kernelKLinearizationAndWindowingAndDispersion) { clReleaseKernel(this->impl->kernelKLinearizationAndWindowingAndDispersion); this->impl->kernelKLinearizationAndWindowingAndDispersion = nullptr; }
 	if (this->impl->kernelKLinearizationCubicAndWindowingAndDispersion) { clReleaseKernel(this->impl->kernelKLinearizationCubicAndWindowingAndDispersion); this->impl->kernelKLinearizationCubicAndWindowingAndDispersion = nullptr; }
@@ -564,9 +554,6 @@ void OpenClBackend::allocateDeviceBuffers() {
 
 	this->impl->d_windowCurve = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, curveSize, nullptr, &err);
 	checkOpenClError(err, "create window curve buffer");
-
-	this->impl->d_dispersionCurve = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY, curveSize, nullptr, &err);
-	checkOpenClError(err, "create dispersion curve buffer");
 
 	this->impl->d_phaseCartesian = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, curveSize * 2, nullptr, &err);
 	checkOpenClError(err, "create phase cartesian buffer");
@@ -633,7 +620,6 @@ void OpenClBackend::releaseDeviceBuffers() {
 
 	if (this->impl->d_resampleCurve) { clReleaseMemObject(this->impl->d_resampleCurve); this->impl->d_resampleCurve = nullptr; }
 	if (this->impl->d_windowCurve) { clReleaseMemObject(this->impl->d_windowCurve); this->impl->d_windowCurve = nullptr; }
-	if (this->impl->d_dispersionCurve) { clReleaseMemObject(this->impl->d_dispersionCurve); this->impl->d_dispersionCurve = nullptr; }
 	if (this->impl->d_phaseCartesian) { clReleaseMemObject(this->impl->d_phaseCartesian); this->impl->d_phaseCartesian = nullptr; }
 	if (this->impl->d_meanALine) { clReleaseMemObject(this->impl->d_meanALine); this->impl->d_meanALine = nullptr; }
 	if (this->impl->d_postProcBackgroundLine) { clReleaseMemObject(this->impl->d_postProcBackgroundLine); this->impl->d_postProcBackgroundLine = nullptr; }
