@@ -14,6 +14,8 @@
 #include <condition_variable>
 #include <atomic>
 #include <cstring>
+#include <map>
+#include <thread>
 
 //	Uncomment to enable profiling (adds overhead, use only for debugging)
 //#define OPENCL_PROFILE_TIMING
@@ -163,8 +165,9 @@ struct OpenClBackend::Impl {
 	VkFFTApplication fftApp;
 	bool fftDebugPrinted = false;
 
-	//	Host output buffers (one per command queue)
+	//	Host output buffers (rotating pool for ordered callback delivery)
 	std::vector<IOBuffer> hostOutputBuffers;
+	std::atomic<int> currentOutputBuffer{0};
 
 	//	Callback
 	std::function<void(const IOBuffer&)> callback;
@@ -178,6 +181,19 @@ struct OpenClBackend::Impl {
 	};
 	std::vector<CallbackData> callbackDataPool;
 	std::atomic<int> nextCallbackIndex{0};
+
+	// Callback ordering. delivers callbacks in buffer submission order
+	std::mutex callbackQueueMutex;
+	std::condition_variable callbackQueueCV;
+	std::map<uint64_t, IOBuffer*> pendingCallbacks;  // bufferId -> outputBuffer
+	uint64_t nextExpectedCallback = 0;
+	std::thread callbackWorkerThread;
+	std::atomic<bool> callbackWorkerRunning{false};
+
+	// Semaphore to limit in-flight output buffers (prevents buffer reuse before callback delivery)
+	std::mutex outputSemaphoreMutex;
+	std::condition_variable outputSemaphoreCV;
+	int availableOutputBuffers = 0;
 
 	Impl() = default;
 
@@ -816,6 +832,9 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 		data.impl = this->impl.get();
 	}
 
+	//	Initialize output buffer semaphore (all buffers available at start)
+	this->impl->availableOutputBuffers = this->impl->numCommandQueues;
+
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
 		const std::vector<float>& profileVec = config.getBackgroundProfile();
@@ -839,6 +858,76 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->fixedPatternNoiseDetermined = true;
 	}
 
+	//	Start callback worker thread for ordered callback delivery
+	//	Multiple command queues can complete out of order, this ensures callbacks are delivered in submission order
+	this->impl->callbackWorkerRunning = true;
+	this->impl->nextExpectedCallback = 0;
+	this->impl->callbackWorkerThread = std::thread([this]() {
+		while (this->impl->callbackWorkerRunning) {
+			IOBuffer* bufferToDeliver = nullptr;
+
+			{
+				std::unique_lock<std::mutex> lock(this->impl->callbackQueueMutex);
+				//	Wait until we have the next expected callback or shutdown
+				this->impl->callbackQueueCV.wait(lock, [this]() {
+					return !this->impl->callbackWorkerRunning ||
+					       this->impl->pendingCallbacks.count(this->impl->nextExpectedCallback) > 0;
+				});
+
+				if (!this->impl->callbackWorkerRunning && this->impl->pendingCallbacks.empty()) {
+					break;
+				}
+
+				//	Check if next expected callback is ready
+				auto it = this->impl->pendingCallbacks.find(this->impl->nextExpectedCallback);
+				if (it != this->impl->pendingCallbacks.end()) {
+					bufferToDeliver = it->second;
+					this->impl->pendingCallbacks.erase(it);
+					this->impl->nextExpectedCallback++;
+				}
+			}
+
+			//	Deliver callback outside the lock
+			if (bufferToDeliver) {
+				if (this->impl->callback) {
+					this->impl->callback(*bufferToDeliver);
+				}
+				//	Release output buffer back to pool
+				{
+					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+					this->impl->availableOutputBuffers++;
+				}
+				this->impl->outputSemaphoreCV.notify_one();
+			}
+		}
+
+		//	Drain remaining callbacks on shutdown
+		while (true) {
+			IOBuffer* bufferToDeliver = nullptr;
+			{
+				std::lock_guard<std::mutex> lock(this->impl->callbackQueueMutex);
+				auto it = this->impl->pendingCallbacks.find(this->impl->nextExpectedCallback);
+				if (it == this->impl->pendingCallbacks.end()) {
+					break;
+				}
+				bufferToDeliver = it->second;
+				this->impl->pendingCallbacks.erase(it);
+				this->impl->nextExpectedCallback++;
+			}
+			if (bufferToDeliver) {
+				if (this->impl->callback) {
+					this->impl->callback(*bufferToDeliver);
+				}
+				//	Release output buffer back to pool
+				{
+					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+					this->impl->availableOutputBuffers++;
+				}
+				this->impl->outputSemaphoreCV.notify_one();
+			}
+		}
+	});
+
 	this->impl->openclInitialized = true;
 }
 
@@ -853,6 +942,16 @@ void OpenClBackend::cleanup() {
 		if (queue) {
 			clFinish(queue);
 		}
+	}
+
+	//	Stop callback worker thread
+	{
+		std::lock_guard<std::mutex> lock(this->impl->callbackQueueMutex);
+		this->impl->callbackWorkerRunning = false;
+	}
+	this->impl->callbackQueueCV.notify_all();
+	if (this->impl->callbackWorkerThread.joinable()) {
+		this->impl->callbackWorkerThread.join();
 	}
 
 	//	Release device buffers
@@ -906,8 +1005,19 @@ void OpenClBackend::process(IOBuffer& input) {
 	cl_mem d_outputBuffer = this->impl->d_outputBuffers[queueIndex];
 	cl_mem d_sinusoidalScanTmpBuffer = this->impl->d_sinusoidalScanTmpBuffers[queueIndex];
 
-	//	Per-queue host output buffer
-	IOBuffer* currentOutputBuf = &this->impl->hostOutputBuffers[queueIndex];
+	//	Wait for an output buffer to be available (prevents buffer reuse before callback delivery)
+	{
+		std::unique_lock<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->outputSemaphoreCV.wait(lock, [this]() {
+			return this->impl->availableOutputBuffers > 0;
+		});
+		this->impl->availableOutputBuffers--;
+	}
+
+	//	Select output buffer from rotating pool (not tied to queue index)
+	int outputBufIdx = this->impl->currentOutputBuffer.fetch_add(1, std::memory_order_relaxed)
+	                   % static_cast<int>(this->impl->hostOutputBuffers.size());
+	IOBuffer* currentOutputBuf = &this->impl->hostOutputBuffers[outputBufIdx];
 
 	//	Get buffer ID from input to propagate to output later
 	uint64_t bufferId = input.getBufferId();
@@ -1590,10 +1700,13 @@ void CL_CALLBACK OpenClBackend::outputCallback(cl_event event, cl_int status, vo
 		return;
 	}
 
-	//	Call user callback with output buffer
-	if (data->impl->callback) {
-		data->impl->callback(*data->outputBuffer);
+	//	Queue the callback for ordered delivery (non-blocking)
+	uint64_t bufferId = data->outputBuffer->getBufferId();
+	{
+		std::lock_guard<std::mutex> lock(data->impl->callbackQueueMutex);
+		data->impl->pendingCallbacks[bufferId] = data->outputBuffer;
 	}
+	data->impl->callbackQueueCV.notify_one();
 
 	//	Release the event
 	clReleaseEvent(event);
