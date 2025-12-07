@@ -91,7 +91,6 @@ struct OpenClBackend::Impl {
 	cl_context context = nullptr;
 	std::vector<cl_command_queue> commandQueues;
 	cl_program program = nullptr;
-	int currentQueue = 0;
 
 	//	Event tracking for async operations
 	std::vector<cl_event> transferEvents;
@@ -140,9 +139,8 @@ struct OpenClBackend::Impl {
 
 	//	Device buffers
 	std::vector<cl_mem> d_inputBuffers;
-	int currentBuffer = 0;
 
-	//	Processing buffers (per-queue for parallel processing)
+	//	Processing buffers
 	std::vector<cl_mem> d_fftBuffers;
 	std::vector<cl_mem> d_inputLinearizedBuffers;
 	std::vector<cl_mem> d_outputBuffers;
@@ -529,9 +527,9 @@ void OpenClBackend::allocateDeviceBuffers() {
 	cl_int err;
 	size_t complexSize = this->impl->samplesPerBuffer * sizeof(float) * 2;  // float2
 
-	//	Input buffers (multiple for pipelining with pinned memory)
-	this->impl->d_inputBuffers.resize(this->impl->numInputBuffers);
-	for (int i = 0; i < this->impl->numInputBuffers; i++) {
+	//	Input buffers (one per command queue. backendIndex stores queue assignment)
+	this->impl->d_inputBuffers.resize(this->impl->numCommandQueues);
+	for (int i = 0; i < this->impl->numCommandQueues; i++) {
 		size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
 		this->impl->d_inputBuffers[i] = clCreateBuffer(this->impl->context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, inputSize, nullptr, &err);
 		checkOpenClError(err, "create input buffer");
@@ -544,14 +542,14 @@ void OpenClBackend::allocateDeviceBuffers() {
 		checkOpenClError(err, "create FFT buffer");
 	}
 
-	//	Linearization buffers (one per command queue for parallel processing - same size as FFT buffer)
+	//	Linearization buffers (one per command queue)
 	this->impl->d_inputLinearizedBuffers.resize(this->impl->numCommandQueues);
 	for (int i = 0; i < this->impl->numCommandQueues; i++) {
 		this->impl->d_inputLinearizedBuffers[i] = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, complexSize, nullptr, &err);
 		checkOpenClError(err, "create linearization buffer");
 	}
 
-	//	Output buffers (one per command queue for parallel processing)
+	//	Output buffers (one per command queue)
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
 	this->impl->d_outputBuffers.resize(this->impl->numCommandQueues);
 	for (int i = 0; i < this->impl->numCommandQueues; i++) {
@@ -808,6 +806,8 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 		}
 
 		this->impl->hostInputBuffers[i].setDataType(config.dataParams.inputDataType);
+		// Fixed mapping: each buffer maps to a specific command queue
+		this->impl->hostInputBuffers[i].setBackendIndex(i % this->impl->numCommandQueues);
 
 		//	Add to free queue
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
@@ -902,21 +902,19 @@ void OpenClBackend::process(IOBuffer& input) {
 		throw std::runtime_error("Backend not initialized");
 	}
 
-	//	Round-robin command queue selection
-	this->impl->currentQueue = (this->impl->currentQueue + 1) % this->impl->numCommandQueues;
-	const int queueIndex = this->impl->currentQueue;
-	cl_command_queue queue = this->impl->commandQueues[queueIndex];
+	// Get queue index from backendIndex
+	const int queueIndex = input.getBackendIndex();
+	if (queueIndex < 0 || queueIndex >= this->impl->numCommandQueues) {
+		throw std::runtime_error("Invalid queue index: " + std::to_string(queueIndex));
+	}
 
-	//	Verify queue is valid
+	cl_command_queue queue = this->impl->commandQueues[queueIndex];
 	if (!queue) {
 		throw std::runtime_error("Command queue is NULL! Queue index: " + std::to_string(queueIndex));
 	}
 
-	//	Round-robin device buffer selection (for input buffers that may have more than numCommandQueues)
-	this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
-	cl_mem d_input = this->impl->d_inputBuffers[this->impl->currentBuffer];
-
-	//	Get per-queue buffers for this processing operation (use same queue index)
+	// Per-queue device buffers (all indexed by queueIndex)
+	cl_mem d_input = this->impl->d_inputBuffers[queueIndex];
 	cl_mem d_fftBuffer = this->impl->d_fftBuffers[queueIndex];
 	cl_mem d_inputLinearized = this->impl->d_inputLinearizedBuffers[queueIndex];
 	cl_mem d_outputBuffer = this->impl->d_outputBuffers[queueIndex];
@@ -1032,13 +1030,12 @@ void OpenClBackend::process(IOBuffer& input) {
 	//	Step 3: K-linearization, windowing, and dispersion compensation
 	cl_mem d_fftBuffer2 = d_fftBuffer;
 
-	bool dcRemoval = config.processingParams.dcRemoval.enabled;
 	bool resampling = config.processingParams.resampling.enabled;
 	bool windowing = config.processingParams.windowing.enabled;
 	bool dispersion = config.processingParams.dispersion.enabled;
 	InterpolationMethod interpMethod = config.processingParams.resampling.method;
 
-	if (dcRemoval && resampling && windowing && dispersion) {
+	if (resampling && windowing && dispersion) {
 		//	K-linearization + windowing + dispersion (most common case)
 		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubicAndWindowingAndDispersion :
 			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearizationAndWindowingAndDispersion :
@@ -1054,7 +1051,7 @@ void OpenClBackend::process(IOBuffer& input) {
 		checkOpenClErrors(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
 
 		d_fftBuffer2 = d_inputLinearized;
-	} else if (dcRemoval && resampling && windowing && !dispersion) {
+	} else if (resampling && windowing && !dispersion) {
 		//	K-linearization + windowing
 		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubicAndWindowing :
 			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearizationAndWindowing :
@@ -1069,7 +1066,7 @@ void OpenClBackend::process(IOBuffer& input) {
 		checkOpenClErrors(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
 
 		d_fftBuffer2 = d_inputLinearized;
-	} else if (dcRemoval && resampling && !windowing && !dispersion) {
+	} else if (resampling && !windowing && !dispersion) {
 		//	Just k-linearization
 		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubic :
 			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearization :
@@ -1114,7 +1111,7 @@ void OpenClBackend::process(IOBuffer& input) {
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 3, sizeof(int), &signalLength));
 		checkOpenClErrors(clSetKernelArg(this->impl->kernelDispersionCompensation, 4, sizeof(int), &samplesPerBuffer));
 		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelDispersionCompensation, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
-	} else if (dcRemoval && resampling && !windowing && dispersion) {
+	} else if (resampling && !windowing && dispersion) {
 		//	K-linearization + dispersion (rarely used)
 		cl_kernel kernel = (interpMethod == InterpolationMethod::CUBIC) ? this->impl->kernelKLinearizationCubic :
 			(interpMethod == InterpolationMethod::LINEAR) ? this->impl->kernelKLinearization :
@@ -1461,6 +1458,7 @@ IOBuffer& OpenClBackend::getNextAvailableInputBuffer() {
 
 	IOBuffer* buffer = this->impl->freeBuffersQueue.front();
 	this->impl->freeBuffersQueue.pop();
+
 	return *buffer;
 }
 
