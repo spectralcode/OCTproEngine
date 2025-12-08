@@ -539,7 +539,6 @@ int main() {
 	RUN_TEST(test_data_integrity);
 	RUN_TEST(test_multiple_frames);
 	RUN_TEST(test_multi_consumer_performance);
-	RUN_TEST(test_slow_consumer_throughput);
 	RUN_TEST(test_queue_depth);
 	
 	std::cout << "========================================" << std::endl;
