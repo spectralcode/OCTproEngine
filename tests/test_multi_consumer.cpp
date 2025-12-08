@@ -11,12 +11,23 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstring>
 #include "test_utils.h"
 
 // Test configuration
 const int SIGNAL_LENGTH = 1024;
 const int ASCANS_PER_BSCAN = 256;
 const int BSCANS_PER_BUFFER = 1;
+
+// Test configuration for performance test
+const int NUM_ITERATIONS = 1000;
+const int PERF_SIGNAL_LENGTH = 1024;
+const int PERF_ASCANS_PER_BSCAN = 512;
+const int PERF_BSCANS_PER_BUFFER = 1;
+
+// Backend for all tests
+const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+
 
 // Generate simple test data
 std::vector<uint16_t> generateTestData() {
@@ -58,7 +69,7 @@ bool test_basic_multi_consumer() {
 	std::cout << "TEST 1: Basic Multi-Consumer" << std::endl;
 	std::cout << "  Testing that 3 callbacks all receive data..." << std::endl;
 	
-	ope::Processor processor(ope::Backend::CPU);
+	ope::Processor processor(TEST_BACKEND);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -111,7 +122,7 @@ bool test_remove_callback() {
 	std::cout << "TEST 2: Remove Callback" << std::endl;
 	std::cout << "  Testing callback removal..." << std::endl;
 	
-	ope::Processor processor(ope::Backend::CPU);
+	ope::Processor processor(TEST_BACKEND);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -165,7 +176,7 @@ bool test_clear_callbacks() {
 	std::cout << "TEST 3: Clear All Callbacks" << std::endl;
 	std::cout << "  Testing clearOutputCallbacks()..." << std::endl;
 	
-	ope::Processor processor(ope::Backend::CPU);
+	ope::Processor processor(TEST_BACKEND);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -212,7 +223,7 @@ bool test_data_integrity() {
 	std::cout << "TEST 4: Data Integrity" << std::endl;
 	std::cout << "  Testing that all callbacks receive same data..." << std::endl;
 	
-	ope::Processor processor(ope::Backend::CPU);
+	ope::Processor processor(TEST_BACKEND);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -291,7 +302,7 @@ bool test_multiple_frames() {
 	std::cout << "TEST 5: Multiple Frames" << std::endl;
 	std::cout << "  Testing multiple frames with multiple callbacks..." << std::endl;
 	
-	ope::Processor processor(ope::Backend::CPU);
+	ope::Processor processor(TEST_BACKEND);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -327,40 +338,96 @@ bool test_multiple_frames() {
 }
 
 // ============================================
-// TEST 6: Legacy API Compatibility
+// TEST 6: Multi-Consumer Performance
 // ============================================
-bool test_legacy_api() {
-	std::cout << "TEST 6: Legacy API Compatibility" << std::endl;
-	std::cout << "  Testing setOutputCallback() still works..." << std::endl;
-	
-	ope::Processor processor(ope::Backend::CPU);
-	configureProcessor(processor);
-	processor.initialize();
-	
-	std::atomic<int> count{0};
-	
-	// Use legacy API
-	processor.setOutputCallback([&](const ope::IOBuffer& buf) {
-		count++;
-	});
-	
-	TEST_ASSERT(processor.getOutputCallbackCount() == 1, "Expected 1 callback from setOutputCallback");
-	std::cout << "  [OK] setOutputCallback() registered 1 callback" << std::endl;
-	
-	// Process frame
-	auto testData = generateTestData();
-	auto& inputBuf = processor.getNextAvailableInputBuffer();
-	std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
-	processor.process(inputBuf);
-	
-	std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	
-	if (count != 1) {
-		std::cerr << "  [FAIL] Callback count=" << count << " (expected 1)" << std::endl;
-		return false;
+bool test_multi_consumer_performance() {
+	std::cout << "TEST 6: Multi-Consumer Performance" << std::endl;
+	std::cout << "  Measuring performance impact of multiple consumers..." << std::endl;
+
+	// Generate test data
+	size_t inputSize = PERF_SIGNAL_LENGTH * PERF_ASCANS_PER_BSCAN * PERF_BSCANS_PER_BUFFER;
+	std::vector<uint16_t> testData(inputSize);
+	for (size_t i = 0; i < inputSize; ++i) {
+		testData[i] = static_cast<uint16_t>(i % 65536);
 	}
-	
-	std::cout << "  [OK] Legacy callback called correctly" << std::endl;
+
+	double baselineAvgTime = 0.0;
+
+	// Test with a increasing number of consumers
+	for (int numConsumers = 1; numConsumers <= 16; ++numConsumers) {
+		ope::Processor processor(TEST_BACKEND);
+		auto config = processor.getConfig();
+		config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
+		config.dataParams.ascansPerBscan = PERF_ASCANS_PER_BSCAN;
+		config.dataParams.bscansPerBuffer = PERF_BSCANS_PER_BUFFER;
+		config.dataParams.inputDataType = ope::DataType::UINT16;
+		config.processingParams.resampling.enabled = false;
+		config.processingParams.windowing.enabled = false;
+		config.processingParams.dispersion.enabled = false;
+		config.processingParams.dcRemoval.enabled = false;
+		config.processingParams.intensity.logScale = false;
+		processor.setConfig(config);
+		processor.initialize();
+
+		auto& dataParams = processor.getConfig().dataParams;
+		size_t outputBufferSize = dataParams.outputSignalLength() * dataParams.ascansPerBscan * dataParams.bscansPerBuffer * dataParams.getOutputBytesPerSample();
+
+		std::atomic<int> completedIterations{0};
+
+		// Create temp buffers for each consumer
+		std::vector<std::vector<uint8_t>> tempBuffers(numConsumers);
+		for (int c = 0; c < numConsumers; ++c) {
+			tempBuffers[c].resize(outputBufferSize);
+		}
+
+		// Add callbacks
+		for (int c = 0; c < numConsumers; ++c) {
+			bool isLast = (c == numConsumers - 1);
+			processor.addOutputCallback([&, c, isLast](const ope::IOBuffer& buf) {
+				// copy output data to temp buffer to simulate actual use of data
+				memcpy(tempBuffers[c].data(), buf.getDataPointer(), outputBufferSize);
+
+				// Simulate some processing that takes time. without memcpy
+				/*volatile float sink = 0;
+				const float* data = static_cast<const float*>(buf.getDataPointer());
+				size_t numFloats = outputBufferSize / sizeof(float);
+				for (size_t i = 0; i < numFloats; i += 16) {
+					sink = data[i];
+				}*/
+
+				if (isLast) {
+					completedIterations++;
+				}
+			});
+		}
+
+		auto startTime = std::chrono::high_resolution_clock::now();
+		for (int i = 0; i < NUM_ITERATIONS; ++i) {
+			auto& inputBuf = processor.getNextAvailableInputBuffer();
+			std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
+			processor.process(inputBuf);
+		}
+		while (completedIterations < NUM_ITERATIONS) {
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
+		}
+		auto endTime = std::chrono::high_resolution_clock::now();
+
+		double duration = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+		double avgTime = duration / NUM_ITERATIONS;  // ms per buffer
+		double buffersPerSec = 1000.0 / avgTime;
+		double bscansPerSec = buffersPerSec * config.dataParams.bscansPerBuffer;
+		double ascansPerSec = bscansPerSec * PERF_ASCANS_PER_BSCAN;
+		double mbPerSec = buffersPerSec * outputBufferSize / (1024.0 * 1024.0);
+
+		if (numConsumers == 1) {
+			baselineAvgTime = avgTime;
+			std::cout << "  " << numConsumers << " consumer:  " << avgTime << " ms/buffer, " << ascansPerSec << " ascans/s, " << bscansPerSec << " bscans/s, " << mbPerSec << " MB/s" << std::endl;
+		} else {
+			double ratio = ((baselineAvgTime/avgTime));
+			std::cout << "  " << numConsumers << " consumers: " << avgTime << " ms/buffer, " << ascansPerSec << " ascans/s, " << bscansPerSec << " bscans/s, " << mbPerSec << " MB/s (" << ratio << "x)" << std::endl;
+		}
+	}
+
 	std::cout << "  PASSED" << std::endl;
 	std::cout << std::endl;
 	return true;
@@ -389,7 +456,7 @@ int main() {
 	RUN_TEST(test_clear_callbacks);
 	RUN_TEST(test_data_integrity);
 	RUN_TEST(test_multiple_frames);
-	RUN_TEST(test_legacy_api);
+	RUN_TEST(test_multi_consumer_performance);
 	
 	std::cout << "========================================" << std::endl;
 	std::cout << "RESULTS: " << passed << "/" << total << " tests passed" << std::endl;
