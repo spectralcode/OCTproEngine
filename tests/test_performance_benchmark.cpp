@@ -54,7 +54,7 @@ const int ITERATIONS = 20000;
 const bool ENABLE_RESAMPLING = true;
 const bool ENABLE_WINDOWING = true;
 const bool ENABLE_DISPERSION = true;
-const bool ENABLE_DC_REMOVAL = true;
+const bool ENABLE_DC_REMOVAL = false;
 const bool ENABLE_LOG_SCALING = true;
 const bool ENABLE_FIXED_PATTERN_NOISE_REMOVAL = false;
 const bool ENABLE_POST_PROCESS_BACKGROUND_SUBTRACTION = false;
@@ -282,8 +282,14 @@ BenchmarkResult runBenchmark(
 	size_t dataSizeBytes = testData.size() * sizeof(uint16_t);
 	
 	std::atomic<int> completedIterations(0);
-	processor.setOutputCallback([&completedIterations](const ope::IOBuffer& output) {
+	size_t outputBufferSize = (signalLength / 2) * ascansPerBscan * bscansPerBuffer * sizeof(float);
+	std::vector<uint8_t> tempBuffer(outputBufferSize);
+
+	processor.setOutputCallback([&completedIterations, &tempBuffer, outputBufferSize](const ope::IOBuffer& output) {
 		completedIterations++;
+
+		// copy output data to temp buffer to simulate actual use of data
+		std::memcpy(tempBuffer.data(), output.getDataPointer(), outputBufferSize);
 	});
 	
 	auto startTime = std::chrono::high_resolution_clock::now();
