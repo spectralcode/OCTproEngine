@@ -25,6 +25,12 @@ const int PERF_SIGNAL_LENGTH = 1024;
 const int PERF_ASCANS_PER_BSCAN = 512;
 const int PERF_BSCANS_PER_BUFFER = 1;
 
+const bool RESAMPLING_ENABLED = true;
+const bool WINDOWING_ENABLED = true;
+const bool DISPERSION_ENABLED = true;
+const bool DC_REMOVAL_ENABLED = false;
+const bool INTENSITY_LOG_SCALE = true;
+
 // Test configuration for slow consumer test
 const int NUM_ITERATIONS_SLOW_CONSUMER = 1000;
 const int SIGNAL_LENGTH_SLOW_CONSUMER = 1024;
@@ -360,7 +366,7 @@ bool test_multi_consumer_performance() {
 	double baselineAvgTime = 0.0;
 
 	// Test with a increasing number of consumers
-	for (int numConsumers = 1; numConsumers <= 16; ++numConsumers) {
+	for (int numConsumers = 0; numConsumers <= 16; ++numConsumers) {
 		ope::Processor processor(TEST_BACKEND);
 		auto config = processor.getConfig();
 		config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
@@ -387,25 +393,32 @@ bool test_multi_consumer_performance() {
 		}
 
 		// Add callbacks
-		for (int c = 0; c < numConsumers; ++c) {
-			bool isLast = (c == numConsumers - 1);
-			processor.addOutputCallback([&, c, isLast](const ope::IOBuffer& buf) {
-				// copy output data to temp buffer to simulate actual use of data
-				memcpy(tempBuffers[c].data(), buf.getDataPointer(), outputBufferSize);
-
-				// Simulate some processing that takes time. without memcpy
-				/*volatile float sink = 0;
-				const float* data = static_cast<const float*>(buf.getDataPointer());
-				size_t numFloats = outputBufferSize / sizeof(float);
-				for (size_t i = 0; i < numFloats; i += 16) {
-					sink = data[i];
-				}*/
-
-				if (isLast) {
-					completedIterations++;
-				}
+		if (numConsumers == 0) {
+			// For 0 consumers: add lightweight counting callback only
+			processor.addOutputCallback([&](const ope::IOBuffer& buf) {
+				completedIterations++;
 			});
-		}
+		} else {
+			for (int c = 0; c < numConsumers; ++c) {
+				bool isLast = (c == numConsumers - 1);
+				processor.addOutputCallback([&, c, isLast](const ope::IOBuffer& buf) {
+					// copy output data to temp buffer to simulate actual use of data
+					memcpy(tempBuffers[c].data(), buf.getDataPointer(), outputBufferSize);
+
+					// Simulate some processing that takes time. without memcpy
+					/*volatile float sink = 0;
+					const float* data = static_cast<const float*>(buf.getDataPointer());
+					size_t numFloats = outputBufferSize / sizeof(float);
+					for (size_t i = 0; i < numFloats; i += 16) {
+						sink = data[i];
+					}*/
+
+					if (isLast) {
+						completedIterations++;
+					}
+				});
+			}
+		}	
 
 		auto startTime = std::chrono::high_resolution_clock::now();
 		for (int i = 0; i < NUM_ITERATIONS; ++i) {
@@ -425,13 +438,13 @@ bool test_multi_consumer_performance() {
 		double ascansPerSec = bscansPerSec * PERF_ASCANS_PER_BSCAN;
 		double mbPerSec = buffersPerSec * outputBufferSize / (1024.0 * 1024.0);
 
-		if (numConsumers == 1) {
+		if (numConsumers == 0) {
 			baselineAvgTime = avgTime;
-			std::cout << "  " << numConsumers << " consumer:  " << avgTime << " ms/buffer, " << ascansPerSec << " ascans/s, " << bscansPerSec << " bscans/s, " << mbPerSec << " MB/s" << std::endl;
-		} else {
-			double ratio = ((baselineAvgTime/avgTime));
-			std::cout << "  " << numConsumers << " consumers: " << avgTime << " ms/buffer, " << ascansPerSec << " ascans/s, " << bscansPerSec << " bscans/s, " << mbPerSec << " MB/s (" << ratio << "x)" << std::endl;
 		}
+
+		double ratio = ((baselineAvgTime/avgTime));
+		std::cout << "  " << numConsumers << " consumers: " << avgTime << " ms/buffer, " << ascansPerSec << " ascans/s, " << bscansPerSec << " bscans/s, " << mbPerSec << " MB/s (" << ratio << "x)" << std::endl;
+		
 	}
 
 	std::cout << "  PASSED" << std::endl;
@@ -469,10 +482,10 @@ bool test_slow_consumer_throughput() {
 		config.dataParams.bscansPerBuffer = BSCANS_PER_BUFFER_SLOW_CONSUMER;
 		config.dataParams.inputDataType = ope::DataType::UINT16;
 		config.processingParams.resampling.enabled = false;
-		config.processingParams.windowing.enabled = false;
-		config.processingParams.dispersion.enabled = false;
-		config.processingParams.dcRemoval.enabled = false;
-		config.processingParams.intensity.logScale = false;
+		config.processingParams.windowing.enabled = WINDOWING_ENABLED;
+		config.processingParams.dispersion.enabled = DISPERSION_ENABLED;
+		config.processingParams.dcRemoval.enabled = DC_REMOVAL_ENABLED;
+		config.processingParams.intensity.logScale = INTENSITY_LOG_SCALE;
 		processor.setConfig(config);
 		processor.initialize();
 
@@ -515,11 +528,11 @@ bool test_slow_consumer_throughput() {
 		config.dataParams.ascansPerBscan = ASCANS_PER_BSCAN_SLOW_CONSUMER;
 		config.dataParams.bscansPerBuffer = BSCANS_PER_BUFFER_SLOW_CONSUMER;
 		config.dataParams.inputDataType = ope::DataType::UINT16;
-		config.processingParams.resampling.enabled = false;
-		config.processingParams.windowing.enabled = false;
-		config.processingParams.dispersion.enabled = false;
-		config.processingParams.dcRemoval.enabled = false;
-		config.processingParams.intensity.logScale = false;
+		config.processingParams.resampling.enabled = RESAMPLING_ENABLED;
+		config.processingParams.windowing.enabled = WINDOWING_ENABLED;
+		config.processingParams.dispersion.enabled = DISPERSION_ENABLED;
+		config.processingParams.dcRemoval.enabled = DC_REMOVAL_ENABLED;
+		config.processingParams.intensity.logScale = INTENSITY_LOG_SCALE;
 		processor.setConfig(config);
 		processor.initialize();
 
@@ -576,11 +589,11 @@ bool test_slow_consumer_throughput() {
 		config.dataParams.ascansPerBscan = ASCANS_PER_BSCAN_SLOW_CONSUMER;
 		config.dataParams.bscansPerBuffer = BSCANS_PER_BUFFER_SLOW_CONSUMER;
 		config.dataParams.inputDataType = ope::DataType::UINT16;
-		config.processingParams.resampling.enabled = false;
-		config.processingParams.windowing.enabled = false;
-		config.processingParams.dispersion.enabled = false;
-		config.processingParams.dcRemoval.enabled = false;
-		config.processingParams.intensity.logScale = false;
+		config.processingParams.resampling.enabled = RESAMPLING_ENABLED;
+		config.processingParams.windowing.enabled = WINDOWING_ENABLED;
+		config.processingParams.dispersion.enabled = DISPERSION_ENABLED;
+		config.processingParams.dcRemoval.enabled = DC_REMOVAL_ENABLED;
+		config.processingParams.intensity.logScale = INTENSITY_LOG_SCALE;
 		processor.setConfig(config);
 		processor.initialize();
 
@@ -690,11 +703,11 @@ bool test_queue_depth() {
 	config.dataParams.ascansPerBscan = PERF_ASCANS_PER_BSCAN;
 	config.dataParams.bscansPerBuffer = PERF_BSCANS_PER_BUFFER;
 	config.dataParams.inputDataType = ope::DataType::UINT16;
-	config.processingParams.resampling.enabled = false;
-	config.processingParams.windowing.enabled = false;
-	config.processingParams.dispersion.enabled = false;
-	config.processingParams.dcRemoval.enabled = false;
-	config.processingParams.intensity.logScale = false;
+	config.processingParams.resampling.enabled = RESAMPLING_ENABLED;
+	config.processingParams.windowing.enabled = WINDOWING_ENABLED;
+	config.processingParams.dispersion.enabled = DISPERSION_ENABLED;
+	config.processingParams.dcRemoval.enabled = DC_REMOVAL_ENABLED;
+	config.processingParams.intensity.logScale = INTENSITY_LOG_SCALE;
 	processor.setConfig(config);
 	processor.initialize();
 
