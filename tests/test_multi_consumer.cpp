@@ -434,9 +434,157 @@ bool test_multi_consumer_performance() {
 }
 
 // ============================================
-// TEST 7: Queue Depth (In-Flight Buffers)
+// TEST 7: Slow Consumer Throughput
+// Compares fast vs slow consumer to measure async callback overhead
+// ============================================
+bool test_slow_consumer_throughput() {
+	std::cout << "TEST 7: Slow Consumer Throughput" << std::endl;
+	std::cout << "  Comparing fast vs slow consumer completion times..." << std::endl;
+
+	const int NUM_BUFFERS = 1000;
+
+	// Generate test data
+	size_t inputSize = PERF_SIGNAL_LENGTH * PERF_ASCANS_PER_BSCAN * PERF_BSCANS_PER_BUFFER;
+	std::vector<uint16_t> testData(inputSize);
+	for (size_t i = 0; i < inputSize; ++i) {
+		testData[i] = static_cast<uint16_t>(i % 65536);
+	}
+
+	double fastCompletionMs = 0;
+	double slowCompletionMs = 0;
+	double slowCallbackWorkMs = 0;
+
+	// ---- RUN 1: FAST CONSUMER (no delay) ----
+	{
+		ope::Processor processor(TEST_BACKEND);
+		auto config = processor.getConfig();
+		config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
+		config.dataParams.ascansPerBscan = PERF_ASCANS_PER_BSCAN;
+		config.dataParams.bscansPerBuffer = PERF_BSCANS_PER_BUFFER;
+		config.dataParams.inputDataType = ope::DataType::UINT16;
+		config.processingParams.resampling.enabled = false;
+		config.processingParams.windowing.enabled = false;
+		config.processingParams.dispersion.enabled = false;
+		config.processingParams.dcRemoval.enabled = false;
+		config.processingParams.intensity.logScale = false;
+		processor.setConfig(config);
+		processor.initialize();
+
+		std::atomic<int> callbacksCompleted{0};
+		std::chrono::high_resolution_clock::time_point callbackEndTime;
+
+		processor.addOutputCallback([&](const ope::IOBuffer& buf) {
+			int count = ++callbacksCompleted;
+			if (count == NUM_BUFFERS) {
+				callbackEndTime = std::chrono::high_resolution_clock::now();
+			}
+		});
+
+		auto startTime = std::chrono::high_resolution_clock::now();
+		for (int i = 0; i < NUM_BUFFERS; ++i) {
+			auto& inputBuf = processor.getNextAvailableInputBuffer();
+			std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
+			processor.process(inputBuf);
+		}
+
+		while (callbacksCompleted < NUM_BUFFERS) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		fastCompletionMs = std::chrono::duration<double, std::milli>(callbackEndTime - startTime).count();
+	}
+
+	// Calculate slow consumer delay from fast consumer's average buffer time
+	double avgBufferTimeMs = fastCompletionMs / NUM_BUFFERS;
+	int slowCallbackDelayUs = static_cast<int>(avgBufferTimeMs * 1000.0);  // Convert ms to us
+
+	std::cout << "  Processing speed for fast consumer: " << fastCompletionMs << " ms (" << avgBufferTimeMs << " ms/buffer)" << std::endl;
+	std::cout << "  this gives us max allowable callback delay for our slow consumer: " << slowCallbackDelayUs << " us (= avg buffer time)" << std::endl;
+
+	// ---- RUN 2: SLOW CONSUMER (busy-wait delay = avg buffer time) ----
+	{
+		ope::Processor processor(TEST_BACKEND);
+		auto config = processor.getConfig();
+		config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
+		config.dataParams.ascansPerBscan = PERF_ASCANS_PER_BSCAN;
+		config.dataParams.bscansPerBuffer = PERF_BSCANS_PER_BUFFER;
+		config.dataParams.inputDataType = ope::DataType::UINT16;
+		config.processingParams.resampling.enabled = false;
+		config.processingParams.windowing.enabled = false;
+		config.processingParams.dispersion.enabled = false;
+		config.processingParams.dcRemoval.enabled = false;
+		config.processingParams.intensity.logScale = false;
+		processor.setConfig(config);
+		processor.initialize();
+
+		std::atomic<int> callbacksCompleted{0};
+		std::atomic<double> totalBusyWaitTimeUs{0};
+		std::chrono::high_resolution_clock::time_point callbackEndTime;
+
+		processor.addOutputCallback([&, slowCallbackDelayUs](const ope::IOBuffer& buf) {
+			// Busy-wait spin loop with accurate timing
+			auto busyStart = std::chrono::high_resolution_clock::now();
+			auto targetEnd = busyStart + std::chrono::microseconds(slowCallbackDelayUs);
+			while (std::chrono::high_resolution_clock::now() < targetEnd) {
+				// Spin
+			}
+			auto busyEnd = std::chrono::high_resolution_clock::now();
+
+			// Accumulate actual busy-wait time
+			double actualUs = std::chrono::duration<double, std::micro>(busyEnd - busyStart).count();
+			double oldVal = totalBusyWaitTimeUs.load();
+			while (!totalBusyWaitTimeUs.compare_exchange_weak(oldVal, oldVal + actualUs)) {}
+
+			int count = ++callbacksCompleted;
+			if (count == NUM_BUFFERS) {
+				callbackEndTime = std::chrono::high_resolution_clock::now();
+			}
+		});
+
+		auto startTime = std::chrono::high_resolution_clock::now();
+		for (int i = 0; i < NUM_BUFFERS; ++i) {
+			auto& inputBuf = processor.getNextAvailableInputBuffer();
+			std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
+			processor.process(inputBuf);
+		}
+
+		while (callbacksCompleted < NUM_BUFFERS) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		slowCompletionMs = std::chrono::duration<double, std::milli>(callbackEndTime - startTime).count();
+		slowCallbackWorkMs = totalBusyWaitTimeUs.load() / 1000.0;
+	}
+
+	// ---- RESULTS ----
+	double callbackDelayMs = slowCallbackDelayUs / 1000.0;
+	double overheadMs = slowCompletionMs - fastCompletionMs;
+	double expectedSlowTimeMs = fastCompletionMs + (callbackDelayMs * NUM_BUFFERS);
+
+	std::cout << "  Processing speed for slow consumer: " << slowCompletionMs << " ms" << std::endl;
+	std::cout << "  Overhead: " << overheadMs << " ms" << std::endl;
+	std::cout << "  Expected processing duration if slow consumer would block processing: " << expectedSlowTimeMs << " ms" << std::endl;
+
+	// Since callback delay = avg buffer time, we expect backpressure
+	// The slow consumer should take roughly 2x the fast consumer time
+	double ratio = slowCompletionMs / fastCompletionMs;
+	std::cout << "  Ratio (slow/fast): " << ratio << "x" << std::endl;
+
+	if (ratio >= 1.5) {
+		std::cout << "  [OK] Backpressure detected: slow consumer took " << ratio << "x longer" << std::endl;
+	} else {
+		std::cout << "  [INFO] Minimal backpressure impact (ratio " << ratio << "x)" << std::endl;
+	}
+
+	std::cout << "  PASSED" << std::endl;
+	std::cout << std::endl;
+	return true;
+}
+
+// ============================================
+// TEST 8: Queue Depth (In-Flight Buffers)
 // Tests that multiple buffers can be "in flight" simultaneously
-// With async callbacks: maxInFlight > 1 
+// With async callbacks: maxInFlight > 1
 // With blocking callbacks: maxInFlight == 1 always
 // ============================================
 bool test_queue_depth() {
@@ -539,6 +687,7 @@ int main() {
 	RUN_TEST(test_data_integrity);
 	RUN_TEST(test_multiple_frames);
 	RUN_TEST(test_multi_consumer_performance);
+	RUN_TEST(test_slow_consumer_throughput);
 	RUN_TEST(test_queue_depth);
 	
 	std::cout << "========================================" << std::endl;
