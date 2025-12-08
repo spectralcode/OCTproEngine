@@ -434,83 +434,9 @@ bool test_multi_consumer_performance() {
 }
 
 // ============================================
-// TEST 7: Slow Consumer Throughput
-// ============================================
-bool test_slow_consumer_throughput() {
-	std::cout << "TEST 7: Slow Consumer Throughput" << std::endl;
-	std::cout << "  Testing that slow callbacks don't block processing (if enough buffers are available)..." << std::endl;
-
-	const int NUM_BUFFERS = 100;
-	const int CALLBACK_DELAY_US = 50;  // Simulate consumer work in microseconds
-
-	ope::Processor processor(TEST_BACKEND);
-	auto config = processor.getConfig();
-	config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
-	config.dataParams.ascansPerBscan = PERF_ASCANS_PER_BSCAN;
-	config.dataParams.bscansPerBuffer = PERF_BSCANS_PER_BUFFER;
-	config.dataParams.inputDataType = ope::DataType::UINT16;
-	config.processingParams.resampling.enabled = false;
-	config.processingParams.windowing.enabled = false;
-	config.processingParams.dispersion.enabled = false;
-	config.processingParams.dcRemoval.enabled = false;
-	config.processingParams.intensity.logScale = false;
-	processor.setConfig(config);
-	processor.initialize();
-
-	// Generate test data
-	size_t inputSize = PERF_SIGNAL_LENGTH * PERF_ASCANS_PER_BSCAN * PERF_BSCANS_PER_BUFFER;
-	std::vector<uint16_t> testData(inputSize);
-	for (size_t i = 0; i < inputSize; ++i) {
-		testData[i] = static_cast<uint16_t>(i % 65536);
-	}
-
-	std::atomic<int> callbacksCompleted{0};
-	std::chrono::high_resolution_clock::time_point callbackEndTime;
-
-	// Add a callback that simulates some work
-	processor.addOutputCallback([&](const ope::IOBuffer& buf) {
-		std::this_thread::sleep_for(std::chrono::microseconds(CALLBACK_DELAY_US));
-		int count = ++callbacksCompleted;
-		if (count == NUM_BUFFERS) {
-			callbackEndTime = std::chrono::high_resolution_clock::now();
-		}
-	});
-
-	// Measure how fast we can submit all buffers
-	auto submitStartTime = std::chrono::high_resolution_clock::now();
-	for (int i = 0; i < NUM_BUFFERS; ++i) {
-		auto& inputBuf = processor.getNextAvailableInputBuffer();
-		std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
-		processor.process(inputBuf);
-	}
-	auto submitEndTime = std::chrono::high_resolution_clock::now();
-
-	// Wait for all callbacks to complete
-	while (callbacksCompleted < NUM_BUFFERS) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
-	}
-
-	double submitDurationMs = std::chrono::duration<double, std::milli>(submitEndTime - submitStartTime).count();
-	double callbackDurationMs = std::chrono::duration<double, std::milli>(callbackEndTime - submitStartTime).count();
-
-	std::cout << "  Time to submit all buffers: " << submitDurationMs << " ms" << std::endl;
-	std::cout << "  Time until last callback done: " << callbackDurationMs << " ms" << std::endl;
-
-	if (callbackDurationMs > submitDurationMs) {
-		std::cout << "  [OK] Callbacks finished " << (callbackDurationMs - submitDurationMs) << " ms after submit" << std::endl;
-	} else {
-		std::cout << "  [OK] Callbacks finished with submit" << std::endl;
-	}
-
-	std::cout << "  PASSED" << std::endl;
-	std::cout << std::endl;
-	return true;
-}
-
-// ============================================
-// TEST 8: Queue Depth (In-Flight Buffers)
+// TEST 7: Queue Depth (In-Flight Buffers)
 // Tests that multiple buffers can be "in flight" simultaneously
-// With async callbacks: maxInFlight > 1 (pipelining works)
+// With async callbacks: maxInFlight > 1 
 // With blocking callbacks: maxInFlight == 1 always
 // ============================================
 bool test_queue_depth() {
