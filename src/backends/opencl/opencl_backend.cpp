@@ -892,12 +892,7 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 				if (this->impl->callback) {
 					this->impl->callback(*bufferToDeliver);
 				}
-				//	Release output buffer back to pool
-				{
-					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-					this->impl->availableOutputBuffers++;
-				}
-				this->impl->outputSemaphoreCV.notify_one();
+				// NOTE: Do NOT release here. OutputBufferManager handles release via releaseOutputBuffer()
 			}
 		}
 
@@ -918,12 +913,7 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 				if (this->impl->callback) {
 					this->impl->callback(*bufferToDeliver);
 				}
-				//	Release output buffer back to pool
-				{
-					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-					this->impl->availableOutputBuffers++;
-				}
-				this->impl->outputSemaphoreCV.notify_one();
+				// NOTE: Do NOT release here - OutputBufferManager handles release via releaseOutputBuffer()
 			}
 		}
 	});
@@ -1560,6 +1550,15 @@ IOBuffer& OpenClBackend::getNextAvailableInputBuffer() {
 
 int OpenClBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
+}
+
+void OpenClBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	(void)buffer;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->availableOutputBuffers++;
+	}
+	this->impl->outputSemaphoreCV.notify_one();
 }
 
 void OpenClBackend::requestPostProcessBackgroundRecording() {

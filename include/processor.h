@@ -12,12 +12,26 @@
 
 namespace ope {
 
+// Drop policy for output buffer consumers
+enum class DropPolicy {
+	BLOCK,       // Block producer if consumer queue is full (default, backward compatible)
+	DROP_OLDEST  // Drop oldest buffer in queue if full (non-blocking)
+};
+
+// Configuration for output buffer consumers
+struct ConsumerConfig {
+	size_t maxQueueSize = 0;                  // 0 = default queue size
+	DropPolicy dropPolicy = DropPolicy::BLOCK;
+};
+
+using ConsumerId = int;
+
 class OPE_API Processor {
 public:
 // todo: Consider redesigning public API for cross-compiler/OS binary compatibility (pure C ABI).
-// maybe keep cpp style API but don't use STL (std::function, std::vector, etc.) in public API? 
+// maybe keep cpp style API but don't use STL (std::function, std::vector, etc.) in public API?
 // maybe c api and optional cpp header-only wrapper?
-	using OutputCallback = std::function<void(const IOBuffer&)>; 
+	using OutputCallback = std::function<void(const IOBuffer&)>;
 	using InputCallback = std::function<void(const IOBuffer&)>;
 	using CallbackId = int;
 
@@ -95,6 +109,32 @@ public:
 
 	// Get number of registered output callbacks
 	size_t getOutputCallbackCount() const;
+
+	// Add output callback with custom configuration
+	CallbackId addOutputCallback(OutputCallback callback, ConsumerConfig config);
+
+	// ============================================
+	// POLLING API (alternative to callbacks)
+	// ============================================
+
+	// Register a consumer for polling-based output retrieval
+	ConsumerId addConsumer(ConsumerConfig config = {});
+
+	// Remove a consumer (releases any queued buffers)
+	void removeConsumer(ConsumerId id);
+
+	// Non-blocking: returns true if buffer available
+	bool tryGetOutputBuffer(ConsumerId id, IOBuffer** output);
+
+	// Blocking: waits for next processed buffer
+	// Returns nullptr if consumer was removed or shutdown
+	IOBuffer* getNextOutputBuffer(ConsumerId id);
+
+	// Release buffer back to pool (required after tryGetOutputBuffer/getNextOutputBuffer)
+	void releaseOutputBuffer(ConsumerId id, IOBuffer* buffer);
+
+	// Get number of dropped frames for consumer (only for DROP_OLDEST policy)
+	uint64_t getDroppedFrameCount(ConsumerId id) const;
 
 	// Input callbacks - receive input buffer before processing
 	// WARNING: Buffer is still in use by backend, copy data if needed beyond callback
@@ -211,7 +251,7 @@ public:
 	void loadFixedPatternNoiseProfileFromFile(const std::string& filepath); 
 	
 	// ============================================
-	// LOW-LEVEL API - Individual Operations (for testing)
+	// LOW-LEVEL API - Individual Operations (for testing) //todo: remove all individual operations
 	// ============================================
 	
 	std::vector<float> convertInput(

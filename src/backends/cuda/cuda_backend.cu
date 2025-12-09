@@ -114,7 +114,7 @@ struct CudaBackend::Impl {
 	// Output buffers for callback (rotating pool for ordered delivery)
 	std::vector<IOBuffer> outputBuffers;
 	std::atomic<int> currentOutputBuffer{0};
-	static constexpr int OUTPUT_BUFFER_MULTIPLIER = 1;  // outputBuffers.size() = numStreams * this
+	static constexpr int OUTPUT_BUFFER_MULTIPLIER = 2;  // outputBuffers.size() = numStreams * this
 
 	// Semaphore to limit in-flight output buffers (prevents buffer reuse before callback delivery)
 	std::mutex outputSemaphoreMutex;
@@ -284,6 +284,7 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 			throw std::runtime_error("Failed to allocate output buffer " + std::to_string(i));
 		}
 		this->impl->outputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
+		this->impl->outputBuffers[i].setBackendIndex(i);
 
 #ifndef __aarch64__
 		// Register output buffer for fast host-to-device transfers (Desktop only)
@@ -401,12 +402,7 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 				if (this->impl->callback) {
 					this->impl->callback(*bufferToDeliver);
 				}
-				// Release output buffer back to pool
-				{
-					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-					this->impl->availableOutputBuffers++;
-				}
-				this->impl->outputSemaphoreCV.notify_one();
+				// NOTE: Do NOT release here - OutputBufferManager handles release via releaseOutputBuffer()
 			}
 		}
 
@@ -427,12 +423,7 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 				if (this->impl->callback) {
 					this->impl->callback(*bufferToDeliver);
 				}
-				// Release output buffer back to pool
-				{
-					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-					this->impl->availableOutputBuffers++;
-				}
-				this->impl->outputSemaphoreCV.notify_one();
+				// NOTE: Do NOT release here - OutputBufferManager handles release via releaseOutputBuffer()
 			}
 		}
 	});
@@ -553,6 +544,15 @@ IOBuffer& CudaBackend::getNextAvailableInputBuffer() {
 
 int CudaBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
+}
+
+void CudaBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	(void)buffer;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->availableOutputBuffers++;
+	}
+	this->impl->outputSemaphoreCV.notify_one();
 }
 
 // ============================================

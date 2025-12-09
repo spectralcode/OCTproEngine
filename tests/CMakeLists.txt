@@ -54,6 +54,7 @@ add_ope_test(test_zerocopy_runtime test_zerocopy_runtime.cpp)
 add_ope_test(test_zerocopy_performance test_zerocopy_performance.cpp)
 add_ope_test(test_buffer_ordering test_buffer_ordering.cpp)
 add_ope_test(test_buffer_ordering_content test_buffer_ordering_content.cpp)
+add_ope_test(test_drop_policy_performance test_drop_policy_performance.cpp)
 
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)

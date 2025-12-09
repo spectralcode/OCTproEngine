@@ -9,9 +9,11 @@ set(CORE_SOURCES
 	core/processorconfiguration.cpp
 	core/backendconfig.cpp
 	core/callback_manager.cpp
+	core/output_buffer_manager.cpp
 	core/processortool.cpp
 	core/cudautils.cpp
 )
+
 
 set(TOOLS_SOURCES)
 if(BUILD_TOOLS)
@@ -22,10 +24,12 @@ set(CPU_SOURCES
 	backends/cpu/cpu_backend.cpp
 )
 
+
 set(CUDA_SOURCES
 	backends/cuda/cuda_backend.cu
 	backends/cuda/cuda_kernels.cu
 )
+
 
 # ========================================
 # OpenCL Kernel Embedding
@@ -49,9 +53,11 @@ set(OPENCL_SOURCES
 	backends/opencl/opencl_kernels_source.cpp
 )
 
+
 set(VULKAN_SOURCES
 	backends/vulkan/vulkan_backend.cpp
 )
+
 
 # ========================================
 # Build Library
@@ -81,6 +87,7 @@ add_library(octproengine SHARED
 	${TOOLS_SOURCES}
 	${BACKEND_SOURCES}
 )
+
 
 # Link libraries
 set(LINK_LIBRARIES)
@@ -128,7 +135,7 @@ if(BUILD_VULKAN)
 	target_include_directories(octproengine PRIVATE ${GLSLANG_INCLUDE_DIRS})
 endif()
 
-target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES})
+target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES} ReaderWriterQueue::ReaderWriterQueue)
 
 # CUDA-specific properties
 if(BUILD_CUDA)
@@ -161,10 +168,12 @@ set_target_properties(octproengine PROPERTIES
 	SOVERSION 1
 )
 
+
 # Define BUILD_OPE_LIBRARY when building the DLL (enables dllexport)
 target_compile_definitions(octproengine PRIVATE
 	BUILD_OPE_LIBRARY
 )
+
 
 # Define backend availability macros
 if(BUILD_CUDA)
@@ -193,6 +202,14 @@ if(WIN32)
 		NOMINMAX
 		_CRT_SECURE_NO_WARNINGS
 	)
+endif()
+
+# MSVC: Suppress C4316 (object may not be aligned to 64 bytes on heap)
+# ReaderWriterQueue uses alignas(64) for cache line optimization.
+# todo: investigate if this may have measurable performance implications if the
+# objects we use with ReaderWriterQueue are not aligned
+if(MSVC)
+	target_compile_options(octproengine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/wd4316>)
 endif()
 
 # Linux/GCC-specific settings - set default symbol visibility
@@ -250,6 +267,7 @@ install(TARGETS octproengine
 	ARCHIVE DESTINATION lib
 	RUNTIME DESTINATION bin
 )
+
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/
 	DESTINATION include/octproengine

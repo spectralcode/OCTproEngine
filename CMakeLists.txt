@@ -23,6 +23,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TOOLS "Build optional ProcessorTools (Recorder, etc.)" ON)
 option(FFTW3_AUTO_DOWNLOAD "Automatically download FFTW3 to thirdparty/fftw if not found (Windows only)" ON)
 option(VKFFT_AUTO_DOWNLOAD "Automatically download VkFFT to thirdparty/vkfft if not found" ON)
+option(READERWRITERQUEUE_AUTO_DOWNLOAD "Automatically download readerwriterqueue to thirdparty if not found" ON)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 14)
@@ -158,6 +159,9 @@ endif()
 
 # Include DLL copying helper for Windows
 include(cmake/CopyDLLs.cmake)
+
+# Find readerwriterqueue (required for lock-free callback queues)
+find_package(ReaderWriterQueue REQUIRED)
 
 # octproengine src folder
 add_subdirectory(src)

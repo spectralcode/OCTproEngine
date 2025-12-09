@@ -139,9 +139,6 @@ struct VulkanBackend::Impl {
 	VkSemaphore outputOrderingSemaphore = VK_NULL_HANDLE;
 	uint64_t nextOutputSignalValue = 1;  // Monotonically increasing value for timeline semaphore
 	std::vector<uint64_t> lastTimelineValuePerCB;  // Last timeline value used by each command buffer
-	std::atomic<uint64_t> lastProcessedTimelineValue{0};  // Highest timeline value fully processed by completion thread
-	std::mutex stagingBufferMutex;  // Protects staging buffer access
-	std::condition_variable stagingBufferCV;  // For waiting on staging buffer availability
 
 	// Command buffers and synchronization
 	VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -292,6 +289,10 @@ struct VulkanBackend::Impl {
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
 
+	// Input buffers waiting for consumer release (indexed by command buffer index)
+	// Used to defer returning input buffers until OutputBufferManager releases output
+	std::vector<IOBuffer*> pendingInputBufferRelease;
+
 	Impl() = default;
 
 	~Impl() {
@@ -362,21 +363,11 @@ struct VulkanBackend::Impl {
 				this->callback(*work.outputBuffer);
 			}
 
-			// Update processed timeline value AFTER callback (output buffer is now safe to reuse)
-			// This must be done after callback to prevent next frame from overwriting buffer ID
-			{
-				std::lock_guard<std::mutex> lock(this->stagingBufferMutex);
-				this->lastProcessedTimelineValue = work.timelineValue;
-			}
-			this->stagingBufferCV.notify_all();
-
-			// Return input buffer to free queue now that GPU and callback are done
-			// Input buffer is backed by staging memory, which is now safe to write to
-			{
-				std::lock_guard<std::mutex> lock(this->freeQueueMutex);
-				this->freeBuffersQueue.push(work.inputBuffer);
-			}
-			this->freeQueueCV.notify_one();
+			// Store input buffer for deferred release - OutputBufferManager will call releaseOutputBuffer()
+			// when all consumers are done, which returns the input buffer to the free queue
+			// NOTE: Do NOT return input buffer here - it would allow the CB slot to be reused
+			// while consumers still hold references to the output buffer
+			this->pendingInputBufferRelease[work.commandBufferIdx] = work.inputBuffer;
 		}
 	}
 
@@ -1406,6 +1397,7 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	size_t outputSamplesPerBuffer = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
 	size_t outputSize = outputSamplesPerBuffer * sizeof(float);  // Output is always float
 	this->impl->outputBuffers.resize(this->impl->numCommandBuffers);
+	this->impl->pendingInputBufferRelease.resize(this->impl->numCommandBuffers, nullptr);
 
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		this->impl->outputBuffers[i].setBackendIndex(i);
@@ -1908,6 +1900,28 @@ IOBuffer& VulkanBackend::getNextAvailableInputBuffer() {
 int VulkanBackend::getNumInputBuffers() const {
 	// there is one input buffer per command buffer
 	return this->impl->numCommandBuffers;
+}
+
+void VulkanBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	if (!buffer) return;
+
+	int idx = buffer->getBackendIndex();
+	if (idx < 0 || idx >= static_cast<int>(this->impl->pendingInputBufferRelease.size())) {
+		return;
+	}
+
+	// Get the input buffer that was waiting for this release
+	IOBuffer* inputBuffer = this->impl->pendingInputBufferRelease[idx];
+	if (inputBuffer) {
+		this->impl->pendingInputBufferRelease[idx] = nullptr;
+
+		// Return input buffer to free queue - now safe to reuse this CB slot
+		{
+			std::lock_guard<std::mutex> lock(this->impl->freeQueueMutex);
+			this->impl->freeBuffersQueue.push(inputBuffer);
+		}
+		this->impl->freeQueueCV.notify_one();
+	}
 }
 
 // ============================================

@@ -35,6 +35,9 @@ public:
 	virtual IOBuffer& getInputBuffer(int index) = 0;
 	virtual IOBuffer& getNextAvailableInputBuffer() = 0;
 	virtual int getNumInputBuffers() const = 0;
+
+	// Output buffer release. called when all consumers are done with a buffer
+	virtual void releaseOutputBuffer(IOBuffer* buffer) = 0;
 	
 	// Post-process background management
 	virtual void requestPostProcessBackgroundRecording() = 0;

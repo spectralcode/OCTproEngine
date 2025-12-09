@@ -59,6 +59,7 @@ public:
 	IOBuffer& getInputBuffer(int index) override;
 	IOBuffer& getNextAvailableInputBuffer() override;
 	int getNumInputBuffers() const override;
+	void releaseOutputBuffer(IOBuffer* buffer) override;
 	
 	// Post-process background methods
 	void requestPostProcessBackgroundRecording() override;

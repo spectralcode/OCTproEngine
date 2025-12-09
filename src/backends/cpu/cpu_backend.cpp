@@ -28,6 +28,11 @@ struct CpuBackend::Impl {
 	IOBuffer outputBuffer1;
 	IOBuffer outputBuffer2;
 	int currentOutputBuffer;
+
+	// Semaphore to limit in-flight output buffers (prevents buffer reuse before consumer release)
+	std::mutex outputSemaphoreMutex;
+	std::condition_variable outputSemaphoreCV;
+	int availableOutputBuffers = 2;  // 2 ping-pong buffers
 	
 	// Input buffer management
 	std::vector<uint8_t> processingBuffer; 
@@ -165,6 +170,15 @@ struct CpuBackend::Impl {
 				this->freeBuffersQueue.push(inputBuffer);
 			}
 			this->freeQueueCV.notify_one();
+
+			// Wait for an output buffer to be available (prevents buffer reuse before consumer release)
+			{
+				std::unique_lock<std::mutex> lock(this->outputSemaphoreMutex);
+				this->outputSemaphoreCV.wait(lock, [this]() {
+					return this->availableOutputBuffers > 0;
+				});
+				this->availableOutputBuffers--;
+			}
 
 			this->currentOutputBuffer = (this->currentOutputBuffer + 1) % 2;
 			IOBuffer& output = (this->currentOutputBuffer == 0)
@@ -878,6 +892,15 @@ IOBuffer& CpuBackend::getNextAvailableInputBuffer() {
 
 int CpuBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
+}
+
+void CpuBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	(void)buffer;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->availableOutputBuffers++;
+	}
+	this->impl->outputSemaphoreCV.notify_one();
 }
 
 float CpuBackend::cubicHermiteInterpolation(float y0, float y1, float y2, float y3, float t) {

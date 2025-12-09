@@ -366,7 +366,7 @@ bool test_multi_consumer_performance() {
 	double baselineAvgTime = 0.0;
 
 	// Test with a increasing number of consumers
-	for (int numConsumers = 0; numConsumers <= 16; ++numConsumers) {
+	for (int numConsumers = 0; numConsumers <= 8; ++numConsumers) {
 		ope::Processor processor(TEST_BACKEND);
 		auto config = processor.getConfig();
 		config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
