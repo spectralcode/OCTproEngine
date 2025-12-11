@@ -49,17 +49,13 @@ void OutputBufferManager::removeConsumer(ConsumerId id) {
 		std::lock_guard<std::mutex> lock(slot.blockMutex);
 		if (!slot.active.load(std::memory_order_acquire)) return;
 
-		bool isDropOldest = (slot.config.dropPolicy == DropPolicy::DROP_OLDEST);
-
 		slot.active.store(false, std::memory_order_release);
 		this->activeCount.fetch_sub(1, std::memory_order_relaxed);
 
-		// Release refs for any queued buffers (only for BLOCK consumers)
+		// Release refs for any queued buffers
 		IOBuffer* buf;
 		while (slot.queue.try_dequeue(buf)) {
-			if (!isDropOldest) {
-				this->decrementRef(buf);
-			}
+			this->decrementRef(buf);
 		}
 	}
 	slot.blockCV.notify_all();
@@ -78,21 +74,10 @@ void OutputBufferManager::publish(IOBuffer* buffer) {
 		return;
 	}
 
-	// Count only BLOCK consumers for reference counting
-	// DROP_OLDEST consumers don't hold references - they access data opportunistically
-	int blockConsumers = 0;
-	for (auto& slot : this->slots) {
-		if (slot.active.load(std::memory_order_acquire) &&
-		    slot.config.dropPolicy == DropPolicy::BLOCK) {
-			blockConsumers++;
-		}
-	}
-
-	// Set reference count based on BLOCK consumers only
+	// Set reference count to number of active consumers (all consumers hold references)
 	int idx = buffer->getBackendIndex();
 	if (idx >= 0 && idx < static_cast<int>(MAX_OUTPUT_BUFFERS)) {
-		// If no BLOCK consumers, set to 1 and release after pushing
-		this->refCounts[idx].store(blockConsumers > 0 ? blockConsumers : 1, std::memory_order_release);
+		this->refCounts[idx].store(consumers, std::memory_order_release);
 	}
 
 	// Push to all active consumer queues
@@ -101,21 +86,15 @@ void OutputBufferManager::publish(IOBuffer* buffer) {
 			this->pushToSlot(slot, buffer);
 		}
 	}
-
-	// If no BLOCK consumers, release immediately after pushing to DROP_OLDEST
-	if (blockConsumers == 0) {
-		this->decrementRef(buffer);
-	}
 }
 
 void OutputBufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
 	// For DROP_OLDEST policy, drop old buffers if at capacity
-	// Note: DROP_OLDEST consumers don't hold references, so no decrementRef() calls
 	if (slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
 		while (slot.queue.size_approx() >= slot.config.maxQueueSize) {
 			IOBuffer* dropped;
 			if (slot.queue.try_dequeue(dropped)) {
-				// No decrementRef - DROP_OLDEST doesn't hold references
+				this->decrementRef(dropped);
 				slot.droppedCount.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				break;
@@ -123,7 +102,7 @@ void OutputBufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
 		}
 		// DROP_OLDEST: lock-free enqueue, notify without lock
 		if (!slot.queue.try_enqueue(buffer)) {
-			// No decrementRef - DROP_OLDEST doesn't hold references
+			this->decrementRef(buffer);
 			slot.droppedCount.fetch_add(1, std::memory_order_relaxed);
 		} else {
 			slot.blockCV.notify_one();
@@ -181,11 +160,6 @@ IOBuffer* OutputBufferManager::getNext(ConsumerId id) {
 void OutputBufferManager::release(ConsumerId id, IOBuffer* buffer) {
 	if (id < 0 || id >= MAX_CONSUMERS) return;
 
-	// DROP_OLDEST consumers don't hold references, so don't decrement
-	if (this->slots[id].config.dropPolicy == DropPolicy::DROP_OLDEST) {
-		return;
-	}
-
 	this->decrementRef(buffer);
 }
 
@@ -228,15 +202,12 @@ void OutputBufferManager::shutdown() {
 		slot.blockCV.notify_all();
 	}
 
-	// Release all queued buffers (only decrement refs for BLOCK consumers)
+	// Release all queued buffers
 	for (auto& slot : this->slots) {
 		if (slot.active.load(std::memory_order_acquire)) {
-			bool isDropOldest = (slot.config.dropPolicy == DropPolicy::DROP_OLDEST);
 			IOBuffer* buf;
 			while (slot.queue.try_dequeue(buf)) {
-				if (!isDropOldest) {
-					this->decrementRef(buf);
-				}
+				this->decrementRef(buf);
 			}
 		}
 	}
