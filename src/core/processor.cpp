@@ -301,6 +301,9 @@ public:
 		}
 		this->backend->initialize(this->config);
 
+		// Set buffer count from backend before setting callbacks
+		this->outputManager.setBufferCount(this->backend->getOutputBufferCount());
+
 		// Setup release callback for OutputBufferManager
 		this->outputManager.setReleaseCallback([this](IOBuffer* buf) {
 			this->backend->releaseOutputBuffer(buf);
@@ -505,6 +508,9 @@ void Processor::setBackend(Backend backend) {
 	// The new backend will load any recorded profiles from config during initialization
 	if (wasInitialized) {
 		this->impl->backend->initialize(this->impl->config);
+
+		// Set buffer count from backend before setting callbacks
+		this->impl->outputManager.setBufferCount(this->impl->backend->getOutputBufferCount());
 
 		// Setup release callback for OutputBufferManager
 		this->impl->outputManager.setReleaseCallback([this](IOBuffer* buf) {

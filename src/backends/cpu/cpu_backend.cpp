@@ -894,6 +894,10 @@ int CpuBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
 }
 
+int CpuBackend::getOutputBufferCount() const {
+	return 2;  // Fixed ping-pong buffers. todo: make configurable
+}
+
 void CpuBackend::releaseOutputBuffer(IOBuffer* buffer) {
 	(void)buffer;
 	{

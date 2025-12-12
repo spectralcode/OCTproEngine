@@ -113,25 +113,28 @@ struct CudaBackend::Impl {
 
 	// Output buffers for callback (rotating pool for ordered delivery)
 	std::vector<IOBuffer> outputBuffers;
-	std::atomic<int> currentOutputBuffer{0};
-	static constexpr int OUTPUT_BUFFER_MULTIPLIER = 2;  // outputBuffers.size() = numStreams * this
+	static constexpr int OUTPUT_BUFFER_MULTIPLIER = 8;  // outputBuffers.size() = numStreams * this
 
-	// Semaphore to limit in-flight output buffers (prevents buffer reuse before callback delivery)
-	std::mutex outputSemaphoreMutex;
-	std::condition_variable outputSemaphoreCV;
-	int availableOutputBuffers = 0;  // Initialized in initialize()
+	// Free output buffer queue (tracks which specific buffers are available)
+	std::queue<int> freeOutputBuffersQueue;
+	std::mutex freeOutputQueueMutex;
+	std::condition_variable freeOutputQueueCV;
 
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
 
-	// Pre-allocated callback data pool (NO heap allocations!)
-	struct CallbackData {
+	// Pre-allocated callback data pools (NO heap allocations!)
+	// Separate pools to prevent index collision between input return and output callbacks
+	struct InputCallbackData {
 		Impl* impl;
 		IOBuffer* inputBuffer;      // For return buffer callback
+	};
+	struct OutputCallbackData {
+		Impl* impl;
 		IOBuffer* outputBuffer;     // For output callback
 	};
-	std::vector<CallbackData> callbackDataPool;
-	std::atomic<int> nextCallbackIndex{0};
+	std::vector<InputCallbackData> inputCallbackDataPool;   // Sized to numInputBuffers (indexed by device buffer)
+	std::vector<OutputCallbackData> outputCallbackDataPool; // Sized to numOutputBuffers (indexed by outputBufIdx)
 	
 	Impl() = default;
 	
@@ -215,12 +218,19 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	// Calculate grid size
 	this->impl->gridSize = this->impl->samplesPerBuffer / this->impl->blockSize;
 	
-	// Pre-allocate callback data pool (NO heap allocations during processing!)
-	// Size matches output buffer pool for 1:1 correspondence
-	int poolSize = 2 * this->impl->numStreams * Impl::OUTPUT_BUFFER_MULTIPLIER;
-	this->impl->callbackDataPool.resize(poolSize);
-	for (auto& data : this->impl->callbackDataPool) {
+	// Pre-allocate callback data pools (NO heap allocations during processing!)
+	// Input pool: sized to numStreams (indexed by device buffer index currentBuffer)
+	this->impl->inputCallbackDataPool.resize(this->impl->numStreams);
+	for (auto& data : this->impl->inputCallbackDataPool) {
 		data.impl = this->impl.get();
+		data.inputBuffer = nullptr;
+	}
+	// Output pool: sized to numOutputBuffers (indexed by outputBufIdx from free queue)
+	int numOutputBuffers = this->impl->numStreams * Impl::OUTPUT_BUFFER_MULTIPLIER;
+	this->impl->outputCallbackDataPool.resize(numOutputBuffers);
+	for (auto& data : this->impl->outputCallbackDataPool) {
+		data.impl = this->impl.get();
+		data.outputBuffer = nullptr;
 	}
 	
 	// Create streams and events
@@ -271,10 +281,16 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	
 	// Allocate output buffers (rotating pool for ordered callback delivery)
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
-	int numOutputBuffers = this->impl->numStreams * Impl::OUTPUT_BUFFER_MULTIPLIER;
+	// numOutputBuffers already declared above for callback pool
 	this->impl->outputBuffers.resize(numOutputBuffers);
-	this->impl->currentOutputBuffer = 0;
-	this->impl->availableOutputBuffers = numOutputBuffers;  // All buffers available initially
+
+	// Clear and populate free output buffer queue
+	while (!this->impl->freeOutputBuffersQueue.empty()) {
+		this->impl->freeOutputBuffersQueue.pop();
+	}
+	for (int i = 0; i < numOutputBuffers; ++i) {
+		this->impl->freeOutputBuffersQueue.push(i);
+	}
 
 	for (int i = 0; i < numOutputBuffers; ++i) {
 		// Set allocation hint for output buffer (same as input buffers)
@@ -546,13 +562,17 @@ int CudaBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
 }
 
+int CudaBackend::getOutputBufferCount() const {
+	return static_cast<int>(this->impl->outputBuffers.size());
+}
+
 void CudaBackend::releaseOutputBuffer(IOBuffer* buffer) {
-	(void)buffer;
+	int idx = buffer->getBackendIndex();
 	{
-		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-		this->impl->availableOutputBuffers++;
+		std::lock_guard<std::mutex> lock(this->impl->freeOutputQueueMutex);
+		this->impl->freeOutputBuffersQueue.push(idx);
 	}
-	this->impl->outputSemaphoreCV.notify_one();
+	this->impl->freeOutputQueueCV.notify_one();
 }
 
 // ============================================
@@ -564,30 +584,36 @@ void CudaBackend::setOutputCallback(std::function<void(const IOBuffer&)> callbac
 }
 
 void CUDART_CB CudaBackend::returnBufferCallback(void* userData) {
-	Impl::CallbackData* data = static_cast<Impl::CallbackData*>(userData);
-	
+	Impl::InputCallbackData* data = static_cast<Impl::InputCallbackData*>(userData);
+
 	if (data && data->impl && data->inputBuffer) {
+		IOBuffer* buffer = data->inputBuffer;
+		data->inputBuffer = nullptr;  // Clear after use to prevent stale pointer access
+
 		// Return buffer to free queue
 		{
 			std::lock_guard<std::mutex> lock(data->impl->freeQueueMutex);
-			data->impl->freeBuffersQueue.push(data->inputBuffer);
+			data->impl->freeBuffersQueue.push(buffer);
 		}
 		data->impl->freeQueueCV.notify_one();  // Wake up waiting threads
 	}
-	
+
 	// NO delete! Memory is pre-allocated
 }
 
 void CUDART_CB CudaBackend::outputCallback(void* userData) {
-	Impl::CallbackData* data = static_cast<Impl::CallbackData*>(userData);
+	Impl::OutputCallbackData* data = static_cast<Impl::OutputCallbackData*>(userData);
 
 	if (data && data->impl && data->outputBuffer) {
-		uint64_t bufferId = data->outputBuffer->getBufferId();
+		IOBuffer* buffer = data->outputBuffer;
+		data->outputBuffer = nullptr;  // Clear after use to prevent stale pointer access
+
+		uint64_t bufferId = buffer->getBufferId();
 
 		// Queue the callback for ordered delivery (non-blocking)
 		{
 			std::lock_guard<std::mutex> lock(data->impl->callbackQueueMutex);
-			data->impl->pendingCallbacks[bufferId] = data->outputBuffer;
+			data->impl->pendingCallbacks[bufferId] = buffer;
 		}
 		data->impl->callbackQueueCV.notify_one();
 	}
@@ -628,18 +654,16 @@ void CudaBackend::process(IOBuffer& input) {
 	this->impl->currentBuffer = (this->impl->currentBuffer + 1) % static_cast<int>(this->impl->d_inputBuffers.size());
 #endif
 
-	// Wait for an output buffer to be available (prevents buffer reuse before callback delivery)
+	// Wait for a free output buffer and get its index (prevents buffer reuse before callback delivery)
+	int outputBufIdx;
 	{
-		std::unique_lock<std::mutex> lock(this->impl->outputSemaphoreMutex);
-		this->impl->outputSemaphoreCV.wait(lock, [this]() {
-			return this->impl->availableOutputBuffers > 0;
+		std::unique_lock<std::mutex> lock(this->impl->freeOutputQueueMutex);
+		this->impl->freeOutputQueueCV.wait(lock, [this]() {
+			return !this->impl->freeOutputBuffersQueue.empty();
 		});
-		this->impl->availableOutputBuffers--;
+		outputBufIdx = this->impl->freeOutputBuffersQueue.front();
+		this->impl->freeOutputBuffersQueue.pop();
 	}
-
-	// Select output buffer from rotating pool
-	int outputBufIdx = this->impl->currentOutputBuffer.fetch_add(1, std::memory_order_relaxed)
-	                   % static_cast<int>(this->impl->outputBuffers.size());
 	IOBuffer* currentOutputBuf = &this->impl->outputBuffers[outputBufIdx];
 
 	// Get buffer ID from input to propagate to output later in the pipeline
@@ -669,9 +693,8 @@ void CudaBackend::process(IOBuffer& input) {
 		));
 
 		// Get pre-allocated callback data for returning buffer after memcpy
-		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
-		          static_cast<int>(this->impl->callbackDataPool.size());
-		Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
+		// Use currentBuffer as index (1:1 with device input buffers, safe because buffer is locked until callback fires)
+		Impl::InputCallbackData* returnData = &this->impl->inputCallbackDataPool[this->impl->currentBuffer];
 		returnData->inputBuffer = &input;
 
 		// Register callback to return buffer after memcpy completes
@@ -689,9 +712,8 @@ void CudaBackend::process(IOBuffer& input) {
 	));
 
 	// Get pre-allocated callback data for returning buffer after memcpy
-	int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
-	          static_cast<int>(this->impl->callbackDataPool.size());
-	Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
+	// Use currentBuffer as index (1:1 with device input buffers, safe because buffer is locked until callback fires)
+	Impl::InputCallbackData* returnData = &this->impl->inputCallbackDataPool[this->impl->currentBuffer];
 	returnData->inputBuffer = &input;
 
 	// Register callback to return buffer after memcpy completes
@@ -996,10 +1018,9 @@ void CudaBackend::process(IOBuffer& input) {
 	));
 
 	// Step 11: Register callback with ordering (waits for its turn before invoking user callback)
+	// Use outputBufIdx as index (1:1 with output buffers, safe because buffer is from free queue and not reused until released)
 	if (this->impl->callback) {
-		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
-		          static_cast<int>(this->impl->callbackDataPool.size());
-		Impl::CallbackData* callbackData = &this->impl->callbackDataPool[idx];
+		Impl::OutputCallbackData* callbackData = &this->impl->outputCallbackDataPool[outputBufIdx];
 		callbackData->outputBuffer = currentOutputBuf;
 		checkCudaErrors(cudaLaunchHostFunc(stream, outputCallback, callbackData));
 	}

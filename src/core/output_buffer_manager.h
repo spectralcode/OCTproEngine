@@ -2,6 +2,7 @@
 #define OPE_OUTPUT_BUFFER_MANAGER_H
 
 #include <array>
+#include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -12,11 +13,6 @@
 namespace ope {
 
 constexpr int MAX_CONSUMERS = 32;
-constexpr size_t DEFAULT_QUEUE_SIZE = 64;
-// Must be >= backend output buffer count (CUDA: numStreams * 4, Vulkan/OpenCL: numCommandBuffers)
-// Used for refCounts array. Buffers with backendIndex >= this value won't be refcounted.
-// todo: somehow couple this with backend buffer count dynamically
-constexpr size_t MAX_OUTPUT_BUFFERS = 16;
 
 using ReleaseCallback = std::function<void(IOBuffer*)>;
 
@@ -27,9 +23,8 @@ using ReleaseCallback = std::function<void(IOBuffer*)>;
  *
  * Drop Policies:
  * - BLOCK: Holds buffer references. Safe but slow consumers block producer.
- * - DROP_OLDEST: No references held. Never blocks, but buffer may be
- *   overwritten while consumer reads (data race). 
- *   Use for non-critical things like live visualization.
+ * - DROP_OLDEST: Holds buffer references but drops oldest when queue full.
+ *   Never blocks processing, dropped buffers are released and can be reused by backend.
  */
 class OutputBufferManager {
 public:
@@ -38,6 +33,13 @@ public:
 
 	OutputBufferManager(const OutputBufferManager&) = delete;
 	OutputBufferManager& operator=(const OutputBufferManager&) = delete;
+
+	/**
+	 * @brief Set the number of output buffers from backend
+	 * @note Internal - called by Processor during initialization
+	 * Must be called before any buffers are published
+	 */
+	void setBufferCount(size_t count);
 
 	/**
 	 * @brief Set callback to return buffers to backend pool
@@ -110,6 +112,7 @@ private:
 		ConsumerConfig config;
 		std::atomic<bool> active{false};
 		std::atomic<uint64_t> droppedCount{0};
+		std::atomic<size_t> queueDepth{0}; //used to enforce maxQueueSize per consumer
 
 		ConsumerSlot();
 	};
@@ -117,7 +120,8 @@ private:
 	std::array<ConsumerSlot, MAX_CONSUMERS> slots;
 	std::atomic<int> activeCount{0};
 
-	std::array<std::atomic<int>, MAX_OUTPUT_BUFFERS> refCounts;
+	std::vector<std::atomic<int>> refCounts; //tracks how many consumers still hold a reference to a specific buffer.
+	size_t bufferCount = 0;
 
 	ReleaseCallback releaseCallback;
 	std::atomic<bool> running{true};

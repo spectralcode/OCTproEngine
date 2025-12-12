@@ -1902,6 +1902,10 @@ int VulkanBackend::getNumInputBuffers() const {
 	return this->impl->numCommandBuffers;
 }
 
+int VulkanBackend::getOutputBufferCount() const {
+	return static_cast<int>(this->impl->outputBuffers.size());
+}
+
 void VulkanBackend::releaseOutputBuffer(IOBuffer* buffer) {
 	if (!buffer) return;
 

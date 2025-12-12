@@ -1552,6 +1552,10 @@ int OpenClBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
 }
 
+int OpenClBackend::getOutputBufferCount() const {
+	return static_cast<int>(this->impl->hostOutputBuffers.size());
+}
+
 void OpenClBackend::releaseOutputBuffer(IOBuffer* buffer) {
 	(void)buffer;
 	{
