@@ -134,6 +134,9 @@ struct OpenClBackend::Impl {
 	std::mutex freeQueueMutex;
 	std::condition_variable freeQueueCV;
 
+	// Output buffer management
+	int numOutputBuffers = 0;  // 0 = auto (numCommandQueues * 2)
+
 	//	Device buffers
 	std::vector<cl_mem> d_inputBuffers;
 
@@ -225,6 +228,16 @@ void OpenClBackend::setNumInputBuffers(int count) {
 		throw std::invalid_argument("Number of input buffers must be at least 1");
 	}
 	this->impl->numInputBuffers = count;
+}
+
+void OpenClBackend::setNumOutputBuffers(int count) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change number of output buffers after initialization");
+	}
+	if (count < 0) {
+		throw std::invalid_argument("Number of output buffers must be >= 0 (0 = auto)");
+	}
+	this->impl->numOutputBuffers = count;
 }
 
 void OpenClBackend::setNumCommandQueues(int numQueues) {

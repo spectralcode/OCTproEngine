@@ -100,6 +100,7 @@ public:
 					const auto* cudaConfig = static_cast<const CudaConfig*>(this->backendConfig.get());
 					cudaBackend->setDeviceId(cudaConfig->deviceId);
 					cudaBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of cudaConfig
+					cudaBackend->setNumOutputBuffers(cudaConfig->numOutputBuffers);
 					cudaBackend->setEnableZeroCopy(cudaConfig->enableZeroCopy);
 
 					this->backend = std::move(cudaBackend);
@@ -145,6 +146,7 @@ public:
 					openclBackend->setPreferGpu(openclConfig->preferGpu);
 					openclBackend->setDeviceId(openclConfig->deviceId);
 					openclBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of openclConfig
+					openclBackend->setNumOutputBuffers(openclConfig->numOutputBuffers);
 
 					this->backend = std::move(openclBackend);
 				}
@@ -165,6 +167,7 @@ public:
 					const auto* vulkanConfig = static_cast<const VulkanConfig*>(this->backendConfig.get());
 					vulkanBackend->setDeviceId(vulkanConfig->deviceId);
 					vulkanBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of vulkanConfig
+					vulkanBackend->setNumOutputBuffers(vulkanConfig->numOutputBuffers);
 
 					this->backend = std::move(vulkanBackend);
 				}

@@ -199,6 +199,7 @@ public:
 	// ============================================
 
 	void setNumInputBuffers(int count);  // Must be called before initialize()  //todo: remove and only use setNumCommandQueues
+	void setNumOutputBuffers(int count);  // Must be called before initialize() (0 = auto)
 	void setNumCommandQueues(int numQueues);
 	void setWorkGroupSize(int workGroupSize);
 	void setPlatformId(int platformId);

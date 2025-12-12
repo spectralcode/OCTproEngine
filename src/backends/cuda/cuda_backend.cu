@@ -79,6 +79,9 @@ struct CudaBackend::Impl {
 	std::queue<IOBuffer*> freeBuffersQueue;
 	std::mutex freeQueueMutex;
 	std::condition_variable freeQueueCV;
+
+	// Output buffer management
+	int numOutputBuffers = 0;  // 0 = auto (numStreams * 2)
 	
 	// Device buffers (one per stream for overlapping)
 	std::vector<void*> d_inputBuffers;
@@ -113,7 +116,6 @@ struct CudaBackend::Impl {
 
 	// Output buffers for callback (rotating pool for ordered delivery)
 	std::vector<IOBuffer> outputBuffers;
-	static constexpr int OUTPUT_BUFFER_MULTIPLIER = 8;  // outputBuffers.size() = numStreams * this
 
 	// Free output buffer queue (tracks which specific buffers are available)
 	std::queue<int> freeOutputBuffersQueue;
@@ -168,6 +170,16 @@ void CudaBackend::setNumInputBuffers(int count) {
 		throw std::invalid_argument("Number of input buffers must be at least 1");
 	}
 	this->impl->numInputBuffers = count;
+}
+
+void CudaBackend::setNumOutputBuffers(int count) {
+	if (this->impl->cudaInitialized) {
+		throw std::runtime_error("Cannot change number of output buffers after initialization");
+	}
+	if (count < 0) {
+		throw std::invalid_argument("Number of output buffers must be >= 0 (0 = auto)");
+	}
+	this->impl->numOutputBuffers = count;
 }
 
 void CudaBackend::setNumStreams(int numStreams) {
@@ -226,7 +238,9 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 		data.inputBuffer = nullptr;
 	}
 	// Output pool: sized to numOutputBuffers (indexed by outputBufIdx from free queue)
-	int numOutputBuffers = this->impl->numStreams * Impl::OUTPUT_BUFFER_MULTIPLIER;
+	int numOutputBuffers = (this->impl->numOutputBuffers > 0)
+		? this->impl->numOutputBuffers
+		: (this->impl->numStreams * 2);
 	this->impl->outputCallbackDataPool.resize(numOutputBuffers);
 	for (auto& data : this->impl->outputCallbackDataPool) {
 		data.impl = this->impl.get();

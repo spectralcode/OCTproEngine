@@ -155,6 +155,9 @@ struct VulkanBackend::Impl {
 	std::mutex freeQueueMutex;
 	std::condition_variable freeQueueCV;
 
+	// Output buffer management
+	int numOutputBuffers = 0;  // 0 = auto (numCommandBuffers * 2)
+
 	// Staging buffers (host-visible, one per command buffer)
 	std::vector<VkBuffer> stagingInputBuffers;
 	std::vector<VkDeviceMemory> stagingInputMemory;
@@ -1016,6 +1019,16 @@ void VulkanBackend::setNumInputBuffers(int count) {
 		throw std::invalid_argument("Number of input buffers must be at least 1");
 	}
 	this->impl->numInputBuffers = count;
+}
+
+void VulkanBackend::setNumOutputBuffers(int count) {
+	if (this->impl->vulkanInitialized) {
+		throw std::runtime_error("Cannot change number of output buffers after initialization");
+	}
+	if (count < 0) {
+		throw std::invalid_argument("Number of output buffers must be >= 0 (0 = auto)");
+	}
+	this->impl->numOutputBuffers = count;
 }
 
 void VulkanBackend::setNumCommandBuffers(int count) {

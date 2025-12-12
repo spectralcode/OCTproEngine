@@ -195,6 +195,7 @@ public:
 	// ============================================
 	
 	void setNumInputBuffers(int count);  // Must be called before initialize()
+	void setNumOutputBuffers(int count);  // Must be called before initialize() (0 = auto)
 	void setNumStreams(int numStreams);
 	void setBlockSize(int blockSize);
 	void setDeviceId(int deviceId);
