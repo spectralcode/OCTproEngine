@@ -339,6 +339,7 @@ struct VulkanBackend::Impl {
 	// Shutdown synchronization (prevents race conditions during cleanup)
 	std::atomic<bool> shuttingDown{false};      // Prevents new work submission during shutdown
 	std::atomic<int> pendingWorkCount{0};       // Tracks in-flight work for graceful draining
+	std::mutex submitMutex;                     // Protects ALL Vulkan handle access and lifetime (critical for shutdown safety)
 
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
@@ -1573,101 +1574,155 @@ void VulkanBackend::cleanup() {
 		return;
 	}
 
-	// PHASE 1: Signal shutdown and drain in-flight work
+	// Signal shutdown and wake ALL blocked threads (Fix 1.3)
 	std::cerr << "[CLEANUP] Setting shuttingDown flag, pendingWorkCount=" << this->impl->pendingWorkCount.load() << std::endl;
 	std::cerr.flush();
 	this->impl->shuttingDown.store(true, std::memory_order_release);
+	this->impl->freeQueueCV.notify_all();      // Wake threads in getNextAvailableInputBuffer()
+	this->impl->pendingWorkCV.notify_all();    // Wake completion thread
 
-	// Wait for in-flight work to complete (completion thread will exit semaphore waits)
-	auto startTime = std::chrono::steady_clock::now();
-	while (this->impl->pendingWorkCount.load(std::memory_order_acquire) > 0) {
-		if (std::chrono::steady_clock::now() - startTime > std::chrono::seconds(10)) {
-			std::cerr << "WARNING: Cleanup timeout, remaining work: "
-			          << this->impl->pendingWorkCount.load() << std::endl;
-			break;
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
-	}
-
-	// PHASE 2: Stop completion thread (work is drained, safe to join)
+	// PHASE 2: STOP COMPLETION THREAD FIRST
+	// The completion thread calls vkWaitSemaphores(), which is a Vulkan call.
+	// If we destroy Vulkan objects while the thread is inside vkWaitSemaphores, it's UB.
+	// We MUST ensure the thread exits BEFORE destroying any Vulkan objects.
+	std::cerr << "[CLEANUP] Stopping completion thread..." << std::endl;
+	std::cerr.flush();
 	if (this->impl->completionThread.joinable()) {
 		this->impl->completionThreadRunning = false;
-		this->impl->pendingWorkCV.notify_all();
+		this->impl->pendingWorkCV.notify_all();  // Ensure thread wakes up
 		this->impl->completionThread.join();
 	}
 
-	// PHASE 3: Wait for GPU idle, then cleanup resources
-	vkDeviceWaitIdle(this->impl->device);
+	// Lock submitMutex, wait for GPU, drain work, destroy resources
+	std::cerr << "[CLEANUP] Acquiring submitMutex and waiting for GPU..." << std::endl;
+	std::cerr.flush();
+	{
+		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Destroy VkFFT
-	deleteVkFFT(&this->impl->fftApp);
+		// Wait for GPU to finish all submitted work
+		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
+		if (waitResult != VK_SUCCESS) {
+			std::cerr << "[CLEANUP] vkDeviceWaitIdle failed with error " << waitResult;
+			if (waitResult == VK_ERROR_DEVICE_LOST) {
+				std::cerr << " (VK_ERROR_DEVICE_LOST - GPU crashed)";
+			}
+			std::cerr << " - continuing with cleanup..." << std::endl;
+			std::cerr.flush();
+			// Continue with cleanup anyway. must still clean up CPU resources
+		}
 
-	// Note: Do NOT call glslang_finalize_process() here
-	// glslang is process-wide and should persist for the application lifetime
-	// It will be finalized when the process exits
+		// Drain pending work queue
+		// After vkDeviceWaitIdle(), GPU work is complete. We can now safely:
+		// 1. Return input buffers to free queue (no longer needed by GPU)
+		// 2. Cancel work deterministically (completion thread already stopped)
+		std::cerr << "[CLEANUP] Draining pending work queue..." << std::endl;
+		std::cerr.flush();
+		{
+			std::lock_guard<std::mutex> workLock(this->impl->pendingWorkMutex);
+			while (!this->impl->pendingWorkQueue.empty()) {
+				VulkanBackend::Impl::PendingWork work = this->impl->pendingWorkQueue.front();
+				this->impl->pendingWorkQueue.pop();
 
-	// Destroy pipelines and shaders
-	this->destroyComputePipelines();
+				// Return input buffer to free queue (cancel work)
+				// Note: Don't fire callback during shutdown. output may be incomplete/invalid
+				if (work.inputBuffer) {
+					std::lock_guard<std::mutex> freeLock(this->impl->freeQueueMutex);
+					this->impl->freeBuffersQueue.push(work.inputBuffer);
+					this->impl->freeQueueCV.notify_one();
+				}
 
-	// Free command buffers and destroy fences
-	this->destroyCommandBuffersAndFences();
+				// Decrement pending work counter
+				this->impl->pendingWorkCount.fetch_sub(1, std::memory_order_release);
+			}
+		}
 
-	// Release buffers
-	this->releaseDeviceBuffers();
+		// Optional diagnostic: Check pendingWorkCount drained
+		if (this->impl->pendingWorkCount.load(std::memory_order_acquire) != 0) {
+			std::cerr << "WARNING: Cleanup completed with pendingWorkCount = "
+			          << this->impl->pendingWorkCount.load() << std::endl;
+			std::cerr.flush();
+		}
 
-	// Release host buffers
-	for (auto& buffer : this->impl->hostInputBuffers) {
-		buffer.releaseMemory();
-	}
-	this->impl->hostInputBuffers.clear();
+		// Destroy resources while still holding submitMutex
+		// This prevents any thread from entering process() and touching Vulkan handles during destruction
+		std::cerr << "[CLEANUP] Destroying Vulkan resources..." << std::endl;
+		std::cerr.flush();
 
-	for (auto& buffer : this->impl->outputBuffers) {
-		buffer.releaseMemory();
-	}
-	this->impl->outputBuffers.clear();
+		// Destroy VkFFT
+		deleteVkFFT(&this->impl->fftApp);
 
-	// Clear queue
-	while (!this->impl->freeBuffersQueue.empty()) {
-		this->impl->freeBuffersQueue.pop();
-	}
+		// Note: Do NOT call glslang_finalize_process() here
+		// glslang is process-wide and should persist for the application lifetime
+		// It will be finalized when the process exits
 
-	// Destroy compute command pool
-	if (this->impl->commandPool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(this->impl->device, this->impl->commandPool, nullptr);
-		this->impl->commandPool = VK_NULL_HANDLE;
-	}
+		// Destroy pipelines and shaders
+		this->destroyComputePipelines();
 
-	// Destroy transfer command pool
-	if (this->impl->transferCommandPool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(this->impl->device, this->impl->transferCommandPool, nullptr);
-		this->impl->transferCommandPool = VK_NULL_HANDLE;
-	}
+		// Free command buffers and destroy fences
+		this->destroyCommandBuffersAndFences();
 
-	// Destroy D2H transfer command pool
-	if (this->impl->d2hTransferCommandPool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(this->impl->device, this->impl->d2hTransferCommandPool, nullptr);
-		this->impl->d2hTransferCommandPool = VK_NULL_HANDLE;
-	}
+		// Release buffers
+		this->releaseDeviceBuffers();
 
-	// Destroy device
-	if (this->impl->device != VK_NULL_HANDLE) {
-		vkDestroyDevice(this->impl->device, nullptr);
-		this->impl->device = VK_NULL_HANDLE;
-	}
+		// Release host buffers
+		for (auto& buffer : this->impl->hostInputBuffers) {
+			buffer.releaseMemory();
+		}
+		this->impl->hostInputBuffers.clear();
 
-	// Destroy debug messenger
-	if (this->impl->debugMessenger != VK_NULL_HANDLE) {
-		DestroyDebugUtilsMessengerEXT(this->impl->instance, this->impl->debugMessenger, nullptr);
-		this->impl->debugMessenger = VK_NULL_HANDLE;
-	}
+		for (auto& buffer : this->impl->outputBuffers) {
+			buffer.releaseMemory();
+		}
+		this->impl->outputBuffers.clear();
 
-	// Destroy instance
-	if (this->impl->instance != VK_NULL_HANDLE) {
-		vkDestroyInstance(this->impl->instance, nullptr);
-		this->impl->instance = VK_NULL_HANDLE;
-	}
+		// Clear queue
+		while (!this->impl->freeBuffersQueue.empty()) {
+			this->impl->freeBuffersQueue.pop();
+		}
 
-	this->impl->vulkanInitialized = false;
+		// Destroy compute command pool
+		if (this->impl->commandPool != VK_NULL_HANDLE) {
+			vkDestroyCommandPool(this->impl->device, this->impl->commandPool, nullptr);
+			this->impl->commandPool = VK_NULL_HANDLE;
+		}
+
+		// Destroy transfer command pool
+		if (this->impl->transferCommandPool != VK_NULL_HANDLE) {
+			vkDestroyCommandPool(this->impl->device, this->impl->transferCommandPool, nullptr);
+			this->impl->transferCommandPool = VK_NULL_HANDLE;
+		}
+
+		// Destroy D2H transfer command pool
+		if (this->impl->d2hTransferCommandPool != VK_NULL_HANDLE) {
+			vkDestroyCommandPool(this->impl->device, this->impl->d2hTransferCommandPool, nullptr);
+			this->impl->d2hTransferCommandPool = VK_NULL_HANDLE;
+		}
+
+		// Destroy device
+		if (this->impl->device != VK_NULL_HANDLE) {
+			vkDestroyDevice(this->impl->device, nullptr);
+			this->impl->device = VK_NULL_HANDLE;
+		}
+
+		// Destroy debug messenger
+		if (this->impl->debugMessenger != VK_NULL_HANDLE) {
+			DestroyDebugUtilsMessengerEXT(this->impl->instance, this->impl->debugMessenger, nullptr);
+			this->impl->debugMessenger = VK_NULL_HANDLE;
+		}
+
+		// Destroy instance
+		if (this->impl->instance != VK_NULL_HANDLE) {
+			vkDestroyInstance(this->impl->instance, nullptr);
+			this->impl->instance = VK_NULL_HANDLE;
+		}
+
+		// Set vulkanInitialized to false while still holding lock (part of lifetime domain - Round 5)
+		this->impl->vulkanInitialized = false;
+
+	}  // submitMutex released here - all resources destroyed
+
+	std::cerr << "[CLEANUP] Cleanup complete." << std::endl;
+	std::cerr.flush();
 }
 
 // ============================================
@@ -1683,10 +1738,30 @@ void VulkanBackend::process(IOBuffer& input) {
 		throw std::runtime_error("Backend not initialized");
 	}
 
+	// Early check (before acquiring expensive lock)
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		throw std::runtime_error("Backend is shutting down");
+	}
+
+	// ============================================
+	// CRITICAL: Acquire submitMutex BEFORE accessing ANY Vulkan handles
+	// This lock protects ALL Vulkan handle usage, not just submissions
+	// ============================================
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// CRITICAL: Re-check shuttingDown AND vulkanInitialized AFTER lock (prevents TOCTOU race)
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		throw std::runtime_error("Backend is shutting down");
+	}
+	if (!this->impl->vulkanInitialized) {
+		throw std::runtime_error("Backend was cleaned up during lock acquisition");
+	}
+
+	// Now safe to access Vulkan handles - cleanup() holds submitMutex during destruction
+
 	// Get the backend index that was set during buffer initialization
 	// Each input buffer has a fixed relationship to a command buffer
-	int idx = input.getBackendIndex(); 
-
+	int idx = input.getBackendIndex();
 
 	VkCommandBuffer cmd = this->impl->commandBuffers[idx];
 	VkFence fence = this->impl->fences[idx];
@@ -1701,8 +1776,9 @@ void VulkanBackend::process(IOBuffer& input) {
 	IOBuffer* outputBuf = &this->impl->outputBuffers[idx];
 
 	// Record all command buffers if needed (first call, after config change, or after bg capture)
-	if (!this->impl->commandBuffersValid ||
-	    this->impl->needRerecordAfterBgCapture.exchange(false, std::memory_order_acq_rel)) {
+	// Re-recording and submission are both protected by submitMutex
+	bool needRerecord = this->impl->needRerecordAfterBgCapture.exchange(false, std::memory_order_acq_rel);
+	if (!this->impl->commandBuffersValid || needRerecord) {
 		this->impl->recordAllCommandBuffers();
 		cmd = this->impl->commandBuffers[idx];  // Restore cmd to current frame buffer
 	}
@@ -2039,9 +2115,14 @@ IOBuffer& VulkanBackend::getNextAvailableInputBuffer() {
 	{
 		std::unique_lock<std::mutex> lock(this->impl->freeQueueMutex);
 
-		// Block until a buffer is available
-		while (this->impl->freeBuffersQueue.empty()) {
-			this->impl->freeQueueCV.wait(lock);
+		// Block until a buffer is available OR shutdown is signaled
+		this->impl->freeQueueCV.wait(lock, [this] {
+			return !this->impl->freeBuffersQueue.empty() || this->impl->shuttingDown.load(std::memory_order_acquire);
+		});
+
+		// After waking, check if we woke due to shutdown
+		if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+			throw std::runtime_error("Backend is shutting down");
 		}
 
 		buffer = this->impl->freeBuffersQueue.front();
