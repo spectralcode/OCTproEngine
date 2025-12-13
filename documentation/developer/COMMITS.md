@@ -20,3 +20,4 @@ Use present tense in commit messages to describe what the commit does to the cod
 - **test:** add or update tests
 - **chore:** maintenance, tooling, other
 - **perf:** performance improvements 
+- **debug:** (temporary) debugging code
