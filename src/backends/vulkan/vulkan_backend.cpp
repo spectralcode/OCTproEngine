@@ -27,6 +27,9 @@
 		if (err != VK_SUCCESS) { \
 			std::stringstream ss; \
 			ss << "Vulkan error at " << __FILE__ << ":" << __LINE__ << " - code: " << err; \
+			if (err == VK_ERROR_DEVICE_LOST) { \
+				std::cerr << "!!! GPU DEVICE LOST (VK_ERROR_DEVICE_LOST) - likely shader OOB/invalid memory access !!!" << std::endl; \
+			} \
 			throw std::runtime_error(ss.str()); \
 		} \
 	} while(0)
@@ -51,6 +54,49 @@ namespace ope {
 // glslang is process-wide, not per-instance
 static bool s_glslangInitialized = false;
 static std::mutex s_glslangMutex;
+
+// ============================================
+// Compute Shader Configuration
+// ============================================
+
+// ============================================
+// Debug Callback for Validation
+// ============================================
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+	VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+	VkDebugUtilsMessageTypeFlagsEXT messageType,
+	const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+	void* pUserData
+) {
+	(void)messageSeverity;
+	(void)messageType;
+	(void)pUserData;
+
+	std::cerr << "[Vulkan Validation] " << pCallbackData->pMessage << std::endl;
+	std::cerr.flush();
+	return VK_FALSE;
+}
+
+static VkResult CreateDebugUtilsMessengerEXT(
+	VkInstance instance,
+	const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
+	const VkAllocationCallbacks* pAllocator,
+	VkDebugUtilsMessengerEXT* pMessenger
+) {
+	auto fn = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+	if (!fn) return VK_ERROR_EXTENSION_NOT_PRESENT;
+	return fn(instance, pCreateInfo, pAllocator, pMessenger);
+}
+
+static void DestroyDebugUtilsMessengerEXT(
+	VkInstance instance,
+	VkDebugUtilsMessengerEXT messenger,
+	const VkAllocationCallbacks* pAllocator
+) {
+	auto fn = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+	if (fn) fn(instance, messenger, pAllocator);
+}
 
 // ============================================
 // Compute Shader Configuration
@@ -115,6 +161,7 @@ struct VulkanBackend::Impl {
 
 	// Vulkan core objects
 	VkInstance instance = VK_NULL_HANDLE;
+	VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 	VkQueue computeQueue = VK_NULL_HANDLE;
@@ -342,6 +389,9 @@ struct VulkanBackend::Impl {
 			// Wait for GPU work to complete (must complete even during shutdown to avoid destroying resources in use!)
 			VkResult result = vkWaitSemaphores(this->device, &waitInfo, UINT64_MAX);
 			if (result != VK_SUCCESS) {
+				if (result == VK_ERROR_DEVICE_LOST) {
+					std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkWaitSemaphores - GPU crashed (likely shader OOB) !!!" << std::endl;
+				}
 				std::cerr << "Vulkan timeline semaphore wait failed: " << result << std::endl;
 				this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
 				continue;
@@ -1119,7 +1169,63 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 	instanceCreateInfo.pApplicationInfo = &appInfo;
 
-	checkVulkanErrors(vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance));
+	// Enable validation layers and debug utils extension
+	const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
+	const char* instanceExtensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+
+	instanceCreateInfo.enabledLayerCount = 1;
+	instanceCreateInfo.ppEnabledLayerNames = validationLayers;
+	instanceCreateInfo.enabledExtensionCount = 1;
+	instanceCreateInfo.ppEnabledExtensionNames = instanceExtensions;
+
+	// Setup debug messenger (will catch messages during vkCreateInstance too)
+	VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
+	debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+	debugCreateInfo.messageSeverity =
+		VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+		VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+	debugCreateInfo.messageType =
+		VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+		VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+		VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+	debugCreateInfo.pfnUserCallback = debugCallback;
+
+	// Enable synchronization validation (critical for catching semaphore/queue bugs!)
+	VkValidationFeaturesEXT validationFeatures{};
+	validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+	VkValidationFeatureEnableEXT enables[] = {
+		VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT
+	};
+	validationFeatures.enabledValidationFeatureCount = 2;
+	validationFeatures.pEnabledValidationFeatures = enables;
+
+	// Chain pNext so we catch messages during vkCreateInstance
+	validationFeatures.pNext = &debugCreateInfo;
+	instanceCreateInfo.pNext = &validationFeatures;
+
+	VkResult instanceResult = vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance);
+	if (instanceResult == VK_ERROR_LAYER_NOT_PRESENT || instanceResult == VK_ERROR_EXTENSION_NOT_PRESENT) {
+		std::cerr << "WARNING: Vulkan validation layers/extensions not available - running without validation" << std::endl;
+		std::cerr.flush();
+		// Retry without validation
+		instanceCreateInfo.enabledLayerCount = 0;
+		instanceCreateInfo.ppEnabledLayerNames = nullptr;
+		instanceCreateInfo.enabledExtensionCount = 0;
+		instanceCreateInfo.ppEnabledExtensionNames = nullptr;
+		instanceCreateInfo.pNext = nullptr;
+		checkVulkanErrors(vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance));
+	} else {
+		checkVulkanErrors(instanceResult);
+		// Create debug messenger
+		VkResult messengerResult = CreateDebugUtilsMessengerEXT(this->impl->instance, &debugCreateInfo, nullptr, &this->impl->debugMessenger);
+		if (messengerResult == VK_SUCCESS) {
+			std::cerr << "Vulkan validation layers + sync validation enabled" << std::endl;
+		} else {
+			std::cerr << "Vulkan validation layers enabled (but messenger creation failed)" << std::endl;
+		}
+		std::cerr.flush();
+	}
 
 	// Select physical device
 	uint32_t deviceCount = 0;
@@ -1461,11 +1567,15 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 }
 
 void VulkanBackend::cleanup() {
+	std::cerr << "[CLEANUP] Starting cleanup..." << std::endl;
+	std::cerr.flush();
 	if (!this->impl->vulkanInitialized) {
 		return;
 	}
 
 	// PHASE 1: Signal shutdown and drain in-flight work
+	std::cerr << "[CLEANUP] Setting shuttingDown flag, pendingWorkCount=" << this->impl->pendingWorkCount.load() << std::endl;
+	std::cerr.flush();
 	this->impl->shuttingDown.store(true, std::memory_order_release);
 
 	// Wait for in-flight work to complete (completion thread will exit semaphore waits)
@@ -1543,6 +1653,12 @@ void VulkanBackend::cleanup() {
 	if (this->impl->device != VK_NULL_HANDLE) {
 		vkDestroyDevice(this->impl->device, nullptr);
 		this->impl->device = VK_NULL_HANDLE;
+	}
+
+	// Destroy debug messenger
+	if (this->impl->debugMessenger != VK_NULL_HANDLE) {
+		DestroyDebugUtilsMessengerEXT(this->impl->instance, this->impl->debugMessenger, nullptr);
+		this->impl->debugMessenger = VK_NULL_HANDLE;
 	}
 
 	// Destroy instance
@@ -1662,7 +1778,11 @@ void VulkanBackend::process(IOBuffer& input) {
 	// Increment pending work counter BEFORE submission (critical for shutdown draining)
 	this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 
-	checkVulkanErrors(vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence));
+	VkResult submitResult = vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence);
+	if (submitResult == VK_ERROR_DEVICE_LOST) {
+		std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkQueueSubmit - GPU crashed (likely shader OOB) !!!" << std::endl;
+	}
+	checkVulkanErrors(submitResult);
 
 	this->impl->nextOutputSignalValue++;
 
