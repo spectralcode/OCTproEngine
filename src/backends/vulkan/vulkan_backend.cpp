@@ -289,6 +289,10 @@ struct VulkanBackend::Impl {
 	std::thread completionThread;
 	std::atomic<bool> completionThreadRunning{false};
 
+	// Shutdown synchronization (prevents race conditions during cleanup)
+	std::atomic<bool> shuttingDown{false};      // Prevents new work submission during shutdown
+	std::atomic<int> pendingWorkCount{0};       // Tracks in-flight work for graceful draining
+
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
 
@@ -335,9 +339,11 @@ struct VulkanBackend::Impl {
 			waitInfo.pSemaphores = &this->outputOrderingSemaphore;
 			waitInfo.pValues = &work.timelineValue;
 
+			// Wait for GPU work to complete (must complete even during shutdown to avoid destroying resources in use!)
 			VkResult result = vkWaitSemaphores(this->device, &waitInfo, UINT64_MAX);
 			if (result != VK_SUCCESS) {
-				std::cerr << "Vulkan timeline semaphore wait failed in completion thread: " << result << std::endl;
+				std::cerr << "Vulkan timeline semaphore wait failed: " << result << std::endl;
+				this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
 				continue;
 			}
 
@@ -359,6 +365,12 @@ struct VulkanBackend::Impl {
 				this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
 			}
 
+			// Store input buffer for deferred release BEFORE callback to avoid race condition
+			// OutputBufferManager will call releaseOutputBuffer() when all consumers are done
+			// NOTE: Do NOT return input buffer here - it would allow the CB slot to be reused
+			// while consumers still hold references to the output buffer
+			this->pendingInputBufferRelease[work.commandBufferIdx] = work.inputBuffer;
+
 			// Restore buffer ID and invoke callback if registered
 			// Buffer ID must be restored because output buffer is shared between frames using same CB
 			work.outputBuffer->setBufferId(work.bufferId);
@@ -366,11 +378,8 @@ struct VulkanBackend::Impl {
 				this->callback(*work.outputBuffer);
 			}
 
-			// Store input buffer for deferred release - OutputBufferManager will call releaseOutputBuffer()
-			// when all consumers are done, which returns the input buffer to the free queue
-			// NOTE: Do NOT return input buffer here - it would allow the CB slot to be reused
-			// while consumers still hold references to the output buffer
-			this->pendingInputBufferRelease[work.commandBufferIdx] = work.inputBuffer;
+			// Decrement pending work counter (work completed)
+			this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
 		}
 	}
 
@@ -400,6 +409,9 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// ============================================
 
 		VkCommandBuffer transferCmd = this->transferCommandBuffers[idx];
+
+		// Reset command buffer before re-recording (required by Vulkan spec)
+		vkResetCommandBuffer(transferCmd, 0);
 
 		VkCommandBufferBeginInfo transferBeginInfo = {};
 		transferBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -446,6 +458,9 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// ============================================
 
 		VkCommandBuffer cmd = this->commandBuffers[idx];
+
+		// Reset command buffer before re-recording (required by Vulkan spec)
+		vkResetCommandBuffer(cmd, 0);
 
 		VkCommandBufferBeginInfo beginInfo = {};
 		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -958,6 +973,9 @@ void VulkanBackend::Impl::recordD2hTransferCommandBuffers() {
 	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
 		VkCommandBuffer d2hCmd = this->d2hTransferCommandBuffers[idx];
 
+		// Reset command buffer before re-recording (required by Vulkan spec)
+		vkResetCommandBuffer(d2hCmd, 0);
+
 		checkVulkanErrors(vkBeginCommandBuffer(d2hCmd, &beginInfo));
 
 		// Acquire barrier (for queue family ownership transfer) only if different queue families
@@ -1447,14 +1465,28 @@ void VulkanBackend::cleanup() {
 		return;
 	}
 
-	// Stop completion thread
+	// PHASE 1: Signal shutdown and drain in-flight work
+	this->impl->shuttingDown.store(true, std::memory_order_release);
+
+	// Wait for in-flight work to complete (completion thread will exit semaphore waits)
+	auto startTime = std::chrono::steady_clock::now();
+	while (this->impl->pendingWorkCount.load(std::memory_order_acquire) > 0) {
+		if (std::chrono::steady_clock::now() - startTime > std::chrono::seconds(10)) {
+			std::cerr << "WARNING: Cleanup timeout, remaining work: "
+			          << this->impl->pendingWorkCount.load() << std::endl;
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+
+	// PHASE 2: Stop completion thread (work is drained, safe to join)
 	if (this->impl->completionThread.joinable()) {
 		this->impl->completionThreadRunning = false;
-		this->impl->pendingWorkCV.notify_all();  // Wake up thread
+		this->impl->pendingWorkCV.notify_all();
 		this->impl->completionThread.join();
 	}
 
-	// Wait for all operations to complete
+	// PHASE 3: Wait for GPU idle, then cleanup resources
 	vkDeviceWaitIdle(this->impl->device);
 
 	// Destroy VkFFT
@@ -1626,6 +1658,9 @@ void VulkanBackend::process(IOBuffer& input) {
 	d2hSubmit.pCommandBuffers = &d2hCmd;
 	d2hSubmit.signalSemaphoreCount = 1;
 	d2hSubmit.pSignalSemaphores = &this->impl->outputOrderingSemaphore;
+
+	// Increment pending work counter BEFORE submission (critical for shutdown draining)
+	this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence));
 
