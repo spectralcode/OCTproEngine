@@ -319,7 +319,7 @@ struct VulkanBackend::Impl {
 
 	// VkFFT
 	VkFFTConfiguration fftConfig;
-	VkFFTApplication fftApp;
+	std::vector<VkFFTApplication> vkfftApps;  // One per command buffer slot (fixes descriptor invalidation)
 	uint64_t fftBufferSize = 0;  // Must persist for VkFFT lifetime
 	VkFence fftFence = VK_NULL_HANDLE;  // Dedicated fence for VkFFT operations
 
@@ -483,11 +483,26 @@ struct VulkanBackend::Impl {
 	bool beginLabel(VkCommandBuffer cmd, const char* text);
 	void endLabel(VkCommandBuffer cmd, bool began);
 
+	// Buffer selection helper (ensures VkFFT init and recording use same buffer choice)
+	VkBuffer* getFftDataBufferForSlot(int i, const ProcessorConfiguration& cfg);
+
 	// Diagnostic helpers
 	void updateDescriptorSetsTagged(const char* tag, uint32_t writeCount, const VkWriteDescriptorSet* writes);
 	void logRecordPoint(const char* tag);
 	void logPoolOp(const char* op, VkDescriptorPool pool);
 };
+
+// ============================================
+// Buffer Selection Helper
+// ============================================
+
+VkBuffer* VulkanBackend::Impl::getFftDataBufferForSlot(int i, const ProcessorConfiguration& cfg)
+{
+	// CRITICAL: This must match the actual buffer that FFT reads/writes in recordSingleCommandBuffer()
+	// If DC removal is enabled: data is in fftBuffer after preprocessing
+	// If DC removal is disabled: data is in intermediateBuffer after preprocessing
+	return cfg.processingParams.dcRemoval.enabled ? &this->deviceFftBuffers[i] : &this->deviceIntermediateBuffers[i];
+}
 
 // ============================================
 // Command Buffer Recording
@@ -766,9 +781,10 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	VkFFTLaunchParams fftLaunchParams = {};
 	fftLaunchParams.commandBuffer = &cmd;
-	fftLaunchParams.buffer = fftBuffer;  // Use dynamic buffer selection (CUDA-style pointer swap)
+	// NOTE: Do NOT override buffer here - it's already set correctly during per-slot VkFFT app init
+	// The buffer selection logic in getFftDataBufferForSlot() matches the dataInFftBuffer logic above
 
-	checkVkFFTErrors(VkFFTAppend(&this->fftApp, 1, &fftLaunchParams));  // +1 = inverse FFT
+	checkVkFFTErrors(VkFFTAppend(&this->vkfftApps[idx], 1, &fftLaunchParams));  // +1 = inverse FFT, per-slot app
 
 	// Barrier after FFT (wait for FFT to complete before post-FFT processing)
 	VkBufferMemoryBarrier fftOutputBarrier = {};
@@ -1612,7 +1628,6 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 
 	// Initialize VkFFT library (BEFORE our own pipelines/descriptor pool)
 	memset(&this->impl->fftConfig, 0, sizeof(VkFFTConfiguration));
-	memset(&this->impl->fftApp, 0, sizeof(VkFFTApplication));
 
 	// Configure VkFFT for 1D IFFT
 	this->impl->fftConfig.FFTdim = 1;  // 1D FFT
@@ -1668,8 +1683,23 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	// Bandwidth boost optimization //todo: test if different value has impact on performance
 	this->impl->fftConfig.performBandwidthBoost = 0;
 
-	// Initialize VkFFT
-	checkVkFFTErrors(initializeVkFFT(&this->impl->fftApp, this->impl->fftConfig));
+	// Initialize VkFFT apps (one per command buffer slot to avoid descriptor invalidation)
+	this->impl->vkfftApps.resize(this->impl->numCommandBuffers);
+
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i)
+	{
+		// Use helper to get correct buffer (ensures consistency with recording)
+		VkBuffer* fftBuffer = this->impl->getFftDataBufferForSlot(i, this->impl->config);
+
+		// Create VkFFT config for this slot
+		VkFFTConfiguration fftCfg = this->impl->fftConfig;  // Copy base config
+		fftCfg.buffer = fftBuffer;  // Set per-slot buffer
+
+		// Zero-initialize the app structure before passing to VkFFT
+		memset(&this->impl->vkfftApps[i], 0, sizeof(VkFFTApplication));
+
+		checkVkFFTErrors(initializeVkFFT(&this->impl->vkfftApps[i], fftCfg));
+	}
 
 	// Initialize curve buffers with identity values (required for universal shader)
 	// IMPORTANT: Must be done BEFORE createComputePipelines() so descriptor sets can reference these buffers
@@ -1831,8 +1861,12 @@ void VulkanBackend::cleanup() {
 		std::cerr << "[CLEANUP] Destroying Vulkan resources..." << std::endl;
 		std::cerr.flush();
 
-		// Destroy VkFFT
-		deleteVkFFT(&this->impl->fftApp);
+		// Destroy VkFFT apps (one per command buffer slot)
+		for (size_t i = 0; i < this->impl->vkfftApps.size(); ++i)
+		{
+			deleteVkFFT(&this->impl->vkfftApps[i]);
+		}
+		this->impl->vkfftApps.clear();
 
 		// Note: Do NOT call glslang_finalize_process() here
 		// glslang is process-wide and should persist for the application lifetime
@@ -2154,12 +2188,80 @@ void VulkanBackend::process(IOBuffer& input) {
 // ============================================
 
 void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
+	// === STEP 1: Detect which changes invalidate command buffers ===
+	// Currently all config changes invalidate CBs (see todo below)
+	// In the future, this should check specific fields (FFT size, DC removal, etc.)
+	bool cbInvalidatedNow = true;  // TODO: make this conditional once selective invalidation is implemented
+
+	// === STEP 2: Update impl->config ===
 	this->impl->config = config;
 
+	// === STEP 3: Update impl->fftConfig if VkFFT-relevant fields changed ===
+	// Currently fftConfig is set during initialize() and doesn't change at runtime
+	// If future config changes affect VkFFTConfiguration fields (FFT size, precision, etc.),
+	// update impl->fftConfig here before rebuilding VkFFT apps
+
+	// === STEP 4: Rebuild VkFFT apps if command buffers were invalidated ===
+	if (cbInvalidatedNow && !this->impl->vkfftApps.empty())
+	{
+		// GPU-safe teardown: Wait for GPU to finish using current VkFFT apps
+		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+		// Wait for all in-flight work to complete
+		// NOTE: vkDeviceWaitIdle() stalls entire device - if updateConfig() is called frequently,
+		// consider fence-based waiting (wait only for in-flight command buffers)
+		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
+		if (waitResult != VK_SUCCESS) {
+			std::cerr << "[updateConfig] WARNING: vkDeviceWaitIdle failed with code " << waitResult << std::endl;
+			// Continue with cleanup - resources must be destroyed
+		}
+
+		// Destroy all VkFFT apps (safe after vkDeviceWaitIdle)
+		for (size_t i = 0; i < this->impl->vkfftApps.size(); ++i)
+		{
+			deleteVkFFT(&this->impl->vkfftApps[i]);
+		}
+		this->impl->vkfftApps.clear();
+
+		// Re-create with new buffer selection using UPDATED config
+		this->impl->vkfftApps.resize(this->impl->numCommandBuffers);
+
+		int initializedCount = 0;  // Track for cleanup robustness
+
+		for (int i = 0; i < this->impl->numCommandBuffers; ++i)
+		{
+			// Use helper to ensure consistent buffer selection (same logic as recording)
+			VkBuffer* fftBuffer = this->impl->getFftDataBufferForSlot(i, this->impl->config);
+
+			// Copy impl->fftConfig and override buffer per-slot
+			VkFFTConfiguration fftCfg = this->impl->fftConfig;
+			fftCfg.buffer = fftBuffer;  // Per-slot buffer from helper
+
+			// Zero-initialize before passing to VkFFT
+			memset(&this->impl->vkfftApps[i], 0, sizeof(VkFFTApplication));
+
+			try {
+				checkVkFFTErrors(initializeVkFFT(&this->impl->vkfftApps[i], fftCfg));
+				initializedCount++;
+			} catch (...) {
+				// Cleanup robustness: If initializeVkFFT() fails midway,
+				// destroy already-initialized apps before re-throwing
+				for (int j = 0; j < initializedCount; ++j) {
+					deleteVkFFT(&this->impl->vkfftApps[j]);
+				}
+				this->impl->vkfftApps.clear();
+				throw;
+			}
+		}
+	}
+
+	// === STEP 5: Mark command buffers as invalid ===
 	// Invalidate command buffers to force re-recording with new configuration
 	// Next process() call will re-record all command buffers
 	//todo: this can be improved to only re-record when relevant parameters change
-	this->impl->commandBuffersValid = false;
+	if (cbInvalidatedNow) {
+		this->impl->commandBuffersValid = false;
+	}
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
