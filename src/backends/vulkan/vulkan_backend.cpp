@@ -134,6 +134,37 @@ void createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDeviceSize
 
 struct VulkanBackend::Impl {
 	// ============================================
+	// RAII Guard for Staging Buffer Exception Safety
+	// ============================================
+	struct StagingLease {
+		VulkanBackend::Impl* impl = nullptr;
+		int idx = -1;
+		bool active = false;
+
+		explicit StagingLease(VulkanBackend::Impl* i) : impl(i) {}
+
+		void acquire(int i) {
+			idx = i;
+			active = true;
+		}
+
+		void release_to_pending() {
+			active = false;  // Disarm guard - work now tracked in pendingWorkQueue
+		}
+
+		~StagingLease() noexcept {
+			if (!active || !impl || idx < 0) return;
+
+			// Return staging buffer to free queue on early-exit / exception
+			std::lock_guard<std::mutex> lock(impl->freeStagingOutputMutex);
+			if (impl->stagingInUse[idx].exchange(false, std::memory_order_acq_rel)) {
+				impl->freeStagingOutputQueue.push(idx);
+				impl->freeStagingOutputCV.notify_one();
+			}
+		}
+	};
+
+	// ============================================
 	// Pipeline Index Enumeration
 	// ============================================
 
@@ -240,6 +271,8 @@ struct VulkanBackend::Impl {
 	std::unique_ptr<std::atomic<bool>[]> stagingInUse;  // Double-free guard (atomics can't go in vector)
 	int numStagingBuffers = 0;  // Track size of stagingInUse array
 	bool stagingOutputIsCoherent = false;  // Track if staging memory has HOST_COHERENT property
+	VkDeviceSize nonCoherentAtomSize = 1;  // Alignment requirement for non-coherent memory operations
+	std::vector<VkDeviceSize> stagingOutputAllocSize;  // Track allocation size per staging output buffer
 
 	// Device buffers (device-local)
 	std::vector<VkBuffer> deviceInputBuffers;
@@ -268,6 +301,7 @@ struct VulkanBackend::Impl {
 	// Fixed pattern noise removal
 	VkBuffer meanALineBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory meanALineMemory = VK_NULL_HANDLE;
+	std::mutex fixedPatternNoiseMutex;  // Protects fixedPatternNoiseDetermined and recordedFixedPatternNoise
 	bool fixedPatternNoiseDetermined = false;
 	std::vector<float> recordedFixedPatternNoise;
 
@@ -277,6 +311,7 @@ struct VulkanBackend::Impl {
 	VkBuffer postProcBackgroundStagingBuffer = VK_NULL_HANDLE;  // For copying profile back to host
 	VkDeviceMemory postProcBackgroundStagingMemory = VK_NULL_HANDLE;
 	void* postProcBackgroundStagingMapped = nullptr;  // Mapped pointer for readback
+	std::mutex backgroundProfileMutex;  // Protects all background profile state below
 	bool postProcessBackgroundRecordingRequested = false;
 	bool hasValidBackgroundProfile = false;  // Track whether background profile has been set
 	std::atomic<bool> needRerecordAfterBgCapture{false};  // Trigger CB re-record after bg capture completes
@@ -473,29 +508,44 @@ struct VulkanBackend::Impl {
 			// ============================================
 			// If staging memory is not coherent, invalidate mapped memory before consumers read
 			if (!this->stagingOutputIsCoherent) {
-				VkMappedMemoryRange range = {};
+				VkDeviceSize atom = this->nonCoherentAtomSize;
+				VkDeviceSize offset = 0;
+				VkDeviceSize end = offset + work.outputSize;
+
+				// Align down offset, align up end (required by Vulkan spec)
+				VkDeviceSize alignedOffset = (offset / atom) * atom;
+				VkDeviceSize alignedEnd = ((end + atom - 1) / atom) * atom;
+
+				// Cap to allocation size to avoid validation errors
+				VkDeviceSize allocSize = this->stagingOutputAllocSize[work.stagingBufferIdx];
+				alignedEnd = std::min(alignedEnd, allocSize);
+
+				VkMappedMemoryRange range{};
 				range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
 				range.memory = this->stagingOutputMemory[work.stagingBufferIdx];
-				range.offset = 0;
-				range.size = work.outputSize;
+				range.offset = alignedOffset;
+				range.size = alignedEnd - alignedOffset;
 				vkInvalidateMappedMemoryRanges(this->device, 1, &range);
 			}
 
 			// If background recording was requested, copy the recorded profile from staging buffer
-			if (this->postProcessBackgroundRecordingRequested) {
-				size_t bgProfileSize = work.outputSignalLength;  // Number of floats in background profile
-				this->recordedPostProcessBackground.resize(bgProfileSize);
-				std::memcpy(this->recordedPostProcessBackground.data(),
-				            this->postProcBackgroundStagingMapped,
-				            bgProfileSize * sizeof(float));
+			{
+				std::lock_guard<std::mutex> lock(this->backgroundProfileMutex);
+				if (this->postProcessBackgroundRecordingRequested) {
+					size_t bgProfileSize = work.outputSignalLength;  // Number of floats in background profile
+					this->recordedPostProcessBackground.resize(bgProfileSize);
+					std::memcpy(this->recordedPostProcessBackground.data(),
+					            this->postProcBackgroundStagingMapped,
+					            bgProfileSize * sizeof(float));
 
-				// Mark as valid and clear the request flag
-				this->hasValidBackgroundProfile = true;
-				this->postProcessBackgroundRecordingRequested = false;
+					// Mark as valid and clear the request flag (atomic publication)
+					this->hasValidBackgroundProfile = true;
+					this->postProcessBackgroundRecordingRequested = false;
 
-				// Trigger re-record of command buffers on next process() call
-				// This removes the background recording dispatch (now only subtraction will run)
-				this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
+					// Trigger re-record of command buffers on next process() call
+					// This removes the background recording dispatch (now only subtraction will run)
+					this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
+				}
 			}
 
 			// ============================================
@@ -555,6 +605,20 @@ VkBuffer* VulkanBackend::Impl::getFftDataBufferForSlot(int i, const ProcessorCon
 
 void VulkanBackend::Impl::recordAllCommandBuffers() {
 	vkDeviceWaitIdle(this->device);  // Wait for all GPU work to complete before re-recording
+
+	// Read background profile and FPN flags under mutex protection (avoid data races during command buffer recording)
+	bool bgRecordingRequested;
+	bool bgProfileValid;
+	bool fpnDetermined;
+	{
+		std::lock_guard<std::mutex> bgLock(this->backgroundProfileMutex);
+		bgRecordingRequested = this->postProcessBackgroundRecordingRequested;
+		bgProfileValid = this->hasValidBackgroundProfile;
+	}
+	{
+		std::lock_guard<std::mutex> fpnLock(this->fixedPatternNoiseMutex);
+		fpnDetermined = this->fixedPatternNoiseDetermined;
+	}
 
 	// Calculate input size (used in all command buffers)
 	size_t inputSize = this->samplesPerBuffer * this->bytesPerSample;
@@ -861,7 +925,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// Warn if FPN is enabled but not enough A-scans available (once per recording)
 	static bool fpnWarningShown = false;
 	if (this->config.processingParams.fixedPatternNoise.enabled &&
-	    !this->fixedPatternNoiseDetermined &&
+	    !fpnDetermined &&
 	    requiredAscans > availableAscans &&
 	    !fpnWarningShown) {
 		std::cerr << "[VulkanBackend] Warning: FPN determination requires " << requiredAscans
@@ -870,7 +934,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	}
 
 	if (this->config.processingParams.fixedPatternNoise.enabled &&
-	    !this->fixedPatternNoiseDetermined &&
+	    !fpnDetermined &&
 	    requiredAscans <= availableAscans) {
 		// Dispatch FPN determination shader to compute mean A-line
 		// This happens once when FPN is first requested, using the current frame's data
@@ -926,8 +990,11 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		                     1, &fpnBarrier,
 		                     0, nullptr);
 
-		// Mark as determined for subsequent frames
-		this->fixedPatternNoiseDetermined = true;
+		// Mark as determined for subsequent frames (mutex-protected)
+		{
+			std::lock_guard<std::mutex> lock(this->fixedPatternNoiseMutex);
+			this->fixedPatternNoiseDetermined = true;
+		}
 	}
 
 	// ============================================
@@ -936,7 +1003,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// ============================================
 
 	// Select the appropriate universal post-FFT pipeline variant
-	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled && this->fixedPatternNoiseDetermined;
+	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled && fpnDetermined;
 	bool logScaling = this->config.processingParams.intensity.logScale;
 	int fpnIdx = fpnEnabled ? 1 : 0;
 	int logIdx = logScaling ? 1 : 0;
@@ -1005,7 +1072,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// Background Recording (if requested)
 	// ============================================
 
-	if (this->postProcessBackgroundRecordingRequested) {
+	if (bgRecordingRequested) {
 		// Bind background recording pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundRecordingPipeline);
 
@@ -1088,7 +1155,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	// Apply subtraction if we have a valid profile OR if we just recorded one (same behavior as CUDA)
 	if (this->config.processingParams.background.enabled &&
-	    (this->hasValidBackgroundProfile || this->postProcessBackgroundRecordingRequested)) {
+	    (bgProfileValid || bgRecordingRequested)) {
 		// Bind background subtraction pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundSubtractionPipeline);
 
@@ -1910,28 +1977,10 @@ void VulkanBackend::cleanup() {
 	this->impl->shuttingDown.store(true, std::memory_order_release);
 	this->impl->completionThreadRunning.store(false, std::memory_order_release);  // Prevent new waits
 	this->impl->freeQueueCV.notify_all();      // Wake threads in getNextAvailableInputBuffer()
+	this->impl->freeStagingOutputCV.notify_all();  // Wake staging buffer waits (Issue 5 fix)
 	this->impl->pendingWorkCV.notify_all();    // Wake completion thread
 
-	// Lock submitMutex and wait for GPU (BEFORE joining thread!)
-	VKDBG_LOG("[CLEANUP] Acquiring submitMutex and waiting for GPU...");
-	{
-		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
-
-		// Wait for GPU to finish all submitted work (signals all timeline values)
-		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
-		if (waitResult != VK_SUCCESS) {
-			std::cerr << "[CLEANUP] vkDeviceWaitIdle failed with error " << waitResult;
-			if (waitResult == VK_ERROR_DEVICE_LOST) {
-				std::cerr << " (VK_ERROR_DEVICE_LOST - GPU crashed)";
-			}
-			std::cerr << " - continuing with cleanup..." << std::endl;
-			std::cerr.flush();
-			// Continue with cleanup anyway. must still clean up CPU resources
-		}
-	}  // Release submitMutex - allows completion thread to proceed
-
-	// NOW stop completion thread safely
-	// All timeline values are signaled, OR thread will exit via timeout + shuttingDown check
+	// Join completion thread FIRST (ensures no more Vulkan calls from completion thread - Issue 5 fix)
 	VKDBG_LOG("[CLEANUP] Stopping completion thread...");
 	if (this->impl->completionThread.joinable()) {
 		this->impl->pendingWorkCV.notify_all();  // Final wake
@@ -1942,6 +1991,17 @@ void VulkanBackend::cleanup() {
 	VKDBG_LOG("[CLEANUP] Draining pending work and destroying resources...");
 	{
 		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+		// Wait for GPU to finish (now protected by submitMutex - Issue 5 fix)
+		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
+		if (waitResult != VK_SUCCESS) {
+			std::cerr << "[CLEANUP] vkDeviceWaitIdle failed with error " << waitResult;
+			if (waitResult == VK_ERROR_DEVICE_LOST) {
+				std::cerr << " (VK_ERROR_DEVICE_LOST - GPU crashed)";
+			}
+			std::cerr << " - continuing with cleanup..." << std::endl;
+			std::cerr.flush();
+		}
 
 		// Drain pending work queue
 		// After vkDeviceWaitIdle(), GPU work is complete. We can now safely:
@@ -2108,6 +2168,8 @@ void VulkanBackend::process(IOBuffer& input) {
 	// Acquire Free Staging Output Buffer
 	// ============================================
 	// Wait for a free staging buffer from the decoupled pool (like CUDA backend)
+	// Use RAII guard to ensure buffer is returned on exception
+	VulkanBackend::Impl::StagingLease stagingLease(this->impl.get());
 	int stagingBufferIdx;
 	{
 		std::unique_lock<std::mutex> lock(this->impl->freeStagingOutputMutex);
@@ -2127,6 +2189,9 @@ void VulkanBackend::process(IOBuffer& input) {
 		if (this->impl->stagingInUse[stagingBufferIdx].exchange(true, std::memory_order_acq_rel)) {
 			throw std::runtime_error("Double-acquire of staging buffer " + std::to_string(stagingBufferIdx));
 		}
+
+		// Activate RAII guard
+		stagingLease.acquire(stagingBufferIdx);
 	}
 
 	// Get output buffer and configure it to point to acquired staging memory
@@ -2155,7 +2220,7 @@ void VulkanBackend::process(IOBuffer& input) {
 	VkSemaphore transferCompleteSemaphore = this->impl->transferToComputeSemaphores[idx];
 
 	// Diagnostic: Check if we're about to submit H2D before previous slot completed
-	uint64_t slotWaitValue = this->impl->stagingLastWriteValue[idx];
+	uint64_t slotWaitValue = this->impl->lastTimelineValuePerCB[idx];
 #ifdef VULKAN_DEBUG
 	uint64_t currentTimelineValue = 0;
 	vkGetSemaphoreCounterValue(this->impl->device, this->impl->outputOrderingSemaphore, &currentTimelineValue);
@@ -2289,9 +2354,6 @@ void VulkanBackend::process(IOBuffer& input) {
 	d2hSubmit.signalSemaphoreCount = 1;
 	d2hSubmit.pSignalSemaphores = &this->impl->outputOrderingSemaphore;
 
-	// Increment pending work counter BEFORE submission (critical for shutdown draining)
-	this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
-
 	VkResult submitResult = vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence);
 	VKDBG_LOG("[D2H SUBMIT] cmdIdx=" << idx
 	          << " stagingIdx=" << stagingBufferIdx
@@ -2326,8 +2388,13 @@ void VulkanBackend::process(IOBuffer& input) {
 			input.getBufferId(),   // Save buffer ID (output buffer is shared between frames)
 			stagingBufferIdx       // NEW: track which staging buffer this work uses (decoupled from commandBufferIdx)
 		});
+		// Increment pending work counter AFTER successful enqueue (inside lock to avoid race)
+		this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 	}
 	this->impl->pendingWorkCV.notify_one();  // Wake completion thread
+
+	// Disarm RAII guard - work is now tracked in pendingWorkQueue
+	stagingLease.release_to_pending();
 
 	// Track which timeline value was used by this CB (for slot reuse protection)
 	this->impl->lastTimelineValuePerCB[idx] = signalValue;
@@ -2716,7 +2783,20 @@ IOBuffer& VulkanBackend::getNextAvailableInputBuffer() {
 
 	// Wait for this CB to be available before writing to its input buffers
 	// This ensures we don't overwrite input buffers while GPU is reading them
-	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
+	// Use bounded wait to prevent indefinite hang if GPU wedged
+	VkResult result = VK_TIMEOUT;
+	while (result == VK_TIMEOUT) {
+		if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+			throw std::runtime_error("Backend shutting down");
+		}
+
+		// Wait with 100ms timeout instead of UINT64_MAX
+		result = vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, 100'000'000ULL);
+	}
+
+	if (result != VK_SUCCESS) {
+		checkVulkanErrors(result);
+	}
 
 	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
 
@@ -2770,7 +2850,10 @@ void VulkanBackend::releaseOutputBuffer(IOBuffer* buffer) {
 // ============================================
 
 void VulkanBackend::requestPostProcessBackgroundRecording() {
-	this->impl->postProcessBackgroundRecordingRequested = true;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
+		this->impl->postProcessBackgroundRecordingRequested = true;
+	}
 	this->impl->commandBuffersValid = false;  // Force re-record on next process()
 }
 
@@ -2794,8 +2877,11 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 		throw std::invalid_argument("Invalid background profile size. Expected " + std::to_string(expectedLength) + " floats but got " + std::to_string(length));
 	}
 
-	// Store profile locally
-	this->impl->recordedPostProcessBackground.assign(background, background + length);
+	// Store profile locally (mutex-protected to avoid data races)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
+		this->impl->recordedPostProcessBackground.assign(background, background + length);
+	}
 
 	// Upload to GPU
 	if (this->impl->postProcBackgroundBuffer == VK_NULL_HANDLE) {
@@ -2862,8 +2948,11 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
 
-	// Mark background profile as valid
-	this->impl->hasValidBackgroundProfile = true;
+	// Mark background profile as valid (mutex-protected)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
+		this->impl->hasValidBackgroundProfile = true;
+	}
 
 	// Re-record command buffers to include background subtraction
 	// First, wait for all in-flight work to complete
@@ -2875,11 +2964,18 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 }
 
 const std::vector<float>& VulkanBackend::getPostProcessBackgroundProfile() const {
+	// Note: Returning reference requires caller holds no concurrent modifications
+	// This is safe in current usage (only called when processing is stopped)
+	// Future: Consider returning by value if called during processing
+	std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
 	return this->impl->recordedPostProcessBackground;
 }
 
 void VulkanBackend::requestFixedPatternNoiseDetermination() {
-	this->impl->fixedPatternNoiseDetermined = false;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
+		this->impl->fixedPatternNoiseDetermined = false;
+	}
 	this->impl->commandBuffersValid = false;  // Force re-record to include FPN determination shader
 }
 
@@ -2971,11 +3067,17 @@ void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved,
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
 
-	// Mark FPN as determined
-	this->impl->fixedPatternNoiseDetermined = true;
+	// Mark FPN as determined (mutex-protected)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
+		this->impl->fixedPatternNoiseDetermined = true;
+	}
 }
 
 const std::vector<float>& VulkanBackend::getFixedPatternNoiseProfile() const {
+	// Note: Returning reference requires caller holds no concurrent modifications
+	// This is safe in current usage (only called when processing is stopped)
+	std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
 	return this->impl->recordedFixedPatternNoise;
 }
 
@@ -3204,6 +3306,11 @@ void createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDeviceSize
 }
 
 void VulkanBackend::allocateDeviceBuffers() {
+	// Get physical device properties for non-coherent memory alignment
+	VkPhysicalDeviceProperties props{};
+	vkGetPhysicalDeviceProperties(this->impl->physicalDevice, &props);
+	this->impl->nonCoherentAtomSize = props.limits.nonCoherentAtomSize;
+
 	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
 	size_t complexSize = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float (2 floats per sample)
 	// Output size is truncated to half signal length after FFT
@@ -3246,6 +3353,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 	this->impl->stagingOutputMemory.resize(actualNumOutputBuffers);
 	this->impl->stagingOutputMapped.resize(actualNumOutputBuffers);
 	this->impl->stagingLastWriteValue.resize(actualNumOutputBuffers, 0);  // Initialize to 0 (no previous write)
+	this->impl->stagingOutputAllocSize.resize(actualNumOutputBuffers);  // Track allocation size for alignment capping
 
 	// Initialize stagingInUse atomic bools (unique_ptr array because atomics can't go in vector)
 	this->impl->numStagingBuffers = actualNumOutputBuffers;
@@ -3289,6 +3397,9 @@ void VulkanBackend::allocateDeviceBuffers() {
 
 		// Map staging buffer memory
 		vkMapMemory(this->impl->device, this->impl->stagingOutputMemory[i], 0, outputSize, 0, &this->impl->stagingOutputMapped[i]);
+
+		// Store allocation size for alignment capping
+		this->impl->stagingOutputAllocSize[i] = outputSize;
 	}
 
 	// Track coherency status for completion thread (determines if vkInvalidateMappedMemoryRanges needed)
