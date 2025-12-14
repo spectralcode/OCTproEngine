@@ -323,6 +323,12 @@ struct VulkanBackend::Impl {
 	bool fixedPatternNoiseDetermined = false;
 	std::vector<float> recordedFixedPatternNoise;
 
+	// FPN staging buffer for host readback (similar to postProcBackgroundStagingBuffer)
+	VkBuffer meanALineStagingBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory meanALineStagingMemory = VK_NULL_HANDLE;
+	void* meanALineStagingMapped = nullptr;  // Persistent mapped pointer
+	bool fpnRecordingRequested = false;
+
 	// Post-processing background
 	VkBuffer postProcBackgroundBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory postProcBackgroundMemory = VK_NULL_HANDLE;
@@ -560,9 +566,38 @@ struct VulkanBackend::Impl {
 					this->hasValidBackgroundProfile = true;
 					this->postProcessBackgroundRecordingRequested = false;
 
+					// Sync to configuration so profile survives backend switches (matches CUDA behavior)
+					this->config.setBackgroundProfile(
+						this->recordedPostProcessBackground
+					);
+
 					// Trigger re-record of command buffers on next process() call
 					// This removes the background recording dispatch (now only subtraction will run)
 					this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
+				}
+			}
+
+			// If FPN recording was requested, copy the recorded profile from staging buffer
+			{
+				std::lock_guard<std::mutex> lock(this->fixedPatternNoiseMutex);
+				if (this->fpnRecordingRequested) {
+					// FPN profile: outputSignalLength complex pairs = signalLength floats total
+					// outputSignalLength = signalLength/2, each complex = 2 floats
+					size_t numFloats = this->signalLength;  // Total number of floats in profile
+					this->recordedFixedPatternNoise.resize(numFloats);
+
+					// Copy from staging buffer (complex pairs as interleaved float array)
+					float* stagingData = static_cast<float*>(this->meanALineStagingMapped);
+					std::memcpy(this->recordedFixedPatternNoise.data(), stagingData,
+					            numFloats * sizeof(float));
+
+					this->fixedPatternNoiseDetermined = true;
+					this->fpnRecordingRequested = false;
+
+					// Sync to configuration so profile survives backend switches (matches CUDA behavior)
+					this->config.setFixedPatternNoiseProfile(
+						this->recordedFixedPatternNoise
+					);
 				}
 			}
 
@@ -628,6 +663,8 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	bool bgRecordingRequested;
 	bool bgProfileValid;
 	bool fpnDetermined;
+	bool fpnRecordingRequested;
+	bool fpnContinuousMode;
 	{
 		std::lock_guard<std::mutex> bgLock(this->backgroundProfileMutex);
 		bgRecordingRequested = this->postProcessBackgroundRecordingRequested;
@@ -636,6 +673,8 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	{
 		std::lock_guard<std::mutex> fpnLock(this->fixedPatternNoiseMutex);
 		fpnDetermined = this->fixedPatternNoiseDetermined;
+		fpnRecordingRequested = this->fpnRecordingRequested;
+		fpnContinuousMode = this->config.processingParams.fixedPatternNoise.continuous;
 	}
 
 	// Calculate input size (used in all command buffers)
@@ -933,85 +972,82 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                     0, nullptr);
 
 	// ============================================
-	// Fixed Pattern Noise Determination (if needed)
+	// FPN Determination (if requested or continuous mode)
 	// ============================================
 
-	// Calculate required and available A-scans for FPN determination
-	int requiredAscans = this->config.processingParams.fixedPatternNoise.bscanAverageCount * this->ascansPerBscan;
-	int availableAscans = this->ascansPerBscan * this->bscansPerBuffer;
-
-	// Warn if FPN is enabled but not enough A-scans available (once per recording)
-	static bool fpnWarningShown = false;
 	if (this->config.processingParams.fixedPatternNoise.enabled &&
-	    !fpnDetermined &&
-	    requiredAscans > availableAscans &&
-	    !fpnWarningShown) {
-		std::cerr << "[VulkanBackend] Warning: FPN determination requires " << requiredAscans
-		          << " A-scans but only " << availableAscans << " available per buffer" << std::endl;
-		fpnWarningShown = true;
-	}
+	    (fpnRecordingRequested || fpnContinuousMode)) {
 
-	if (this->config.processingParams.fixedPatternNoise.enabled &&
-	    !fpnDetermined &&
-	    requiredAscans <= availableAscans) {
-		// Dispatch FPN determination shader to compute mean A-line
-		// This happens once when FPN is first requested, using the current frame's data
+		// Check if we have enough A-scans
+		int requiredAscans = this->config.processingParams.fixedPatternNoise.bscanAverageCount * this->ascansPerBscan;
+		int availableAscans = this->ascansPerBscan * this->bscansPerBuffer;
 
-		// Bind FPN determination pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->getPipeline(Impl::PipelineIndex::FpnDetermination));
+		if (requiredAscans <= availableAscans) {
+			// Bind FPN determination pipeline
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                  this->getPipeline(Impl::PipelineIndex::FpnDetermination));
 
-		// Bind FPN determination descriptor set (select variant based on which buffer was used for FFT)
-		int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->fpnDeterminationPipelineLayout,
-		                        0, 1, &this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant], 0, nullptr);
-		logBindDS("FPNDetermination", cmd, this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant]);
+			// Bind descriptor set for THIS command buffer (idx, not hardcoded 0!)
+			int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        this->fpnDeterminationPipelineLayout,
+			                        0, 1, &this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant],
+			                        0, nullptr);
+			logBindDS("FpnDetermination", cmd, this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant]);
 
-		// Push constants: width, height, segments, stride, outputSignalLength
-		struct FpnDeterminationPushConstants {
-			uint32_t width;         // outputSignalLength (samples per A-scan after truncation)
-			uint32_t height;        // Number of A-scans to use for FPN (bscanAverageCount * ascansPerBscan)
-			uint32_t segments;      // Number of segments for minimum variance calculation
-			uint32_t stride;        // fullSignalLength (stride between A-scans in input)
-			uint32_t outputSignalLength;  // Same as width
-		} fpnPush;
+			// Push constants
+			struct FpnDeterminationPushConstants {
+				uint32_t width;
+				uint32_t height;
+				uint32_t segments;
+				uint32_t stride;
+				uint32_t outputSignalLength;
+			} fpnPush;
 
-		int outputSignalLength = this->signalLength / 2; // todo: when truncate step becomes optional, outputSignalLength needs to be obtained differently
-		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
-		fpnPush.height = static_cast<uint32_t>(requiredAscans);  // Use bscanAverageCount * ascansPerBscan (like CUDA/OpenCL)
-		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
-		fpnPush.stride = static_cast<uint32_t>(this->signalLength);
-		fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
+			int outputSignalLength = this->signalLength / 2;
+			fpnPush.width = static_cast<uint32_t>(outputSignalLength);
+			fpnPush.height = static_cast<uint32_t>(requiredAscans);
+			fpnPush.segments = 8;
+			fpnPush.stride = static_cast<uint32_t>(this->signalLength);
+			fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
 
-		vkCmdPushConstants(cmd, this->fpnDeterminationPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(fpnPush), &fpnPush);
+			vkCmdPushConstants(cmd, this->fpnDeterminationPipelineLayout,
+			                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fpnPush), &fpnPush);
 
-		// Dispatch FPN determination shader (one thread per sample in the output A-scan)
-		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
-		vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
+			// Dispatch FPN determination
+			uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
+			vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
 
-		// Barrier: wait for FPN profile to be written before using it
-		VkBufferMemoryBarrier fpnBarrier = {};
-		fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		fpnBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		fpnBarrier.buffer = this->meanALineBuffer;
-		fpnBarrier.offset = 0;
-		fpnBarrier.size = VK_WHOLE_SIZE;
+			// Pipeline barrier (determination writes before staging copy reads)
+			VkBufferMemoryBarrier fpnBarrier = {};
+			fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			fpnBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+			fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			fpnBarrier.buffer = this->meanALineBuffer;
+			fpnBarrier.offset = 0;
+			fpnBarrier.size = VK_WHOLE_SIZE;
 
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &fpnBarrier,
-		                     0, nullptr);
+			vkCmdPipelineBarrier(cmd,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     0, 0, nullptr, 1, &fpnBarrier, 0, nullptr);
 
-		// Mark as determined for subsequent frames (mutex-protected)
-		{
-			std::lock_guard<std::mutex> lock(this->fixedPatternNoiseMutex);
-			this->fixedPatternNoiseDetermined = true;
+			// GPU-to-GPU copy: meanALineBuffer -> meanALineStagingBuffer
+			VkBufferCopy fpnCopyRegion = {};
+			fpnCopyRegion.srcOffset = 0;
+			fpnCopyRegion.dstOffset = 0;
+			fpnCopyRegion.size = sizeof(float) * this->signalLength;  // outputSignalLength complex pairs = signalLength floats
+
+			// Balanced label for FPN copy
+			char fpnLabelName[128];
+			snprintf(fpnLabelName, sizeof(fpnLabelName),
+			         "FPN copy dst=meanALineStaging src=meanALine size=%zu",
+			         (size_t)fpnCopyRegion.size);
+			bool fpnBegan = this->beginLabel(cmd, fpnLabelName);
+			vkCmdCopyBuffer(cmd, this->meanALineBuffer, this->meanALineStagingBuffer, 1, &fpnCopyRegion);
+			this->endLabel(cmd, fpnBegan);
 		}
 	}
 
@@ -1021,7 +1057,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// ============================================
 
 	// Select the appropriate universal post-FFT pipeline variant
-	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled && fpnDetermined;
+	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled;
 	bool logScaling = this->config.processingParams.intensity.logScale;
 	int fpnIdx = fpnEnabled ? 1 : 0;
 	int logIdx = logScaling ? 1 : 0;
@@ -1237,6 +1273,10 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	this->commandBuffersValid = true;
 }
+
+// ============================================
+// D2H Transfer Command Buffer Recording
+// ============================================
 
 // Dynamic D2H command buffer recording (supports decoupled staging buffer pool)
 // Records a single D2H transfer command buffer to copy from deviceProcessedBuffers[commandBufferIdx]
@@ -2519,10 +2559,13 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
 	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Early exit during shutdown
-	if (!this->impl->vulkanInitialized ||
-	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
 		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
 	}
 
 	// Create buffer if it doesn't exist
@@ -2607,10 +2650,13 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
 	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Early exit during shutdown
-	if (!this->impl->vulkanInitialized ||
-	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
 		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
 	}
 
 	// Create buffer if it doesn't exist
@@ -2695,10 +2741,13 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
 	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Early exit during shutdown
-	if (!this->impl->vulkanInitialized ||
-	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
 		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
 	}
 
 	// Create buffer if it doesn't exist
@@ -2895,10 +2944,13 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
 	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Early exit during shutdown
-	if (!this->impl->vulkanInitialized ||
-	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
 		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
 	}
 
 	if (!background || length == 0) {
@@ -3008,19 +3060,24 @@ const std::vector<float>& VulkanBackend::getPostProcessBackgroundProfile() const
 void VulkanBackend::requestFixedPatternNoiseDetermination() {
 	{
 		std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
-		this->impl->fixedPatternNoiseDetermined = false;
+		this->impl->fpnRecordingRequested = true;
+		this->impl->fixedPatternNoiseDetermined = false;  // Mark as not determined yet
 	}
-	this->impl->commandBuffersValid = false;  // Force re-record to include FPN determination shader
+	// Invalidate command buffers to include FPN determination dispatch
+	this->impl->commandBuffersValid = false;
 }
 
 void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
 	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
 	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Early exit during shutdown
-	if (!this->impl->vulkanInitialized ||
-	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
 		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
 	}
 
 	if (!profileInterleaved || complexPairs == 0) {
@@ -3506,7 +3563,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 	// So size = (signalLength / 2) * 2 * sizeof(float) = signalLength * sizeof(float) = curveSize
 	size_t meanALineSize = curveSize;
 	createBuffer(this->impl->device, this->impl->physicalDevice, meanALineSize,
-	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 	             this->impl->meanALineBuffer, this->impl->meanALineMemory);
 
@@ -3526,6 +3583,15 @@ void VulkanBackend::allocateDeviceBuffers() {
 	// Map staging buffer for persistent access
 	vkMapMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory, 0, backgroundSize, 0, &this->impl->postProcBackgroundStagingMapped);
 
+	// FPN staging buffer for host readback (complex float, same size as meanALineBuffer)
+	createBuffer(this->impl->device, this->impl->physicalDevice, meanALineSize,
+	             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             this->impl->meanALineStagingBuffer, this->impl->meanALineStagingMemory);
+
+	// Map FPN staging buffer for persistent access
+	vkMapMemory(this->impl->device, this->impl->meanALineStagingMemory, 0, meanALineSize, 0, &this->impl->meanALineStagingMapped);
+
 	// Initialize background buffer to zeros (so background subtraction works even without recording)
 	VkCommandBufferAllocateInfo allocInfo = {};
 	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -3542,6 +3608,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 
 	vkBeginCommandBuffer(initCmdBuffer, &beginInfo);
 	vkCmdFillBuffer(initCmdBuffer, this->impl->postProcBackgroundBuffer, 0, VK_WHOLE_SIZE, 0);  // Fill with zeros
+	vkCmdFillBuffer(initCmdBuffer, this->impl->meanALineBuffer, 0, VK_WHOLE_SIZE, 0);  // Zero-fill meanALineBuffer so pre-determination subtraction has no effect
 	vkEndCommandBuffer(initCmdBuffer);
 
 	// Submit and wait for initialization
@@ -3694,6 +3761,20 @@ void VulkanBackend::releaseDeviceBuffers() {
 	}
 	if (this->impl->postProcBackgroundStagingMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory, nullptr);
+	}
+
+	// Unmap and cleanup staging buffer for FPN profile
+	if (this->impl->meanALineStagingMapped != nullptr) {
+		vkUnmapMemory(this->impl->device, this->impl->meanALineStagingMemory);
+		this->impl->meanALineStagingMapped = nullptr;
+	}
+	if (this->impl->meanALineStagingBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->meanALineStagingBuffer, nullptr);
+		this->impl->meanALineStagingBuffer = VK_NULL_HANDLE;
+	}
+	if (this->impl->meanALineStagingMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->meanALineStagingMemory, nullptr);
+		this->impl->meanALineStagingMemory = VK_NULL_HANDLE;
 	}
 }
 
