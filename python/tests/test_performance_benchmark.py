@@ -231,6 +231,8 @@ def run_benchmark(backend, signal_length, ascans_per_bscan, bscans_per_buffer, t
     
     def on_output(output_array, buffer_id):
         with lock:
+            # simulate actual use of output data
+            _ = np.maximum(output_array, 0, out=output_array)
             completed_iterations['count'] += 1
 
     processor.add_output_callback(on_output)
