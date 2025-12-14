@@ -15,31 +15,16 @@ if not exist "CMakeLists.txt" (
 )
 
 REM Find Python
-REM Priority: 1) User-set PYTHON_EXE, 2) python in PATH, 3) Common install locations
+REM Priority: 1) User-set PYTHON_EXE, 2) python in PATH
 if not "%PYTHON_EXE%"=="" (
 	echo Using user-specified Python: %PYTHON_EXE%
 	goto :python_found
 )
 
-REM Try python in PATH (most common)
+REM Try python in PATH
 where python.exe >nul 2>&1
 if %errorlevel% equ 0 (
 	for /f "delims=" %%i in ('where python.exe') do set "PYTHON_EXE=%%i"
-	goto :python_found
-)
-
-REM Check common installation locations
-if exist "C:\Users\%USERNAME%\anaconda3\python.exe" (
-	set "PYTHON_EXE=C:\Users\%USERNAME%\anaconda3\python.exe"
-	set "PATH=C:\Users\%USERNAME%\anaconda3;C:\Users\%USERNAME%\anaconda3\Scripts;%PATH%"
-	goto :python_found
-)
-if exist "C:\Python312\python.exe" (
-	set "PYTHON_EXE=C:\Python312\python.exe"
-	goto :python_found
-)
-if exist "C:\Python311\python.exe" (
-	set "PYTHON_EXE=C:\Python311\python.exe"
 	goto :python_found
 )
 
