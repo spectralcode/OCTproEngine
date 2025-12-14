@@ -233,6 +233,14 @@ struct VulkanBackend::Impl {
 	std::vector<VkDeviceMemory> stagingOutputMemory;
 	std::vector<void*> stagingOutputMapped;
 
+	// Free staging output buffer pool (decoupled from command buffer slots)
+	std::queue<int> freeStagingOutputQueue;
+	std::mutex freeStagingOutputMutex;
+	std::condition_variable freeStagingOutputCV;
+	std::unique_ptr<std::atomic<bool>[]> stagingInUse;  // Double-free guard (atomics can't go in vector)
+	int numStagingBuffers = 0;  // Track size of stagingInUse array
+	bool stagingOutputIsCoherent = false;  // Track if staging memory has HOST_COHERENT property
+
 	// Device buffers (device-local)
 	std::vector<VkBuffer> deviceInputBuffers;
 	std::vector<VkDeviceMemory> deviceInputMemory;
@@ -348,6 +356,7 @@ struct VulkanBackend::Impl {
 		int outputSignalLength;
 		uint64_t timelineValue;  // Timeline semaphore value to wait for
 		uint64_t bufferId;       // Buffer ID to restore before callback (output buffer is shared)
+		int stagingBufferIdx;    // Track which staging buffer this work uses (decoupled from commandBufferIdx)
 	};
 	std::queue<PendingWork> pendingWorkQueue;
 	std::mutex pendingWorkMutex;
@@ -448,6 +457,30 @@ struct VulkanBackend::Impl {
 			}
 
 
+			// ============================================
+			// Release Input Buffer Immediately
+			// ============================================
+			// CRITICAL: With decoupled staging buffer pool, input buffer can be released immediately
+			// after GPU completion, allowing command buffer slot reuse independent of consumer speed
+			{
+				std::lock_guard<std::mutex> lock(this->freeQueueMutex);
+				this->freeBuffersQueue.push(work.inputBuffer);
+			}
+			this->freeQueueCV.notify_one();
+
+			// ============================================
+			// Memory Coherency (Non-Coherent Memory Support)
+			// ============================================
+			// If staging memory is not coherent, invalidate mapped memory before consumers read
+			if (!this->stagingOutputIsCoherent) {
+				VkMappedMemoryRange range = {};
+				range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+				range.memory = this->stagingOutputMemory[work.stagingBufferIdx];
+				range.offset = 0;
+				range.size = work.outputSize;
+				vkInvalidateMappedMemoryRanges(this->device, 1, &range);
+			}
+
 			// If background recording was requested, copy the recorded profile from staging buffer
 			if (this->postProcessBackgroundRecordingRequested) {
 				size_t bgProfileSize = work.outputSignalLength;  // Number of floats in background profile
@@ -465,14 +498,11 @@ struct VulkanBackend::Impl {
 				this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
 			}
 
-			// Store input buffer for deferred release BEFORE callback to avoid race condition
-			// OutputBufferManager will call releaseOutputBuffer() when all consumers are done
-			// NOTE: Do NOT return input buffer here - it would allow the CB slot to be reused
-			// while consumers still hold references to the output buffer
-			this->pendingInputBufferRelease[work.commandBufferIdx] = work.inputBuffer;
-
+			// ============================================
+			// Invoke Callback (Output Now Safe to Read)
+			// ============================================
 			// Restore buffer ID and invoke callback if registered
-			// Buffer ID must be restored because output buffer is shared between frames using same CB
+			// Buffer ID must be restored because output buffer is shared between frames
 			work.outputBuffer->setBufferId(work.bufferId);
 			if (this->callback) {
 				this->callback(*work.outputBuffer);
@@ -487,8 +517,10 @@ struct VulkanBackend::Impl {
 	// Called when commandBuffersValid is false (first run or after config change)
 	void recordAllCommandBuffers();
 
-	// Record D2H transfer command buffers (separate from compute for bidirectional DMA)
-	void recordD2hTransferCommandBuffers();
+	// Record D2H transfer command buffer (dynamic, supports decoupled staging buffer pool)
+	// Records a single D2H transfer command buffer to copy from deviceProcessedBuffers[commandBufferIdx]
+	// to stagingOutputBuffers[stagingBufferIdx]
+	void recordD2hTransferCommandBuffer(int commandBufferIdx, int stagingBufferIdx, size_t outputSize);
 
 	// Debug utils helpers
 	void initDebugUtils();
@@ -1111,73 +1143,88 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                     1, &d2hReleaseBarrier,
 	                     0, nullptr);
 
-	// D2H transfer is now handled by separate D2H command buffer (see recordD2hTransferCommandBuffers)
+	// D2H transfer is now handled dynamically in process() with recordD2hTransferCommandBuffer()
 
 	checkVulkanErrors(vkEndCommandBuffer(cmd));
 	}  // End of loop through all command buffers
 
-	// Record D2H transfer command buffers
-	this->recordD2hTransferCommandBuffers();
+	// D2H command buffers are now recorded dynamically in process() to support decoupled staging buffer pool
 
 	this->commandBuffersValid = true;
 }
 
-void VulkanBackend::Impl::recordD2hTransferCommandBuffers() {
-	int outputSignalLength = this->signalLength / 2;
-	size_t outputSize = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
+// Dynamic D2H command buffer recording (supports decoupled staging buffer pool)
+// Records a single D2H transfer command buffer to copy from deviceProcessedBuffers[commandBufferIdx]
+// to stagingOutputBuffers[stagingBufferIdx]
+void VulkanBackend::Impl::recordD2hTransferCommandBuffer(int commandBufferIdx, int stagingBufferIdx, size_t outputSize) {
+	// Bounds check
+	size_t outputSignalLength = this->signalLength / 2;
+	size_t stagingCapacity = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
+	if (outputSize > stagingCapacity) {
+		throw std::runtime_error("Output size exceeds staging buffer capacity");
+	}
+
+	// Verify 4-byte alignment (floats are always aligned, but verify anyway)
+	if (outputSize % 4 != 0) {
+		throw std::runtime_error("Output size not 4-byte aligned: " + std::to_string(outputSize));
+	}
+
+	VkCommandBuffer d2hCmd = this->d2hTransferCommandBuffers[commandBufferIdx];
+
+	// Reset command buffer before re-recording (required by Vulkan spec)
+	// SAFETY: This is safe because command buffer slot reuse gates ensure the GPU is done with
+	// the previous submission before we call this function (timeline semaphore signaled)
+	vkResetCommandBuffer(d2hCmd, 0);
 
 	VkCommandBufferBeginInfo beginInfo = {};
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	beginInfo.flags = 0;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;  // Re-recorded every time
 
-	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
-		VkCommandBuffer d2hCmd = this->d2hTransferCommandBuffers[idx];
+	checkVulkanErrors(vkBeginCommandBuffer(d2hCmd, &beginInfo));
 
-		// Reset command buffer before re-recording (required by Vulkan spec)
-		vkResetCommandBuffer(d2hCmd, 0);
+	// Acquire barrier (for queue family ownership transfer) only if different queue families
+	// useSeparateTransferQueue means transfer queue is in a DIFFERENT family from compute
+	// useBidirectionalTransfer can be true even with same-family multi-queue (no ownership transfer needed)
+	if (this->useSeparateTransferQueue) {
+		VkBufferMemoryBarrier acquireBarrier = {};
+		acquireBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		acquireBarrier.srcAccessMask = 0;  // Acquire barrier
+		acquireBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		acquireBarrier.srcQueueFamilyIndex = this->queueFamilyIndex;  // From compute
+		acquireBarrier.dstQueueFamilyIndex = this->transferQueueFamilyIndex;  // To D2H queue
+		acquireBarrier.buffer = this->deviceProcessedBuffers[commandBufferIdx];
+		acquireBarrier.offset = 0;
+		acquireBarrier.size = VK_WHOLE_SIZE;
 
-		checkVulkanErrors(vkBeginCommandBuffer(d2hCmd, &beginInfo));
-
-		// Acquire barrier (for queue family ownership transfer) only if different queue families
-		// useSeparateTransferQueue means transfer queue is in a DIFFERENT family from compute
-		// useBidirectionalTransfer can be true even with same-family multi-queue (no ownership transfer needed)
-		if (this->useSeparateTransferQueue) {
-			VkBufferMemoryBarrier acquireBarrier = {};
-			acquireBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			acquireBarrier.srcAccessMask = 0;  // Acquire barrier
-			acquireBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			acquireBarrier.srcQueueFamilyIndex = this->queueFamilyIndex;  // From compute
-			acquireBarrier.dstQueueFamilyIndex = this->transferQueueFamilyIndex;  // To D2H queue
-			acquireBarrier.buffer = this->deviceProcessedBuffers[idx];
-			acquireBarrier.offset = 0;
-			acquireBarrier.size = VK_WHOLE_SIZE;
-
-			vkCmdPipelineBarrier(d2hCmd,
-			                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                     0,
-			                     0, nullptr,
-			                     1, &acquireBarrier,
-			                     0, nullptr);
-		}
-
-		// D2H copy: device processed buffer → staging output buffer
-		VkBufferCopy copyRegion = {};
-		copyRegion.srcOffset = 0;
-		copyRegion.dstOffset = 0;
-		copyRegion.size = outputSize;
-
-		// Balanced label for D2H copy
-		char labelName[128];
-		snprintf(labelName, sizeof(labelName),
-		         "D2H copy idx=%d dst=stagingOutput[%d] src=deviceProcessed[%d] size=%zu offset=%zu",
-		         idx, idx, idx, (size_t)copyRegion.size, (size_t)copyRegion.dstOffset);
-		bool began = this->beginLabel(d2hCmd, labelName);
-		vkCmdCopyBuffer(d2hCmd, this->deviceProcessedBuffers[idx], this->stagingOutputBuffers[idx], 1, &copyRegion);
-		this->endLabel(d2hCmd, began);
-
-		checkVulkanErrors(vkEndCommandBuffer(d2hCmd));
+		vkCmdPipelineBarrier(d2hCmd,
+		                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &acquireBarrier,
+		                     0, nullptr);
 	}
+
+	// D2H copy: device processed buffer → staging output buffer
+	// KEY CHANGE: stagingBufferIdx is now decoupled from commandBufferIdx
+	VkBufferCopy copyRegion = {};
+	copyRegion.srcOffset = 0;
+	copyRegion.dstOffset = 0;
+	copyRegion.size = outputSize;  // Dynamic size (validated above)
+
+	// Balanced label for D2H copy
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "D2H copy cmdIdx=%d staging=%d src=deviceProcessed[%d] size=%zu",
+	         commandBufferIdx, stagingBufferIdx, commandBufferIdx, (size_t)copyRegion.size);
+	bool began = this->beginLabel(d2hCmd, labelName);
+	vkCmdCopyBuffer(d2hCmd,
+	                this->deviceProcessedBuffers[commandBufferIdx],  // Source: per-CB device buffer
+	                this->stagingOutputBuffers[stagingBufferIdx],    // Dest: from free pool
+	                1, &copyRegion);
+	this->endLabel(d2hCmd, began);
+
+	checkVulkanErrors(vkEndCommandBuffer(d2hCmd));
 }
 
 // ============================================
@@ -1800,18 +1847,24 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
 	}
 
-	// Allocate output buffers (one per command buffer)
+	// Allocate output buffers (decoupled from command buffer slots)
 	// Output is truncated to half signal length after FFT
 	int outputSignalLength = this->impl->signalLength / 2;
 	size_t outputSamplesPerBuffer = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
 	size_t outputSize = outputSamplesPerBuffer * sizeof(float);  // Output is always float
-	this->impl->outputBuffers.resize(this->impl->numCommandBuffers);
-	this->impl->pendingInputBufferRelease.resize(this->impl->numCommandBuffers, nullptr);
 
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		this->impl->outputBuffers[i].setBackendIndex(i);
+	// Determine actual number of output buffers (like CUDA backend)
+	int actualNumOutputBuffers = (this->impl->numOutputBuffers > 0)
+		? this->impl->numOutputBuffers
+		: (this->impl->numCommandBuffers * 2);
+
+	this->impl->outputBuffers.resize(actualNumOutputBuffers);
+	this->impl->pendingInputBufferRelease.resize(actualNumOutputBuffers, nullptr);
+
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		this->impl->outputBuffers[i].setBackendIndex(i);  // i = stagingBufferIdx (NOT commandBufferIdx)
 		this->impl->outputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
-		this->impl->outputBuffers[i].setExternalMemory(this->impl->stagingOutputMapped[i], outputSize);
+		// Memory will be set dynamically in process() after acquiring staging buffer
 	}
 
 	// Pre-record all command buffers for maximum performance
@@ -2051,10 +2104,39 @@ void VulkanBackend::process(IOBuffer& input) {
 	// is done in getNextAvailableInputBuffer() before user writes to buffer.
 	// User's data is already in staging buffer - no memcpy needed.
 
-	// Get output buffer for this command buffer
+	// ============================================
+	// Acquire Free Staging Output Buffer
+	// ============================================
+	// Wait for a free staging buffer from the decoupled pool (like CUDA backend)
+	int stagingBufferIdx;
+	{
+		std::unique_lock<std::mutex> lock(this->impl->freeStagingOutputMutex);
+		this->impl->freeStagingOutputCV.wait(lock, [this]() {
+			return this->impl->shuttingDown.load(std::memory_order_acquire) ||
+			       !this->impl->freeStagingOutputQueue.empty();
+		});
+
+		if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+			throw std::runtime_error("Backend shutting down");
+		}
+
+		stagingBufferIdx = this->impl->freeStagingOutputQueue.front();
+		this->impl->freeStagingOutputQueue.pop();
+
+		// Mark as in-use (double-acquire guard)
+		if (this->impl->stagingInUse[stagingBufferIdx].exchange(true, std::memory_order_acq_rel)) {
+			throw std::runtime_error("Double-acquire of staging buffer " + std::to_string(stagingBufferIdx));
+		}
+	}
+
+	// Get output buffer and configure it to point to acquired staging memory
 	// Note: Don't set bufferId here - it would race with consumer threads reading it
 	// The completion thread restores bufferId from work.bufferId before callback
-	IOBuffer* outputBuf = &this->impl->outputBuffers[idx];
+	IOBuffer* outputBuf = &this->impl->outputBuffers[stagingBufferIdx];
+	int outputSignalLength = this->impl->signalLength / 2;
+	size_t outputSize = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer * sizeof(float);
+	outputBuf->setBackendIndex(stagingBufferIdx);  // Ensure index matches staging buffer
+	outputBuf->setExternalMemory(this->impl->stagingOutputMapped[stagingBufferIdx], outputSize);
 
 	// Record all command buffers if needed (first call, after config change, or after bg capture)
 	// Re-recording and submission are both protected by submitMutex
@@ -2063,8 +2145,6 @@ void VulkanBackend::process(IOBuffer& input) {
 		this->impl->recordAllCommandBuffers();
 		cmd = this->impl->commandBuffers[idx];  // Restore cmd to current frame buffer
 	}
-
-	int outputSignalLength = this->impl->signalLength / 2;
 
 	// ============================================
 	// Submit Transfer and Compute Command Buffers
@@ -2157,15 +2237,22 @@ void VulkanBackend::process(IOBuffer& input) {
 	          << " src=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]
 	          << " dst=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]);
 
+	// ============================================
+	// Record D2H Transfer Command Buffer Dynamically
+	// ============================================
+	// Record the D2H command buffer to copy from deviceProcessed[idx] to stagingOutput[stagingBufferIdx]
+	// This is safe because command buffer slot reuse gates ensure GPU is done with previous submission
+	this->impl->recordD2hTransferCommandBuffer(idx, stagingBufferIdx, outputSize);
+	VkCommandBuffer d2hCmd = this->impl->d2hTransferCommandBuffers[idx];
+
 	// Submit D2H transfer command buffer. signals timeline semaphore for ordered completion
 	// D2H waits on: compute complete
 	// D2H signals: timeline semaphore (for completion thread ordering)
-	VkCommandBuffer d2hCmd = this->impl->d2hTransferCommandBuffers[idx];
 
 	// Determine if we need to wait for previous write to this staging buffer
-	uint64_t stagingReuseWaitValue = this->impl->stagingLastWriteValue[idx];
+	uint64_t stagingReuseWaitValue = this->impl->stagingLastWriteValue[stagingBufferIdx];  // Use stagingBufferIdx, not idx
 	bool needStagingWait = (stagingReuseWaitValue > 0);
-	VKDBG_LOG("[D2H DEBUG] idx=" << idx << " signal=" << signalValue << " waitValue=" << stagingReuseWaitValue << " needWait=" << needStagingWait);
+	VKDBG_LOG("[D2H DEBUG] cmdIdx=" << idx << " stagingIdx=" << stagingBufferIdx << " signal=" << signalValue << " waitValue=" << stagingReuseWaitValue << " needWait=" << needStagingWait);
 
 	// Setup wait values: [binary_semaphore_value, timeline_wait_value (if needed)]
 	uint64_t d2hWaitValues[2] = {0, stagingReuseWaitValue};
@@ -2206,13 +2293,14 @@ void VulkanBackend::process(IOBuffer& input) {
 	this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 
 	VkResult submitResult = vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence);
-	VKDBG_LOG("[D2H SUBMIT] idx=" << idx
+	VKDBG_LOG("[D2H SUBMIT] cmdIdx=" << idx
+	          << " stagingIdx=" << stagingBufferIdx
 	          << " cmd=" << d2hCmd
 	          << " signalValue=" << signalValue
 	          << " waitValue=" << stagingReuseWaitValue
 	          << " needWait=" << needStagingWait
 	          << " src=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]
-	          << " dst=stagingOutput[" << idx << "]=" << this->impl->stagingOutputBuffers[idx]);
+	          << " dst=stagingOutput[" << stagingBufferIdx << "]=" << this->impl->stagingOutputBuffers[stagingBufferIdx]);
 	if (submitResult == VK_ERROR_DEVICE_LOST) {
 		std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkQueueSubmit - GPU crashed (likely shader OOB) !!!" << std::endl;
 	}
@@ -2221,27 +2309,27 @@ void VulkanBackend::process(IOBuffer& input) {
 	this->impl->nextOutputSignalValue++;
 
 	// Update per-buffer reuse guard: this staging buffer was last written at signalValue
-	this->impl->stagingLastWriteValue[idx] = signalValue;
+	this->impl->stagingLastWriteValue[stagingBufferIdx] = signalValue;  // Use stagingBufferIdx, not idx
 
 	// Queue work for async completion (completion thread will wait on timeline semaphore and invoke callback)
 	// This enables true async overlap: process() returns immediately, allowing next frame to start
-	size_t outputSize = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer * sizeof(float);
 	{
 		std::lock_guard<std::mutex> lock(this->impl->pendingWorkMutex);
 		this->impl->pendingWorkQueue.push({
 			fence,
-			idx,
+			idx,                   // Command buffer index (for fence/timeline tracking)
 			outputBuf,
 			&input,                // Zero-copy: return input buffer to free queue after callback
 			outputSize,
 			outputSignalLength,
 			signalValue,           // Timeline semaphore value for this frame
-			input.getBufferId()    // Save buffer ID (output buffer is shared between frames using same CB)
+			input.getBufferId(),   // Save buffer ID (output buffer is shared between frames)
+			stagingBufferIdx       // NEW: track which staging buffer this work uses (decoupled from commandBufferIdx)
 		});
 	}
 	this->impl->pendingWorkCV.notify_one();  // Wake completion thread
 
-	// Track which timeline value was used by this CB (for staging buffer protection)
+	// Track which timeline value was used by this CB (for slot reuse protection)
 	this->impl->lastTimelineValuePerCB[idx] = signalValue;
 }
 
@@ -2650,23 +2738,31 @@ int VulkanBackend::getOutputBufferCount() const {
 void VulkanBackend::releaseOutputBuffer(IOBuffer* buffer) {
 	if (!buffer) return;
 
-	int idx = buffer->getBackendIndex();
-	if (idx < 0 || idx >= static_cast<int>(this->impl->pendingInputBufferRelease.size())) {
+	// Get staging buffer index (decoupled from command buffer index)
+	int stagingBufferIdx = buffer->getBackendIndex();
+	if (stagingBufferIdx < 0 || stagingBufferIdx >= this->impl->numStagingBuffers) {
 		return;
 	}
 
-	// Get the input buffer that was waiting for this release
-	IOBuffer* inputBuffer = this->impl->pendingInputBufferRelease[idx];
-	if (inputBuffer) {
-		this->impl->pendingInputBufferRelease[idx] = nullptr;
+	// ============================================
+	// Return Staging Buffer to Free Queue
+	// ============================================
+	// NEW POLICY: Input buffers are released in completion thread, NOT here
+	// This function ONLY returns the staging buffer to the free pool
+	{
+		std::lock_guard<std::mutex> lock(this->impl->freeStagingOutputMutex);
 
-		// Return input buffer to free queue - now safe to reuse this CB slot
-		{
-			std::lock_guard<std::mutex> lock(this->impl->freeQueueMutex);
-			this->impl->freeBuffersQueue.push(inputBuffer);
+		// Safety: check if already released (double-free guard)
+		if (!this->impl->stagingInUse[stagingBufferIdx].load(std::memory_order_acquire)) {
+			std::cerr << "WARNING: Double release of staging buffer " << stagingBufferIdx << std::endl;
+			return;
 		}
-		this->impl->freeQueueCV.notify_one();
+
+		// Mark as not in use and return to free queue
+		this->impl->stagingInUse[stagingBufferIdx].store(false, std::memory_order_release);
+		this->impl->freeStagingOutputQueue.push(stagingBufferIdx);
 	}
+	this->impl->freeStagingOutputCV.notify_one();
 }
 
 // ============================================
@@ -3140,31 +3236,67 @@ void VulkanBackend::allocateDeviceBuffers() {
 		vkMapMemory(this->impl->device, this->impl->stagingInputMemory[i], 0, inputSize, 0, &this->impl->stagingInputMapped[i]);
 	}
 
-	// Allocate staging output buffers
-	this->impl->stagingOutputBuffers.resize(this->impl->numCommandBuffers);
-	this->impl->stagingOutputMemory.resize(this->impl->numCommandBuffers);
-	this->impl->stagingOutputMapped.resize(this->impl->numCommandBuffers);
-	this->impl->stagingLastWriteValue.resize(this->impl->numCommandBuffers, 0);  // Initialize to 0 (no previous write)
+	// Allocate staging output buffers (decoupled pool, larger than command buffer count)
+	// Determine actual number of output buffers (like CUDA backend)
+	int actualNumOutputBuffers = (this->impl->numOutputBuffers > 0)
+		? this->impl->numOutputBuffers
+		: (this->impl->numCommandBuffers * 2);
 
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		// Try to allocate with cached memory for fast CPU reads (60x faster than uncached!)
+	this->impl->stagingOutputBuffers.resize(actualNumOutputBuffers);
+	this->impl->stagingOutputMemory.resize(actualNumOutputBuffers);
+	this->impl->stagingOutputMapped.resize(actualNumOutputBuffers);
+	this->impl->stagingLastWriteValue.resize(actualNumOutputBuffers, 0);  // Initialize to 0 (no previous write)
+
+	// Initialize stagingInUse atomic bools (unique_ptr array because atomics can't go in vector)
+	this->impl->numStagingBuffers = actualNumOutputBuffers;
+	this->impl->stagingInUse.reset(new std::atomic<bool>[actualNumOutputBuffers]);
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		this->impl->stagingInUse[i].store(false, std::memory_order_relaxed);
+	}
+
+	// Track whether we successfully allocated with coherent memory (for flexible platform support)
+	bool allocatedCoherent = true;
+
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		// Try to allocate with cached + coherent memory for fast CPU reads (60x faster than uncached!)
 		// HOST_CACHED + HOST_COHERENT = best of both worlds: fast reads + automatic sync
-		// Fallback to non-cached if cached memory is not available on this platform
+		// Fallback to non-coherent if coherent memory is not available on this platform
+		bool bufferIsCoherent = false;
 		try {
 			createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
 			             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
 			             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+			bufferIsCoherent = true;
 		} catch (const std::runtime_error&) {
-			// HOST_CACHED not available - fall back to non-cached (slower reads but still functional)
-			createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
-			             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+			// HOST_CACHED not available - try non-cached coherent
+			try {
+				createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+				             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+				bufferIsCoherent = true;
+			} catch (const std::runtime_error&) {
+				// HOST_COHERENT not available - fall back to non-coherent (requires manual invalidation)
+				createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+				             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+				             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+				bufferIsCoherent = false;
+				allocatedCoherent = false;
+			}
 		}
 
 		// Map staging buffer memory
 		vkMapMemory(this->impl->device, this->impl->stagingOutputMemory[i], 0, outputSize, 0, &this->impl->stagingOutputMapped[i]);
+	}
+
+	// Track coherency status for completion thread (determines if vkInvalidateMappedMemoryRanges needed)
+	this->impl->stagingOutputIsCoherent = allocatedCoherent;
+
+	// Initialize free staging output buffer queue
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		this->impl->freeStagingOutputQueue.push(i);
 	}
 
 	// Allocate device-local buffers (for computation)
