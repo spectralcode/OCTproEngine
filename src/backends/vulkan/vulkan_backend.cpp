@@ -1,5 +1,8 @@
 #include "vulkan_backend.h"
 
+//#define VULKAN_DEBUG_LOGGING  // Uncomment to enable debug output
+
+
 //	VkFFT backend selection: 0 = Vulkan
 #define VKFFT_BACKEND 0
 #include <vkFFT/vkFFT.h>
@@ -44,6 +47,15 @@
 			throw std::runtime_error(ss.str()); \
 		} \
 	} while(0)
+
+// Unified debug macro (controls logging + validation + debug utils extension)
+//#define VULKAN_DEBUG  // Uncomment to enable debug output and Vulkan validation
+#ifdef VULKAN_DEBUG
+	#include <iostream>
+	#define VKDBG_LOG(x) do { std::cout << x << std::endl; } while (0)
+#else
+	#define VKDBG_LOG(x) do { } while (0)
+#endif
 
 namespace ope {
 
@@ -346,6 +358,7 @@ struct VulkanBackend::Impl {
 	// Shutdown synchronization (prevents race conditions during cleanup)
 	std::atomic<bool> shuttingDown{false};      // Prevents new work submission during shutdown
 	std::atomic<int> pendingWorkCount{0};       // Tracks in-flight work for graceful draining
+	std::atomic<bool> cleanupDone{false};       // Idempotency guard: prevents double-destroy crashes
 	std::mutex submitMutex;                     // Protects ALL Vulkan handle access and lifetime (critical for shutdown safety)
 
 	// Diagnostic sequence tracking
@@ -519,10 +532,10 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	auto logBindDS = [&](const char* tag, VkCommandBuffer cmd, VkDescriptorSet set)
 	{
 		uint32_t seq = this->diagSeq.fetch_add(1);
-		std::cout << "[" << seq << "] [DS BIND] " << tag
+		VKDBG_LOG("[" << seq << "] [DS BIND] " << tag
 			<< " cmd=" << std::hex << (uint64_t)cmd
 			<< " set=" << (uint64_t)set
-			<< std::dec << std::endl;
+			<< std::dec);
 	};
 
 	// Loop through and record ALL command buffers (not just current frame's buffer)
@@ -1228,6 +1241,7 @@ void VulkanBackend::Impl::updateDescriptorSetsTagged(
 	uint32_t writeCount,
 	const VkWriteDescriptorSet* writes)
 {
+#ifdef VULKAN_DEBUG_LOGGING
 	uint32_t seq = diagSeq.fetch_add(1);
 	std::cout << "[" << seq << "] [DS UPDATE] " << tag
 		<< " writeCount=" << writeCount;
@@ -1239,20 +1253,21 @@ void VulkanBackend::Impl::updateDescriptorSetsTagged(
 	}
 
 	std::cout << std::endl;
+#endif
 	vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
 }
 
 void VulkanBackend::Impl::logRecordPoint(const char* tag)
 {
 	uint32_t seq = diagSeq.fetch_add(1);
-	std::cout << "[" << seq << "] [RECORD] " << tag << std::endl;
+	VKDBG_LOG("[" << seq << "] [RECORD] " << tag);
 }
 
 void VulkanBackend::Impl::logPoolOp(const char* op, VkDescriptorPool pool)
 {
 	uint32_t seq = diagSeq.fetch_add(1);
-	std::cout << "[" << seq << "] [POOL " << op << "] "
-		<< std::hex << (uint64_t)pool << std::dec << std::endl;
+	VKDBG_LOG("[" << seq << "] [POOL " << op << "] "
+		<< std::hex << (uint64_t)pool << std::dec);
 }
 
 // ============================================
@@ -1361,64 +1376,111 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 	instanceCreateInfo.pApplicationInfo = &appInfo;
 
-	// Enable validation layers and debug utils extension
-	const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
-	const char* instanceExtensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
-
-	instanceCreateInfo.enabledLayerCount = 1;
-	instanceCreateInfo.ppEnabledLayerNames = validationLayers;
-	instanceCreateInfo.enabledExtensionCount = 1;
-	instanceCreateInfo.ppEnabledExtensionNames = instanceExtensions;
-
-	// Setup debug messenger (will catch messages during vkCreateInstance too)
+	// Conditional validation layer and debug utils extension setup
+	std::vector<const char*> layers;
+	std::vector<const char*> exts;
 	VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
-	debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
-	debugCreateInfo.messageSeverity =
-		VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-		VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-	debugCreateInfo.messageType =
-		VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-		VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-		VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-	debugCreateInfo.pfnUserCallback = debugCallback;
-
-	// Enable synchronization validation (critical for catching semaphore/queue bugs!)
 	VkValidationFeaturesEXT validationFeatures{};
-	validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
 	VkValidationFeatureEnableEXT enables[] = {
 		VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
 		VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT
 	};
-	validationFeatures.enabledValidationFeatureCount = 2;
-	validationFeatures.pEnabledValidationFeatures = enables;
+	bool willEnableValidation = false;
 
-	// Chain pNext so we catch messages during vkCreateInstance
-	validationFeatures.pNext = &debugCreateInfo;
-	instanceCreateInfo.pNext = &validationFeatures;
+#ifdef VULKAN_DEBUG
+	// Enumerate available layers
+		uint32_t layerCount = 0;
+		vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+		std::vector<VkLayerProperties> availableLayers(layerCount);
+		vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
 
-	VkResult instanceResult = vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance);
-	if (instanceResult == VK_ERROR_LAYER_NOT_PRESENT || instanceResult == VK_ERROR_EXTENSION_NOT_PRESENT) {
-		std::cerr << "WARNING: Vulkan validation layers/extensions not available - running without validation" << std::endl;
-		std::cerr.flush();
-		// Retry without validation
-		instanceCreateInfo.enabledLayerCount = 0;
-		instanceCreateInfo.ppEnabledLayerNames = nullptr;
-		instanceCreateInfo.enabledExtensionCount = 0;
-		instanceCreateInfo.ppEnabledExtensionNames = nullptr;
-		instanceCreateInfo.pNext = nullptr;
-		checkVulkanErrors(vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance));
-	} else {
-		checkVulkanErrors(instanceResult);
-		// Create debug messenger
-		VkResult messengerResult = CreateDebugUtilsMessengerEXT(this->impl->instance, &debugCreateInfo, nullptr, &this->impl->debugMessenger);
-		if (messengerResult == VK_SUCCESS) {
-			std::cerr << "Vulkan validation layers + sync validation enabled" << std::endl;
-			this->impl->debugUtilsEnabled = true;  // Enable debug utils naming and labeling
-		} else {
-			std::cerr << "Vulkan validation layers enabled (but messenger creation failed)" << std::endl;
+		// Check if validation layer is available
+		bool hasValidation = false;
+		for (const auto& layer : availableLayers) {
+			if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+				hasValidation = true;
+				break;
+			}
 		}
-		std::cerr.flush();
-	}
+
+		if (hasValidation) {
+			layers.push_back("VK_LAYER_KHRONOS_validation");
+		}
+
+		// Enumerate and check debug utils extension
+		uint32_t extCount = 0;
+		vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
+		std::vector<VkExtensionProperties> availableExts(extCount);
+		vkEnumerateInstanceExtensionProperties(nullptr, &extCount, availableExts.data());
+
+		bool hasDebugUtils = false;
+		for (const auto& ext : availableExts) {
+			if (strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+				hasDebugUtils = true;
+				break;
+			}
+		}
+
+		if (hasDebugUtils) {
+			exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		}
+
+		// Only set up debug structs if we have both validation layer and debug utils
+		willEnableValidation = hasValidation && hasDebugUtils;
+
+		if (willEnableValidation) {
+			// Setup debug messenger (will catch messages during vkCreateInstance too)
+			debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+			debugCreateInfo.messageSeverity =
+				VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+			debugCreateInfo.messageType =
+				VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+			debugCreateInfo.pfnUserCallback = debugCallback;
+
+			// Enable synchronization validation (critical for catching semaphore/queue bugs!)
+			validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+			validationFeatures.enabledValidationFeatureCount = 2;
+			validationFeatures.pEnabledValidationFeatures = enables;
+
+			// Chain pNext so we catch messages during vkCreateInstance
+			validationFeatures.pNext = &debugCreateInfo;
+			instanceCreateInfo.pNext = &validationFeatures;
+		} else {
+			instanceCreateInfo.pNext = nullptr;
+			if (!hasValidation) {
+				std::cerr << "WARNING: Vulkan validation layer not available - running without validation" << std::endl;
+			}
+			if (!hasDebugUtils) {
+				std::cerr << "WARNING: Vulkan debug utils extension not available" << std::endl;
+			}
+		}
+#else
+	instanceCreateInfo.pNext = nullptr;
+#endif
+
+	instanceCreateInfo.enabledLayerCount = static_cast<uint32_t>(layers.size());
+	instanceCreateInfo.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+	instanceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+	instanceCreateInfo.ppEnabledExtensionNames = exts.empty() ? nullptr : exts.data();
+
+	// Create instance
+	checkVulkanErrors(vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance));
+
+	// Create debug messenger if validation is enabled
+#ifdef VULKAN_DEBUG
+	if (willEnableValidation) {
+			VkResult messengerResult = CreateDebugUtilsMessengerEXT(this->impl->instance, &debugCreateInfo, nullptr, &this->impl->debugMessenger);
+			if (messengerResult == VK_SUCCESS) {
+				VKDBG_LOG("Vulkan validation layers + sync validation enabled");
+				this->impl->debugUtilsEnabled = true;  // Enable debug utils naming and labeling
+			} else {
+				VKDBG_LOG("Vulkan validation enabled (messenger creation failed)");
+			}
+		}
+#endif
 
 	// Select physical device
 	uint32_t deviceCount = 0;
@@ -1572,17 +1634,17 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 			if (computeFamilyQueueCount >= 3) {
 				// Use queue 2 for D2H transfers (full bidirectional)
 				vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 2, &this->impl->d2hTransferQueue);
-				std::cout << "[VulkanBackend] Bidirectional DMA: 3 queues from compute family (compute + H2D + D2H)" << std::endl;
+				VKDBG_LOG("[VulkanBackend] Bidirectional DMA: 3 queues from compute family (compute + H2D + D2H)");
 			} else {
 				// Only 2 queues - share queue 1 for both H2D and D2H
 				this->impl->d2hTransferQueue = this->impl->transferQueue;
-				std::cout << "[VulkanBackend] DMA: 2 queues from compute family (compute + transfers)" << std::endl;
+				VKDBG_LOG("[VulkanBackend] DMA: 2 queues from compute family (compute + transfers)");
 			}
 		} else {
 			// Only 1 queue - everything serialized (worst case)
 			this->impl->transferQueue = this->impl->computeQueue;
 			this->impl->d2hTransferQueue = this->impl->computeQueue;
-			std::cout << "[VulkanBackend] Warning: Only 1 queue available - all operations serialized" << std::endl;
+			VKDBG_LOG("[VulkanBackend] Warning: Only 1 queue available - all operations serialized");
 		}
 	}
 
@@ -1778,23 +1840,27 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 }
 
 void VulkanBackend::cleanup() {
-	std::cerr << "[CLEANUP] Starting cleanup..." << std::endl;
-	std::cerr.flush();
+	// Atomic exchange: returns OLD value and sets to true
+	// If OLD was true, cleanup already ran -> return immediately
+	// IMPORTANT: Guard BEFORE taking any mutex so second call returns immediately
+	if (this->impl->cleanupDone.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+
+	VKDBG_LOG("[CLEANUP] Starting cleanup...");
 	if (!this->impl->vulkanInitialized) {
 		return;
 	}
 
 	// Signal shutdown and wake ALL blocked threads
-	std::cerr << "[CLEANUP] Setting shuttingDown flag, pendingWorkCount=" << this->impl->pendingWorkCount.load() << std::endl;
-	std::cerr.flush();
+	VKDBG_LOG("[CLEANUP] Setting shuttingDown flag, pendingWorkCount=" << this->impl->pendingWorkCount.load());
 	this->impl->shuttingDown.store(true, std::memory_order_release);
 	this->impl->completionThreadRunning.store(false, std::memory_order_release);  // Prevent new waits
 	this->impl->freeQueueCV.notify_all();      // Wake threads in getNextAvailableInputBuffer()
 	this->impl->pendingWorkCV.notify_all();    // Wake completion thread
 
 	// Lock submitMutex and wait for GPU (BEFORE joining thread!)
-	std::cerr << "[CLEANUP] Acquiring submitMutex and waiting for GPU..." << std::endl;
-	std::cerr.flush();
+	VKDBG_LOG("[CLEANUP] Acquiring submitMutex and waiting for GPU...");
 	{
 		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
@@ -1813,16 +1879,14 @@ void VulkanBackend::cleanup() {
 
 	// NOW stop completion thread safely
 	// All timeline values are signaled, OR thread will exit via timeout + shuttingDown check
-	std::cerr << "[CLEANUP] Stopping completion thread..." << std::endl;
-	std::cerr.flush();
+	VKDBG_LOG("[CLEANUP] Stopping completion thread...");
 	if (this->impl->completionThread.joinable()) {
 		this->impl->pendingWorkCV.notify_all();  // Final wake
 		this->impl->completionThread.join();     // Won't hang (timeout-based wait)
 	}
 
 	// Drain pending work and destroy resources
-	std::cerr << "[CLEANUP] Draining pending work and destroying resources..." << std::endl;
-	std::cerr.flush();
+	VKDBG_LOG("[CLEANUP] Draining pending work and destroying resources...");
 	{
 		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
@@ -1858,8 +1922,7 @@ void VulkanBackend::cleanup() {
 
 		// Destroy resources while still holding submitMutex
 		// This prevents any thread from entering process() and touching Vulkan handles during destruction
-		std::cerr << "[CLEANUP] Destroying Vulkan resources..." << std::endl;
-		std::cerr.flush();
+		VKDBG_LOG("[CLEANUP] Destroying Vulkan resources...");
 
 		// Destroy VkFFT apps (one per command buffer slot)
 		for (size_t i = 0; i < this->impl->vkfftApps.size(); ++i)
@@ -1921,11 +1984,13 @@ void VulkanBackend::cleanup() {
 			this->impl->device = VK_NULL_HANDLE;
 		}
 
-		// Destroy debug messenger
+		// Destroy debug messenger (only if debug mode enabled)
+#ifdef VULKAN_DEBUG
 		if (this->impl->debugMessenger != VK_NULL_HANDLE) {
-			DestroyDebugUtilsMessengerEXT(this->impl->instance, this->impl->debugMessenger, nullptr);
-			this->impl->debugMessenger = VK_NULL_HANDLE;
-		}
+				DestroyDebugUtilsMessengerEXT(this->impl->instance, this->impl->debugMessenger, nullptr);
+				this->impl->debugMessenger = VK_NULL_HANDLE;
+			}
+#endif
 
 		// Destroy instance
 		if (this->impl->instance != VK_NULL_HANDLE) {
@@ -1938,8 +2003,7 @@ void VulkanBackend::cleanup() {
 
 	}  // submitMutex released here - all resources destroyed
 
-	std::cerr << "[CLEANUP] Cleanup complete." << std::endl;
-	std::cerr.flush();
+	VKDBG_LOG("[CLEANUP] Cleanup complete.");
 }
 
 // ============================================
@@ -2015,19 +2079,18 @@ void VulkanBackend::process(IOBuffer& input) {
 	uint64_t currentTimelineValue = 0;
 	vkGetSemaphoreCounterValue(this->impl->device, this->impl->outputOrderingSemaphore, &currentTimelineValue);
 
-	std::cout << "[H2D DIAGNOSTIC] idx=" << idx
+	VKDBG_LOG("[H2D DIAGNOSTIC] idx=" << idx
 	          << " slotWaitValue=" << slotWaitValue
 	          << " currentTimeline=" << currentTimelineValue
 	          << " needWait=" << (slotWaitValue > 0)
-	          << " SAFE=" << (currentTimelineValue >= slotWaitValue || slotWaitValue == 0)
-	          << std::endl;
+	          << " SAFE=" << (currentTimelineValue >= slotWaitValue || slotWaitValue == 0));
 
 	// Wait on previous "slot complete" value for this idx (recorded when D2H for this idx was submitted)
 	bool needSlotWait = (slotWaitValue > 0);
 
-	std::cout << "[H2D DEBUG] idx=" << idx
+	VKDBG_LOG("[H2D DEBUG] idx=" << idx
 	          << " slotWaitValue=" << slotWaitValue
-	          << " needWait=" << needSlotWait << std::endl;
+	          << " needWait=" << needSlotWait);
 
 	VkTimelineSemaphoreSubmitInfo h2dTimelineInfo{};
 	VkSubmitInfo transferSubmit{};
@@ -2062,11 +2125,10 @@ void VulkanBackend::process(IOBuffer& input) {
 	transferSubmit.pSignalSemaphores = &transferCompleteSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
-	std::cout << "[H2D SUBMIT] idx=" << idx
+	VKDBG_LOG("[H2D SUBMIT] idx=" << idx
 	          << " cmd=" << transferCmd
 	          << " src=stagingInput[" << idx << "]=" << this->impl->stagingInputBuffers[idx]
-	          << " dst=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]
-	          << std::endl;
+	          << " dst=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]);
 
 	// Submit compute command buffer. signals computeToD2hSemaphore when done
 	// Compute only waits on H2D transfer
@@ -2087,12 +2149,11 @@ void VulkanBackend::process(IOBuffer& input) {
 	computeSubmit.pSignalSemaphores = &computeToD2hSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, VK_NULL_HANDLE));
-	std::cout << "[COMPUTE SUBMIT] idx=" << idx
+	VKDBG_LOG("[COMPUTE SUBMIT] idx=" << idx
 	          << " cmd=" << cmd
 	          << " signalValue=" << signalValue
 	          << " src=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]
-	          << " dst=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]
-	          << std::endl;
+	          << " dst=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]);
 
 	// Submit D2H transfer command buffer. signals timeline semaphore for ordered completion
 	// D2H waits on: compute complete
@@ -2102,7 +2163,7 @@ void VulkanBackend::process(IOBuffer& input) {
 	// Determine if we need to wait for previous write to this staging buffer
 	uint64_t stagingReuseWaitValue = this->impl->stagingLastWriteValue[idx];
 	bool needStagingWait = (stagingReuseWaitValue > 0);
-	std::cout << "[D2H DEBUG] idx=" << idx << " signal=" << signalValue << " waitValue=" << stagingReuseWaitValue << " needWait=" << needStagingWait << std::endl;
+	VKDBG_LOG("[D2H DEBUG] idx=" << idx << " signal=" << signalValue << " waitValue=" << stagingReuseWaitValue << " needWait=" << needStagingWait);
 
 	// Setup wait values: [binary_semaphore_value, timeline_wait_value (if needed)]
 	uint64_t d2hWaitValues[2] = {0, stagingReuseWaitValue};
@@ -2143,14 +2204,13 @@ void VulkanBackend::process(IOBuffer& input) {
 	this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 
 	VkResult submitResult = vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence);
-	std::cout << "[D2H SUBMIT] idx=" << idx
+	VKDBG_LOG("[D2H SUBMIT] idx=" << idx
 	          << " cmd=" << d2hCmd
 	          << " signalValue=" << signalValue
 	          << " waitValue=" << stagingReuseWaitValue
 	          << " needWait=" << needStagingWait
 	          << " src=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]
-	          << " dst=stagingOutput[" << idx << "]=" << this->impl->stagingOutputBuffers[idx]
-	          << std::endl;
+	          << " dst=stagingOutput[" << idx << "]=" << this->impl->stagingOutputBuffers[idx]);
 	if (submitResult == VK_ERROR_DEVICE_LOST) {
 		std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkQueueSubmit - GPU crashed (likely shader OOB) !!!" << std::endl;
 	}
