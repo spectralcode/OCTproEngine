@@ -348,6 +348,9 @@ struct VulkanBackend::Impl {
 	std::atomic<int> pendingWorkCount{0};       // Tracks in-flight work for graceful draining
 	std::mutex submitMutex;                     // Protects ALL Vulkan handle access and lifetime (critical for shutdown safety)
 
+	// Diagnostic sequence tracking
+	std::atomic<uint32_t> diagSeq{0};
+
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
 
@@ -479,6 +482,11 @@ struct VulkanBackend::Impl {
 	void nameObject(VkObjectType type, uint64_t handle, const char* name);
 	bool beginLabel(VkCommandBuffer cmd, const char* text);
 	void endLabel(VkCommandBuffer cmd, bool began);
+
+	// Diagnostic helpers
+	void updateDescriptorSetsTagged(const char* tag, uint32_t writeCount, const VkWriteDescriptorSet* writes);
+	void logRecordPoint(const char* tag);
+	void logPoolOp(const char* op, VkDescriptorPool pool);
 };
 
 // ============================================
@@ -491,6 +499,16 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// Calculate input size (used in all command buffers)
 	size_t inputSize = this->samplesPerBuffer * this->bytesPerSample;
 	uint32_t numWorkgroups = (this->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
+
+	// Diagnostic lambda for logging descriptor set binds
+	auto logBindDS = [&](const char* tag, VkCommandBuffer cmd, VkDescriptorSet set)
+	{
+		uint32_t seq = this->diagSeq.fetch_add(1);
+		std::cout << "[" << seq << "] [DS BIND] " << tag
+			<< " cmd=" << std::hex << (uint64_t)cmd
+			<< " set=" << (uint64_t)set
+			<< std::dec << std::endl;
+	};
 
 	// Loop through and record ALL command buffers (not just current frame's buffer)
 	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
@@ -603,6 +621,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// Bind descriptor set for this command buffer
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->pipelineLayout,
 	                        0, 1, &this->descriptorSets[idx], 0, nullptr);
+	logBindDS("InputConversion", cmd, this->descriptorSets[idx]);
 
 	// Push constants: samplesPerBuffer, inputBitDepth, bytesPerSample
 	uint32_t pushConstants[3] = {
@@ -659,6 +678,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Bind DC removal descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->dcRemovalPipelineLayout,
 		                        0, 1, &this->dcRemovalDescriptorSets[idx], 0, nullptr);
+		logBindDS("DCRemoval", cmd, this->dcRemovalDescriptorSets[idx]);
 
 		// Push constants: rollingAverageWindowSize, signalLength, ascansPerBscan, samplesPerBuffer
 		uint32_t dcPushConstants[4] = {
@@ -704,6 +724,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Bind universal pre-FFT descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->universalPreFFTPipelineLayout,
 		                        0, 1, &this->universalPreFFTDescriptorSets[idx], 0, nullptr);
+		logBindDS("UniversalPreFFT", cmd, this->universalPreFFTDescriptorSets[idx]);
 
 		// Push constants: signalLength, samplesPerBuffer
 		uint32_t universalPushConstants[2] = {
@@ -800,6 +821,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->fpnDeterminationPipelineLayout,
 		                        0, 1, &this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant], 0, nullptr);
+		logBindDS("FPNDetermination", cmd, this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant]);
 
 		// Push constants: width, height, segments, stride, outputSignalLength
 		struct FpnDeterminationPushConstants {
@@ -868,6 +890,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	int postFFTDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->universalPostFFTPipelineLayout,
 	                        0, 1, &this->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant], 0, nullptr);
+	logBindDS("UniversalPostFFT", cmd, this->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant]);
 
 	// Push constants: fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
 	int outputSignalLength = this->signalLength / 2;
@@ -928,6 +951,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Bind background recording descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundRecordingPipelineLayout,
 		                        0, 1, &this->backgroundRecordingDescriptorSets[idx], 0, nullptr);
+		logBindDS("BackgroundRecording", cmd, this->backgroundRecordingDescriptorSets[idx]);
 
 		// Push constants: samplesPerAscan, ascansPerBuffer
 		struct BackgroundRecordingPushConstants {
@@ -1010,6 +1034,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Bind background subtraction descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundSubtractionPipelineLayout,
 		                        0, 1, &this->backgroundSubtractionDescriptorSets[idx], 0, nullptr);
+		logBindDS("BackgroundSubtraction", cmd, this->backgroundSubtractionDescriptorSets[idx]);
 
 		// Push constants: backgroundWeight, backgroundOffset, samplesPerAscan, samplesPerBuffer
 		struct BackgroundSubtractionPushConstants {
@@ -1178,6 +1203,41 @@ void VulkanBackend::Impl::endLabel(VkCommandBuffer cmd, bool began) {
 	this->vkCmdEndDebugUtilsLabelEXT_fn(cmd);
 }
 
+// ============================================
+// Diagnostic Helpers
+// ============================================
+
+void VulkanBackend::Impl::updateDescriptorSetsTagged(
+	const char* tag,
+	uint32_t writeCount,
+	const VkWriteDescriptorSet* writes)
+{
+	uint32_t seq = diagSeq.fetch_add(1);
+	std::cout << "[" << seq << "] [DS UPDATE] " << tag
+		<< " writeCount=" << writeCount;
+
+	for (uint32_t i = 0; i < writeCount; ++i)
+	{
+		std::cout << " set[" << i << "]="
+			<< std::hex << (uint64_t)writes[i].dstSet << std::dec;
+	}
+
+	std::cout << std::endl;
+	vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
+}
+
+void VulkanBackend::Impl::logRecordPoint(const char* tag)
+{
+	uint32_t seq = diagSeq.fetch_add(1);
+	std::cout << "[" << seq << "] [RECORD] " << tag << std::endl;
+}
+
+void VulkanBackend::Impl::logPoolOp(const char* op, VkDescriptorPool pool)
+{
+	uint32_t seq = diagSeq.fetch_add(1);
+	std::cout << "[" << seq << "] [POOL " << op << "] "
+		<< std::hex << (uint64_t)pool << std::dec << std::endl;
+}
 
 // ============================================
 // Constructor / Destructor
@@ -1663,6 +1723,7 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	}
 
 	// Pre-record all command buffers for maximum performance
+	this->impl->logRecordPoint("from_initialize");
 	this->recordCommandBuffers();
 
 	// Load recorded profiles from configuration (if backend was switched)
@@ -2187,9 +2248,6 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
-
-	// Re-record command buffers to ensure they use the updated curve data
-	this->recordCommandBuffers();
 }
 
 void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
@@ -2278,9 +2336,6 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
-
-	// Re-record command buffers to ensure they use the updated curve data
-	this->recordCommandBuffers();
 }
 
 void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
@@ -2369,9 +2424,6 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
-
-	// Re-record command buffers to ensure they use the updated curve data
-	this->recordCommandBuffers();
 }
 
 // ============================================
@@ -2558,6 +2610,7 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 	vkDeviceWaitIdle(this->impl->device);
 
 	// Re-record all command buffers with background subtraction enabled
+	this->impl->logRecordPoint("from_setPostProcessBackgroundProfile");
 	this->recordCommandBuffers();
 }
 
@@ -3552,6 +3605,7 @@ void VulkanBackend::createComputePipelines() {
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Allow individual descriptor sets to be freed
 
 	checkVulkanErrors(vkCreateDescriptorPool(this->impl->device, &poolInfo, nullptr, &this->impl->descriptorPool));
+	this->impl->logPoolOp("CREATE", this->impl->descriptorPool);
 
 	// ============================================
 	// Allocate Descriptor Sets (one per command buffer)
@@ -3603,7 +3657,7 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[1].descriptorCount = 1;
 		descriptorWrites[1].pBufferInfo = &outputBufferInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("InputConversion", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 	}
 
 	// ============================================
@@ -3749,7 +3803,7 @@ void VulkanBackend::createComputePipelines() {
 		dcRemovalDescriptorWrites[1].descriptorCount = 1;
 		dcRemovalDescriptorWrites[1].pBufferInfo = &dcRemovalOutputBufferInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(dcRemovalDescriptorWrites.size()), dcRemovalDescriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("DCRemoval", static_cast<uint32_t>(dcRemovalDescriptorWrites.size()), dcRemovalDescriptorWrites.data());
 	}
 
 	// ============================================
@@ -4193,7 +4247,7 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[6].descriptorCount = 1;
 		descriptorWrites[6].pBufferInfo = &outputInfoB;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("UniversalPreFFT", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 	}
 
 	// ============================================
@@ -4375,7 +4429,7 @@ void VulkanBackend::createComputePipelines() {
 			descriptorWrites[2].descriptorCount = 1;
 			descriptorWrites[2].pBufferInfo = &outputInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("UniversalPostFFT_variant0", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 		}
 
 		// --- Variant 1: Input from deviceIntermediateBuffers[i] ---
@@ -4414,7 +4468,7 @@ void VulkanBackend::createComputePipelines() {
 			descriptorWrites[2].descriptorCount = 1;
 			descriptorWrites[2].pBufferInfo = &outputInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("UniversalPostFFT_variant1", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 		}
 	}
 
@@ -4484,7 +4538,7 @@ void VulkanBackend::createComputePipelines() {
 			fpnDescriptorWrites[1].descriptorCount = 1;
 			fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("FPNDetermination_variant0", static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data());
 		}
 
 		// --- Variant 1: Input from deviceIntermediateBuffers[i] ---
@@ -4514,7 +4568,7 @@ void VulkanBackend::createComputePipelines() {
 			fpnDescriptorWrites[1].descriptorCount = 1;
 			fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("FPNDetermination_variant1", static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data());
 		}
 	}
 
@@ -4565,7 +4619,7 @@ void VulkanBackend::createComputePipelines() {
 		bgDescriptorWrites[1].descriptorCount = 1;
 		bgDescriptorWrites[1].pBufferInfo = &backgroundInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(bgDescriptorWrites.size()), bgDescriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("BackgroundSubtraction", static_cast<uint32_t>(bgDescriptorWrites.size()), bgDescriptorWrites.data());
 	}
 
 	// ============================================
@@ -4615,7 +4669,7 @@ void VulkanBackend::createComputePipelines() {
 		bgRecDescriptorWrites[1].descriptorCount = 1;
 		bgRecDescriptorWrites[1].pBufferInfo = &backgroundInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(bgRecDescriptorWrites.size()), bgRecDescriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("BackgroundRecording", static_cast<uint32_t>(bgRecDescriptorWrites.size()), bgRecDescriptorWrites.data());
 	}
 
 	// ============================================
@@ -4651,6 +4705,7 @@ void VulkanBackend::destroyComputePipelines() {
 
 	// Destroy descriptor pool
 	if (this->impl->descriptorPool != VK_NULL_HANDLE) {
+		this->impl->logPoolOp("DESTROY", this->impl->descriptorPool);
 		vkDestroyDescriptorPool(this->impl->device, this->impl->descriptorPool, nullptr);
 		this->impl->descriptorPool = VK_NULL_HANDLE;
 	}
