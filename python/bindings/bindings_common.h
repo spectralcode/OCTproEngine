@@ -12,7 +12,6 @@
 #include "iobuffer.h"
 #include "types.h"
 #include "version.h"
-#include "cudautils.h"
 #include "tools/recorder.h"
 
 namespace py = pybind11;

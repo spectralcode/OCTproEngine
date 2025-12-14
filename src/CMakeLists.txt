@@ -11,7 +11,6 @@ set(CORE_SOURCES
 	core/callback_manager.cpp
 	core/output_buffer_manager.cpp
 	core/processortool.cpp
-	core/cudautils.cpp
 )
 
 
