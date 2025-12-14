@@ -1,6 +1,6 @@
 #include "vulkan_backend.h"
 
-//#define VULKAN_DEBUG_LOGGING  // Uncomment to enable debug output
+//#define VULKAN_DEBUG  // Uncomment to enable debug output
 
 
 //	VkFFT backend selection: 0 = Vulkan
@@ -1355,7 +1355,7 @@ void VulkanBackend::Impl::updateDescriptorSetsTagged(
 	uint32_t writeCount,
 	const VkWriteDescriptorSet* writes)
 {
-#ifdef VULKAN_DEBUG_LOGGING
+#ifdef VULKAN_DEBUG
 	uint32_t seq = diagSeq.fetch_add(1);
 	std::cout << "[" << seq << "] [DS UPDATE] " << tag
 		<< " writeCount=" << writeCount;
