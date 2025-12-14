@@ -2076,6 +2076,7 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	// Diagnostic: Check if we're about to submit H2D before previous slot completed
 	uint64_t slotWaitValue = this->impl->stagingLastWriteValue[idx];
+#ifdef VULKAN_DEBUG
 	uint64_t currentTimelineValue = 0;
 	vkGetSemaphoreCounterValue(this->impl->device, this->impl->outputOrderingSemaphore, &currentTimelineValue);
 
@@ -2084,6 +2085,7 @@ void VulkanBackend::process(IOBuffer& input) {
 	          << " currentTimeline=" << currentTimelineValue
 	          << " needWait=" << (slotWaitValue > 0)
 	          << " SAFE=" << (currentTimelineValue >= slotWaitValue || slotWaitValue == 0));
+#endif
 
 	// Wait on previous "slot complete" value for this idx (recorded when D2H for this idx was submitted)
 	bool needSlotWait = (slotWaitValue > 0);
