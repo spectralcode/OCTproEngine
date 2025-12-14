@@ -49,7 +49,6 @@
 	} while(0)
 
 // Unified debug macro (controls logging + validation + debug utils extension)
-//#define VULKAN_DEBUG  // Uncomment to enable debug output and Vulkan validation
 #ifdef VULKAN_DEBUG
 	#include <iostream>
 	#define VKDBG_LOG(x) do { std::cout << x << std::endl; } while (0)
@@ -243,6 +242,25 @@ struct VulkanBackend::Impl {
 	std::vector<VkFence> fences;
 	// Note: No round-robin index needed - zero-copy input determines CB from buffer pointer
 	bool commandBuffersValid = false;  // Track if command buffers need re-recording
+
+	// Selective VkFFT rebuild. track parameters that affect VkFFT app creation
+	struct FftKey {
+		uint32_t signalLength = 0;
+		uint32_t numberBatches = 0;
+		bool dcRemovalEnabled = false;  // Affects which buffer VkFFT uses (getFftDataBufferForSlot)
+
+		bool operator==(const FftKey& other) const {
+			return signalLength == other.signalLength &&
+			       numberBatches == other.numberBatches &&
+			       dcRemovalEnabled == other.dcRemovalEnabled;
+		}
+
+		bool operator!=(const FftKey& other) const {
+			return !(*this == other);
+		}
+	};
+
+	FftKey prevFftKey{};
 
 	// Input buffer management (queue-based, thread-safe)
 	// Zero-copy: numInputBuffers == numCommandBuffers (each input buffer is backed by staging)
@@ -1877,6 +1895,13 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		checkVkFFTErrors(initializeVkFFT(&this->impl->vkfftApps[i], fftCfg));
 	}
 
+	// Store FFT key for selective invalidation in updateConfig()
+	this->impl->prevFftKey.signalLength = static_cast<uint32_t>(this->impl->signalLength);
+	this->impl->prevFftKey.numberBatches = static_cast<uint32_t>(
+		this->impl->ascansPerBscan * this->impl->bscansPerBuffer
+	);
+	this->impl->prevFftKey.dcRemovalEnabled = this->impl->config.processingParams.dcRemoval.enabled;
+
 	// Initialize curve buffers with identity values (required for universal shader)
 	// IMPORTANT: Must be done BEFORE createComputePipelines() so descriptor sets can reference these buffers
 	// Resampling identity curve: [0.0, 1.0, 2.0, ..., signalLength-1]
@@ -2405,35 +2430,43 @@ void VulkanBackend::process(IOBuffer& input) {
 // ============================================
 
 void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
-	// === STEP 1: Detect which changes invalidate command buffers ===
-	// Currently all config changes invalidate CBs (see todo below)
-	// In the future, this should check specific fields (FFT size, DC removal, etc.)
-	bool cbInvalidatedNow = true;  // TODO: make this conditional once selective invalidation is implemented
+	// === STEP 1: Detect which changes invalidate VkFFT apps ===
+	VulkanBackend::Impl::FftKey newKey{};
+	newKey.signalLength = static_cast<uint32_t>(config.dataParams.signalLength);
+	newKey.numberBatches = static_cast<uint32_t>(
+		config.dataParams.ascansPerBscan * config.dataParams.bscansPerBuffer
+	);
+	newKey.dcRemovalEnabled = config.processingParams.dcRemoval.enabled;
+
+	bool fftParamsChanged = (newKey != this->impl->prevFftKey);
 
 	// === STEP 2: Update impl->config ===
 	this->impl->config = config;
 
-	// === STEP 3: Update impl->fftConfig if VkFFT-relevant fields changed ===
-	// Currently fftConfig is set during initialize() and doesn't change at runtime
-	// If future config changes affect VkFFTConfiguration fields (FFT size, precision, etc.),
-	// update impl->fftConfig here before rebuilding VkFFT apps
+	// === STEP 3: Not needed - VkFFT config is constant at runtime ===
 
-	// === STEP 4: Rebuild VkFFT apps if command buffers were invalidated ===
-	if (cbInvalidatedNow && !this->impl->vkfftApps.empty())
+	// === STEP 4: Rebuild VkFFT apps ONLY if FFT parameters changed ===
+	if (fftParamsChanged)  // Removed !vkfftApps.empty() check - always rebuild if params changed
 	{
 		// GPU-safe teardown: Wait for GPU to finish using current VkFFT apps
 		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-		// Wait for all in-flight work to complete
-		// NOTE: vkDeviceWaitIdle() stalls entire device - if updateConfig() is called frequently,
-		// consider fence-based waiting (wait only for in-flight command buffers)
-		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
-		if (waitResult != VK_SUCCESS) {
-			std::cerr << "[updateConfig] WARNING: vkDeviceWaitIdle failed with code " << waitResult << std::endl;
-			// Continue with cleanup - resources must be destroyed
+		// Wait for all in-flight command buffers using fences
+		if (!this->impl->fences.empty()) {
+			VkResult waitResult = vkWaitForFences(
+				this->impl->device,
+				static_cast<uint32_t>(this->impl->fences.size()),
+				this->impl->fences.data(),
+				VK_TRUE,  // Wait for all fences
+				UINT64_MAX  // No timeout
+			);
+			if (waitResult != VK_SUCCESS) {
+				std::cerr << "[updateConfig] WARNING: vkWaitForFences failed with code " << waitResult << std::endl;
+				// Continue with cleanup - resources must be destroyed
+			}
 		}
 
-		// Destroy all VkFFT apps (safe after vkDeviceWaitIdle)
+		// Destroy all VkFFT apps (safe after waiting for fences)
 		for (size_t i = 0; i < this->impl->vkfftApps.size(); ++i)
 		{
 			deleteVkFFT(&this->impl->vkfftApps[i]);
@@ -2453,6 +2486,8 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 			// Copy impl->fftConfig and override buffer per-slot
 			VkFFTConfiguration fftCfg = this->impl->fftConfig;
 			fftCfg.buffer = fftBuffer;  // Per-slot buffer from helper
+			fftCfg.size[0] = newKey.signalLength;  // Update FFT size
+			fftCfg.numberBatches = newKey.numberBatches;  // Update batch count
 
 			// Zero-initialize before passing to VkFFT
 			memset(&this->impl->vkfftApps[i], 0, sizeof(VkFFTApplication));
@@ -2470,15 +2505,14 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 				throw;
 			}
 		}
+
+		// Update prevFftKey ONLY after successful rebuild
+		this->impl->prevFftKey = newKey;
 	}
 
-	// === STEP 5: Mark command buffers as invalid ===
-	// Invalidate command buffers to force re-recording with new configuration
-	// Next process() call will re-record all command buffers
-	//todo: this can be improved to only re-record when relevant parameters change
-	if (cbInvalidatedNow) {
-		this->impl->commandBuffersValid = false;
-	}
+	// === STEP 5: Mark command buffers invalid ===
+	// Command buffers always need re-recording on config change
+	this->impl->commandBuffersValid = false;
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
