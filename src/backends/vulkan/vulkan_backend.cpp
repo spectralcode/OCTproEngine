@@ -186,6 +186,13 @@ struct VulkanBackend::Impl {
 	VkSemaphore outputOrderingSemaphore = VK_NULL_HANDLE;
 	uint64_t nextOutputSignalValue = 1;  // Monotonically increasing value for timeline semaphore
 	std::vector<uint64_t> lastTimelineValuePerCB;  // Last timeline value used by each command buffer
+	std::vector<uint64_t> stagingLastWriteValue;  // Track last timeline value that wrote to each staging buffer
+
+	// Debug utils (CRITICAL: gate on debugUtilsEnabled - vkGetDeviceProcAddr can return non-null even when extension disabled)
+	bool debugUtilsEnabled = false;  // Set true when VK_EXT_debug_utils is enabled at instance creation
+	PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT_fn = nullptr;
+	PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT_fn = nullptr;
+	PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT_fn = nullptr;
 
 	// Command buffers and synchronization
 	VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -466,6 +473,12 @@ struct VulkanBackend::Impl {
 
 	// Record D2H transfer command buffers (separate from compute for bidirectional DMA)
 	void recordD2hTransferCommandBuffers();
+
+	// Debug utils helpers
+	void initDebugUtils();
+	void nameObject(VkObjectType type, uint64_t handle, const char* name);
+	bool beginLabel(VkCommandBuffer cmd, const char* text);
+	void endLabel(VkCommandBuffer cmd, bool began);
 };
 
 // ============================================
@@ -499,7 +512,15 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Copy from staging to device buffer
 		VkBufferCopy copyRegion = {};
 		copyRegion.size = inputSize;
+
+		// Balanced label for H2D copy
+		char labelName[128];
+		snprintf(labelName, sizeof(labelName),
+		         "H2D copy idx=%d dst=deviceInput[%d] src=stagingInput[%d] size=%zu offset=%zu",
+		         idx, idx, idx, (size_t)copyRegion.size, (size_t)copyRegion.dstOffset);
+		bool began = this->beginLabel(transferCmd, labelName);
 		vkCmdCopyBuffer(transferCmd, this->stagingInputBuffers[idx], this->deviceInputBuffers[idx], 1, &copyRegion);
+		this->endLabel(transferCmd, began);
 
 		// Release barrier (transfer queue releases ownership to compute queue)
 		VkBufferMemoryBarrier releaseBarrier = {};
@@ -946,7 +967,15 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Copy recorded background profile from device to staging buffer for host readback
 		VkBufferCopy bgCopyRegion = {};
 		bgCopyRegion.size = static_cast<VkDeviceSize>(outputSignalLength * sizeof(float));
+
+		// Balanced label for background copy
+		char bgLabelName[128];
+		snprintf(bgLabelName, sizeof(bgLabelName),
+		         "Background copy dst=postProcBackgroundStaging src=postProcBackground size=%zu",
+		         (size_t)bgCopyRegion.size);
+		bool bgBegan = this->beginLabel(cmd, bgLabelName);
 		vkCmdCopyBuffer(cmd, this->postProcBackgroundBuffer, this->postProcBackgroundStagingBuffer, 1, &bgCopyRegion);
+		this->endLabel(cmd, bgBegan);
 
 		// Barrier after copy (ensure copy completes before host reads)
 		VkBufferMemoryBarrier bgCopyBarrier = {};
@@ -1083,10 +1112,70 @@ void VulkanBackend::Impl::recordD2hTransferCommandBuffers() {
 		copyRegion.srcOffset = 0;
 		copyRegion.dstOffset = 0;
 		copyRegion.size = outputSize;
+
+		// Balanced label for D2H copy
+		char labelName[128];
+		snprintf(labelName, sizeof(labelName),
+		         "D2H copy idx=%d dst=stagingOutput[%d] src=deviceProcessed[%d] size=%zu offset=%zu",
+		         idx, idx, idx, (size_t)copyRegion.size, (size_t)copyRegion.dstOffset);
+		bool began = this->beginLabel(d2hCmd, labelName);
 		vkCmdCopyBuffer(d2hCmd, this->deviceProcessedBuffers[idx], this->stagingOutputBuffers[idx], 1, &copyRegion);
+		this->endLabel(d2hCmd, began);
 
 		checkVulkanErrors(vkEndCommandBuffer(d2hCmd));
 	}
+}
+
+// ============================================
+// Debug Utils Helpers
+// ============================================
+
+void VulkanBackend::Impl::initDebugUtils() {
+	// CRITICAL: Only load if extension was actually enabled
+	if (!this->debugUtilsEnabled)
+		return;
+
+	this->vkSetDebugUtilsObjectNameEXT_fn = (PFN_vkSetDebugUtilsObjectNameEXT)
+	    vkGetDeviceProcAddr(this->device, "vkSetDebugUtilsObjectNameEXT");
+	this->vkCmdBeginDebugUtilsLabelEXT_fn = (PFN_vkCmdBeginDebugUtilsLabelEXT)
+	    vkGetDeviceProcAddr(this->device, "vkCmdBeginDebugUtilsLabelEXT");
+	this->vkCmdEndDebugUtilsLabelEXT_fn = (PFN_vkCmdEndDebugUtilsLabelEXT)
+	    vkGetDeviceProcAddr(this->device, "vkCmdEndDebugUtilsLabelEXT");
+}
+
+void VulkanBackend::Impl::nameObject(VkObjectType type, uint64_t handle, const char* name) {
+	if (!this->debugUtilsEnabled || !this->vkSetDebugUtilsObjectNameEXT_fn || handle == 0 || !name)
+		return;
+
+	VkDebugUtilsObjectNameInfoEXT info{};
+	info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+	info.objectType = type;
+	info.objectHandle = handle;
+	info.pObjectName = name;
+
+	this->vkSetDebugUtilsObjectNameEXT_fn(this->device, &info);
+}
+
+// CRITICAL: Balanced labeling - track whether Begin was called
+bool VulkanBackend::Impl::beginLabel(VkCommandBuffer cmd, const char* text) {
+	if (!this->debugUtilsEnabled || !this->vkCmdBeginDebugUtilsLabelEXT_fn || !cmd || !text)
+		return false;
+
+	VkDebugUtilsLabelEXT label{};
+	label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+	label.pLabelName = text;
+
+	this->vkCmdBeginDebugUtilsLabelEXT_fn(cmd, &label);
+	return true;
+}
+
+void VulkanBackend::Impl::endLabel(VkCommandBuffer cmd, bool began) {
+	if (!began)
+		return;
+	if (!this->debugUtilsEnabled || !this->vkCmdEndDebugUtilsLabelEXT_fn || !cmd)
+		return;
+
+	this->vkCmdEndDebugUtilsLabelEXT_fn(cmd);
 }
 
 
@@ -1248,6 +1337,7 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		VkResult messengerResult = CreateDebugUtilsMessengerEXT(this->impl->instance, &debugCreateInfo, nullptr, &this->impl->debugMessenger);
 		if (messengerResult == VK_SUCCESS) {
 			std::cerr << "Vulkan validation layers + sync validation enabled" << std::endl;
+			this->impl->debugUtilsEnabled = true;  // Enable debug utils naming and labeling
 		} else {
 			std::cerr << "Vulkan validation layers enabled (but messenger creation failed)" << std::endl;
 		}
@@ -1378,6 +1468,9 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	deviceCreateInfo.pEnabledFeatures = &features2.features;
 
 	checkVulkanErrors(vkCreateDevice(this->impl->physicalDevice, &deviceCreateInfo, nullptr, &this->impl->device));
+
+	// Initialize debug utils function pointers (if enabled)
+	this->impl->initDebugUtils();
 
 	// Get queues. strategy depends on whether we have a dedicated transfer family
 	if (this->impl->useSeparateTransferQueue) {
@@ -1830,6 +1923,11 @@ void VulkanBackend::process(IOBuffer& input) {
 	transferSubmit.pSignalSemaphores = &transferCompleteSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
+	std::cout << "[H2D SUBMIT] idx=" << idx
+	          << " cmd=" << transferCmd
+	          << " src=stagingInput[" << idx << "]=" << this->impl->stagingInputBuffers[idx]
+	          << " dst=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]
+	          << std::endl;
 
 	// Submit compute command buffer. signals computeToD2hSemaphore when done
 	// Compute only waits on H2D transfer
@@ -1850,31 +1948,53 @@ void VulkanBackend::process(IOBuffer& input) {
 	computeSubmit.pSignalSemaphores = &computeToD2hSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, VK_NULL_HANDLE));
+	std::cout << "[COMPUTE SUBMIT] idx=" << idx
+	          << " cmd=" << cmd
+	          << " signalValue=" << signalValue
+	          << " src=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]
+	          << " dst=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]
+	          << std::endl;
 
 	// Submit D2H transfer command buffer. signals timeline semaphore for ordered completion
 	// D2H waits on: compute complete
 	// D2H signals: timeline semaphore (for completion thread ordering)
 	VkCommandBuffer d2hCmd = this->impl->d2hTransferCommandBuffers[idx];
 
-	uint64_t d2hWaitValues[1] = {0};         // Binary semaphore (ignored)
+	// Determine if we need to wait for previous write to this staging buffer
+	uint64_t stagingReuseWaitValue = this->impl->stagingLastWriteValue[idx];
+	bool needStagingWait = (stagingReuseWaitValue > 0);
+	std::cout << "[D2H DEBUG] idx=" << idx << " signal=" << signalValue << " waitValue=" << stagingReuseWaitValue << " needWait=" << needStagingWait << std::endl;
+
+	// Setup wait values: [binary_semaphore_value, timeline_wait_value (if needed)]
+	uint64_t d2hWaitValues[2] = {0, stagingReuseWaitValue};
 	uint64_t d2hSignalValues[1] = {signalValue};  // Timeline semaphore signal value
+
+	// Setup wait semaphores: [computeToD2hSemaphore, outputOrderingSemaphore (if needed)]
+	VkSemaphore d2hWaitSemaphores[2] = {
+		computeToD2hSemaphore,
+		this->impl->outputOrderingSemaphore
+	};
+
+	// Setup wait stages
+	VkPipelineStageFlags d2hWaitStages[2] = {
+		VK_PIPELINE_STAGE_TRANSFER_BIT,  // For compute→D2H dependency
+		VK_PIPELINE_STAGE_TRANSFER_BIT   // For staging buffer reuse protection
+	};
 
 	VkTimelineSemaphoreSubmitInfo d2hTimelineInfo = {};
 	d2hTimelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
 	d2hTimelineInfo.pNext = nullptr;
-	d2hTimelineInfo.waitSemaphoreValueCount = 1;
+	d2hTimelineInfo.waitSemaphoreValueCount = needStagingWait ? 2 : 1;
 	d2hTimelineInfo.pWaitSemaphoreValues = d2hWaitValues;
 	d2hTimelineInfo.signalSemaphoreValueCount = 1;
 	d2hTimelineInfo.pSignalSemaphoreValues = d2hSignalValues;
 
-	VkPipelineStageFlags d2hWaitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-
 	VkSubmitInfo d2hSubmit = {};
 	d2hSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	d2hSubmit.pNext = &d2hTimelineInfo;
-	d2hSubmit.waitSemaphoreCount = 1;
-	d2hSubmit.pWaitSemaphores = &computeToD2hSemaphore;
-	d2hSubmit.pWaitDstStageMask = &d2hWaitStage;
+	d2hSubmit.waitSemaphoreCount = needStagingWait ? 2 : 1;
+	d2hSubmit.pWaitSemaphores = d2hWaitSemaphores;
+	d2hSubmit.pWaitDstStageMask = d2hWaitStages;
 	d2hSubmit.commandBufferCount = 1;
 	d2hSubmit.pCommandBuffers = &d2hCmd;
 	d2hSubmit.signalSemaphoreCount = 1;
@@ -1884,12 +2004,23 @@ void VulkanBackend::process(IOBuffer& input) {
 	this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 
 	VkResult submitResult = vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence);
+	std::cout << "[D2H SUBMIT] idx=" << idx
+	          << " cmd=" << d2hCmd
+	          << " signalValue=" << signalValue
+	          << " waitValue=" << stagingReuseWaitValue
+	          << " needWait=" << needStagingWait
+	          << " src=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]
+	          << " dst=stagingOutput[" << idx << "]=" << this->impl->stagingOutputBuffers[idx]
+	          << std::endl;
 	if (submitResult == VK_ERROR_DEVICE_LOST) {
 		std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkQueueSubmit - GPU crashed (likely shader OOB) !!!" << std::endl;
 	}
 	checkVulkanErrors(submitResult);
 
 	this->impl->nextOutputSignalValue++;
+
+	// Update per-buffer reuse guard: this staging buffer was last written at signalValue
+	this->impl->stagingLastWriteValue[idx] = signalValue;
 
 	// Queue work for async completion (completion thread will wait on timeline semaphore and invoke callback)
 	// This enables true async overlap: process() returns immediately, allowing next frame to start
@@ -1983,7 +2114,15 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for resample curve upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Resample curve upload dst=resampleCurveBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->resampleCurveBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -2059,7 +2198,15 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for dispersion curve upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Dispersion curve upload dst=dispersionCurveBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->dispersionCurveBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -2135,7 +2282,15 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for window curve upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Window curve upload dst=windowCurveBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->windowCurveBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -2304,7 +2459,15 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for background profile upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Background profile upload dst=postProcBackgroundBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->postProcBackgroundBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -2404,7 +2567,15 @@ void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved,
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for mean A-line upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Mean A-line upload dst=meanALineBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->meanALineBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -2691,6 +2862,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 	this->impl->stagingOutputBuffers.resize(this->impl->numCommandBuffers);
 	this->impl->stagingOutputMemory.resize(this->impl->numCommandBuffers);
 	this->impl->stagingOutputMapped.resize(this->impl->numCommandBuffers);
+	this->impl->stagingLastWriteValue.resize(this->impl->numCommandBuffers, 0);  // Initialize to 0 (no previous write)
 
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
 		// Try to allocate with cached memory for fast CPU reads (60x faster than uncached!)
@@ -2821,6 +2993,31 @@ void VulkanBackend::allocateDeviceBuffers() {
 
 	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
 	vkQueueWaitIdle(this->impl->computeQueue);
+
+	// Name buffers for debug identification
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		char name[64];
+
+		// Staging output buffers (D2H destination)
+		snprintf(name, sizeof(name), "stagingOutput[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->stagingOutputBuffers[i], name);
+
+		// Device processed buffers (compute output, D2H source)
+		snprintf(name, sizeof(name), "deviceProcessed[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->deviceProcessedBuffers[i], name);
+
+		// Staging input buffers (H2D source)
+		snprintf(name, sizeof(name), "stagingInput[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->stagingInputBuffers[i], name);
+
+		// Device input buffers (H2D destination, compute source)
+		snprintf(name, sizeof(name), "deviceInput[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->deviceInputBuffers[i], name);
+	}
 
 	// Cleanup
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &initCmdBuffer);
@@ -3025,6 +3222,28 @@ void VulkanBackend::createCommandBuffersAndFences() {
 
 	// Initialize per-CB timeline tracking (0 means no previous frame used this CB)
 	this->impl->lastTimelineValuePerCB.resize(this->impl->numCommandBuffers, 0);
+
+	// Name command buffers and semaphores for debug identification
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		char name[64];
+
+		snprintf(name, sizeof(name), "transferCmd[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER,
+		                       (uint64_t)this->impl->transferCommandBuffers[i], name);
+
+		snprintf(name, sizeof(name), "computeCmd[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER,
+		                       (uint64_t)this->impl->commandBuffers[i], name);
+
+		snprintf(name, sizeof(name), "d2hCmd[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER,
+		                       (uint64_t)this->impl->d2hTransferCommandBuffers[i], name);
+	}
+
+	// Name semaphores
+	this->impl->nameObject(VK_OBJECT_TYPE_SEMAPHORE,
+	                       (uint64_t)this->impl->outputOrderingSemaphore,
+	                       "outputOrderingTimeline");
 }
 
 void VulkanBackend::destroyCommandBuffersAndFences() {
