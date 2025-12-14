@@ -50,6 +50,7 @@ struct ProcessingParams {
 
 	bool fpnRemoval = false;
 	int fpnBscanCount = 1;
+	bool fpnContinuous = false;
 };
 
 struct DataParams {
@@ -171,6 +172,7 @@ void applyProcessingParams(ope::Processor* proc, const ProcessingParams& params)
 
 	proc->enableFixedPatternNoiseRemoval(params.fpnRemoval);
 	proc->setFixedPatternNoiseBscanCount(params.fpnBscanCount);
+	proc->enableContinuousFixedPatternNoiseDetermination(params.fpnContinuous);
 }
 
 void initializeProcessor(AppState* state) {
@@ -597,6 +599,7 @@ void renderProcessingUI(AppState* state) {
 	// Fixed Pattern Noise
 	ImGui::SeparatorText("Fixed-Pattern Noise Removal");
 	CheckboxWithReprocess("Enable FPN Removal", &pp.fpnRemoval, state);
+	CheckboxWithReprocess("Continuous FPN", &pp.fpnContinuous, state);
 	if (ImGui::InputInt("FPN B-scan Count", &pp.fpnBscanCount, 1, 1)) {
 		if (state->autoUpdate) reprocessData(state);
 	}
