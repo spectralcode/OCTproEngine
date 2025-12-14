@@ -3805,6 +3805,7 @@ std::string loadShaderSource(const std::string& filepath) {
 		"tests/" + filepath,                           // From build dir to test dir (Linux)
 		"examples/Release/" + filepath,                // From build dir to examples dir (Windows)
 		"examples/" + filepath,                        // From build dir to examples dir (Linux)
+		"../../src/backends/vulkan/shaders/" + filepath.substr(filepath.find_last_of('/') + 1),  // From python test dir to shaders
 		"src/backends/vulkan/shaders/" + filepath.substr(filepath.find_last_of('/') + 1)  // Source tree fallback
 	};
 
