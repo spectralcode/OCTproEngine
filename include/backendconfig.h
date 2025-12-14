@@ -90,8 +90,9 @@ class OPE_API VulkanConfig : public BackendConfig {
 public:
 	int deviceId;  // Physical device index
 	int numOutputBuffers;  // 0 = auto (default: numCommandBuffers * 2)
+	int numStagingInputBuffers;  // 0 = auto (default: numCommandBuffers * 2)
 
-	VulkanConfig() : deviceId(0), numOutputBuffers(0) {}
+	VulkanConfig() : deviceId(0), numOutputBuffers(0), numStagingInputBuffers(0) {}
 
 	Backend getBackendType() const override { return Backend::VULKAN; }
 

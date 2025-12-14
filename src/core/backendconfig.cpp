@@ -63,6 +63,9 @@ std::string VulkanConfig::toString() const {
 	if (numOutputBuffers > 0) {
 		oss << ", num_output_buffers=" << numOutputBuffers;
 	}
+	if (numStagingInputBuffers > 0) {
+		oss << ", num_staging_input_buffers=" << numStagingInputBuffers;
+	}
 	oss << ")";
 	return oss.str();
 }
@@ -366,6 +369,8 @@ std::unique_ptr<BackendConfig> BackendUtils::parseConfig(const std::string& conf
 						config->deviceId = std::stoi(value);
 					} else if (key == "num_output_buffers") {
 						config->numOutputBuffers = std::stoi(value);
+					} else if (key == "num_staging_input_buffers") {
+						config->numStagingInputBuffers = std::stoi(value);
 					}
 				}
 			}
@@ -426,6 +431,9 @@ std::string BackendUtils::serializeConfig(const BackendConfig& config) {
 		oss << "vulkan:device=" << vulkanConfig.deviceId;
 		if (vulkanConfig.numOutputBuffers > 0) {
 			oss << ",num_output_buffers=" << vulkanConfig.numOutputBuffers;
+		}
+		if (vulkanConfig.numStagingInputBuffers > 0) {
+			oss << ",num_staging_input_buffers=" << vulkanConfig.numStagingInputBuffers;
 		}
 		break;
 	}

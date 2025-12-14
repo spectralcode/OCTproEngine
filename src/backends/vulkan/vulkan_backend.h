@@ -199,6 +199,7 @@ public:
 
 	void setNumInputBuffers(int count);  // Must be called before initialize()
 	void setNumOutputBuffers(int count);  // Must be called before initialize() (0 = auto)
+	void setNumStagingInputBuffers(int count);  // Must be called before initialize() (0 = auto, default: numCommandBuffers * 2)
 	void setNumCommandBuffers(int count);  // Equivalent to CUDA streams
 	void setDeviceId(int deviceId);  // Select physical device
 
