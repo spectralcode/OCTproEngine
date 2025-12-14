@@ -356,16 +356,16 @@ struct VulkanBackend::Impl {
 
 	// Completion thread function (runs asynchronously, similar to CUDA stream callbacks)
 	void completionThreadFunc() {
-		while (this->completionThreadRunning) {
+		while (this->completionThreadRunning.load(std::memory_order_acquire)) {
 			PendingWork work;
 			{
 				std::unique_lock<std::mutex> lock(this->pendingWorkMutex);
 				// Wait for work or shutdown signal
 				this->pendingWorkCV.wait(lock, [this] {
-					return !this->pendingWorkQueue.empty() || !this->completionThreadRunning;
+					return !this->pendingWorkQueue.empty() || !this->completionThreadRunning.load(std::memory_order_acquire);
 				});
 
-				if (!this->completionThreadRunning && this->pendingWorkQueue.empty()) {
+				if (!this->completionThreadRunning.load(std::memory_order_acquire) && this->pendingWorkQueue.empty()) {
 					break;  // Shutdown
 				}
 
@@ -387,15 +387,41 @@ struct VulkanBackend::Impl {
 			waitInfo.pSemaphores = &this->outputOrderingSemaphore;
 			waitInfo.pValues = &work.timelineValue;
 
-			// Wait for GPU work to complete (must complete even during shutdown to avoid destroying resources in use!)
-			VkResult result = vkWaitSemaphores(this->device, &waitInfo, UINT64_MAX);
-			if (result != VK_SUCCESS) {
-				if (result == VK_ERROR_DEVICE_LOST) {
-					std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkWaitSemaphores - GPU crashed (likely shader OOB) !!!" << std::endl;
+			// Wait for timeline semaphore with TIMEOUT + shutdown check (robust against DEVICE_LOST and logic bugs)
+			// Poll with timeout to allow shutdown cancellation
+			bool workCompleted = false;
+			for (;;) {
+				// Check shutdown flag BEFORE waiting
+				if (this->shuttingDown.load(std::memory_order_acquire)) {
+					// Cancelled during shutdown - clean up work item
+					this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
+					break;  // Skip to next iteration (thread will exit)
 				}
-				std::cerr << "Vulkan timeline semaphore wait failed: " << result << std::endl;
-				this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
-				continue;
+
+				// Wait with 10ms timeout (in nanoseconds)
+				VkResult result = vkWaitSemaphores(this->device, &waitInfo, 10'000'000ULL);
+
+				if (result == VK_SUCCESS) {
+					// Normal completion - process callback
+					workCompleted = true;
+					break;  // Exit wait loop
+				} else if (result == VK_TIMEOUT) {
+					// Timeout - loop and check shutdown again
+					continue;
+				} else {
+					// Error (VK_ERROR_DEVICE_LOST, etc.)
+					if (result == VK_ERROR_DEVICE_LOST) {
+						std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkWaitSemaphores !!!" << std::endl;
+					}
+					std::cerr << "Timeline semaphore wait failed: " << result << std::endl;
+					this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
+					break;  // Skip callback, continue to next work item
+				}
+			}
+
+			// Skip callback if cancelled or error
+			if (!workCompleted || this->shuttingDown.load(std::memory_order_acquire)) {
+				continue;  // Thread will exit on next loop check
 			}
 
 
@@ -774,7 +800,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		                   0, sizeof(fpnPush), &fpnPush);
 
 		// Dispatch FPN determination shader (one thread per sample in the output A-scan)
-		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + 127) / 128;
+		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 		vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
 
 		// Barrier: wait for FPN profile to be written before using it
@@ -895,7 +921,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		                   0, sizeof(bgRecPush), &bgRecPush);
 
 		// Dispatch background recording shader (one thread per sample in background profile)
-		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + 127) / 128;
+		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 		vkCmdDispatch(cmd, bgRecWorkgroups, 1, 1);
 
 		// Barrier after background recording (wait for writes to complete before subtraction or copy)
@@ -1574,32 +1600,21 @@ void VulkanBackend::cleanup() {
 		return;
 	}
 
-	// Signal shutdown and wake ALL blocked threads (Fix 1.3)
+	// Signal shutdown and wake ALL blocked threads
 	std::cerr << "[CLEANUP] Setting shuttingDown flag, pendingWorkCount=" << this->impl->pendingWorkCount.load() << std::endl;
 	std::cerr.flush();
 	this->impl->shuttingDown.store(true, std::memory_order_release);
+	this->impl->completionThreadRunning.store(false, std::memory_order_release);  // Prevent new waits
 	this->impl->freeQueueCV.notify_all();      // Wake threads in getNextAvailableInputBuffer()
 	this->impl->pendingWorkCV.notify_all();    // Wake completion thread
 
-	// PHASE 2: STOP COMPLETION THREAD FIRST
-	// The completion thread calls vkWaitSemaphores(), which is a Vulkan call.
-	// If we destroy Vulkan objects while the thread is inside vkWaitSemaphores, it's UB.
-	// We MUST ensure the thread exits BEFORE destroying any Vulkan objects.
-	std::cerr << "[CLEANUP] Stopping completion thread..." << std::endl;
-	std::cerr.flush();
-	if (this->impl->completionThread.joinable()) {
-		this->impl->completionThreadRunning = false;
-		this->impl->pendingWorkCV.notify_all();  // Ensure thread wakes up
-		this->impl->completionThread.join();
-	}
-
-	// Lock submitMutex, wait for GPU, drain work, destroy resources
+	// Lock submitMutex and wait for GPU (BEFORE joining thread!)
 	std::cerr << "[CLEANUP] Acquiring submitMutex and waiting for GPU..." << std::endl;
 	std::cerr.flush();
 	{
 		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-		// Wait for GPU to finish all submitted work
+		// Wait for GPU to finish all submitted work (signals all timeline values)
 		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
 		if (waitResult != VK_SUCCESS) {
 			std::cerr << "[CLEANUP] vkDeviceWaitIdle failed with error " << waitResult;
@@ -1610,13 +1625,27 @@ void VulkanBackend::cleanup() {
 			std::cerr.flush();
 			// Continue with cleanup anyway. must still clean up CPU resources
 		}
+	}  // Release submitMutex - allows completion thread to proceed
+
+	// NOW stop completion thread safely
+	// All timeline values are signaled, OR thread will exit via timeout + shuttingDown check
+	std::cerr << "[CLEANUP] Stopping completion thread..." << std::endl;
+	std::cerr.flush();
+	if (this->impl->completionThread.joinable()) {
+		this->impl->pendingWorkCV.notify_all();  // Final wake
+		this->impl->completionThread.join();     // Won't hang (timeout-based wait)
+	}
+
+	// Drain pending work and destroy resources
+	std::cerr << "[CLEANUP] Draining pending work and destroying resources..." << std::endl;
+	std::cerr.flush();
+	{
+		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
 		// Drain pending work queue
 		// After vkDeviceWaitIdle(), GPU work is complete. We can now safely:
 		// 1. Return input buffers to free queue (no longer needed by GPU)
 		// 2. Cancel work deterministically (completion thread already stopped)
-		std::cerr << "[CLEANUP] Draining pending work queue..." << std::endl;
-		std::cerr.flush();
 		{
 			std::lock_guard<std::mutex> workLock(this->impl->pendingWorkMutex);
 			while (!this->impl->pendingWorkQueue.empty()) {
@@ -1898,6 +1927,15 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Early exit during shutdown
+	if (!this->impl->vulkanInitialized ||
+	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	// Create buffer if it doesn't exist
 	if (this->impl->resampleCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength)) {
 		VkDeviceSize bufferSize = length * sizeof(float);
@@ -1965,6 +2003,15 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 }
 
 void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Early exit during shutdown
+	if (!this->impl->vulkanInitialized ||
+	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	// Create buffer if it doesn't exist
 	if (this->impl->dispersionCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength * 2)) {
 		VkDeviceSize bufferSize = length * sizeof(float);
@@ -2032,6 +2079,15 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 }
 
 void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Early exit during shutdown
+	if (!this->impl->vulkanInitialized ||
+	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	// Create buffer if it doesn't exist
 	if (this->impl->windowCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength)) {
 		VkDeviceSize bufferSize = length * sizeof(float);
@@ -2187,6 +2243,15 @@ void VulkanBackend::requestPostProcessBackgroundRecording() {
 }
 
 void VulkanBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Early exit during shutdown
+	if (!this->impl->vulkanInitialized ||
+	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	if (!background || length == 0) {
 		throw std::invalid_argument("Invalid background profile pointer or size");
 	}
@@ -2278,6 +2343,15 @@ void VulkanBackend::requestFixedPatternNoiseDetermination() {
 }
 
 void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Early exit during shutdown
+	if (!this->impl->vulkanInitialized ||
+	    this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	if (!profileInterleaved || complexPairs == 0) {
 		throw std::invalid_argument("Invalid fixed pattern noise profile pointer or size");
 	}
