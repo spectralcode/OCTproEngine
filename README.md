@@ -123,12 +123,12 @@ int main() {
     
     // Initialize
     processor.initialize();
-    
+
     // Set callback
-    processor.setOutputCallback([](const ope::IOBuffer& output) {
+    processor.addOutputCallback([](const ope::IOBuffer& output) {
         std::cout << "Processed " << output.getSizeInBytes() << " bytes" << std::endl;
     });
-    
+
     // Get buffer, fill with data, process
     ope::IOBuffer& buffer = processor.getNextAvailableInputBuffer();
     // ... fill buffer with your OCT data ...

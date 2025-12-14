@@ -90,10 +90,6 @@ public:
 	// processing is asynchronous; output is delivered via registered callbacks
 	void process(IOBuffer& input);
 
-	// todo: remove this method and update python bindings, tests etc
-	// Set single output callback (legacy method)
-	void setOutputCallback(OutputCallback callback);
-
 	// Add an output callback for processed data
 	// Each callback runs on its own dedicated thread. Callbacks execute
 	// in parallel when processing completes.

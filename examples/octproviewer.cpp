@@ -243,7 +243,7 @@ void initializeProcessor(AppState* state) {
 
 	applyProcessingParams(state->processor, state->procParams);
 
-	state->processor->setOutputCallback(
+	state->processor->addOutputCallback(
 		[state](const ope::IOBuffer& output) { onProcessedData(output, state); }
 	);
 

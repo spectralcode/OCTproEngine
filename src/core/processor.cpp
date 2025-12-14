@@ -640,14 +640,6 @@ size_t Processor::getInputCallbackCount() const {
 	return this->impl->inputCallbackManager.getCallbackCount();
 }
 
-void Processor::setOutputCallback(OutputCallback callback) {
-	// Legacy method: clear all and add one
-	// Provided for backwards compatibility
-	// todo: remove this method und update processor.h and all examples, tests, etc
-	this->clearOutputCallbacks();
-	this->addOutputCallback(callback);
-}
-
 void Processor::process(IOBuffer& input) {
 	this->impl->ensureInitialized();
 

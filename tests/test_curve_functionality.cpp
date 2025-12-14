@@ -134,8 +134,8 @@ struct ProcessingResult {
 // Process data and get output
 bool processData(ope::Processor& processor, const std::vector<uint16_t>& testData, ProcessingResult& result) {
 	result.reset();
-	
-	processor.setOutputCallback([&result](const ope::IOBuffer& output) {
+
+	processor.addOutputCallback([&result](const ope::IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(result.mutex);
 		
 		size_t numFloats = output.getSizeInBytes() / sizeof(float);
