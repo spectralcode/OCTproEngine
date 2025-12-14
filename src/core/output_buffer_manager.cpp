@@ -21,6 +21,18 @@ void OutputBufferManager::setBufferCount(size_t count) {
 	for (auto& ref : this->refCounts) {
 		ref.store(0, std::memory_order_relaxed);
 	}
+
+	// Update existing consumers that have maxQueueSize=0 (using default)
+	// This handles the case where consumers were added before initialize()
+	for (int i = 0; i < MAX_CONSUMERS; i++) {
+		auto& slot = this->slots[i];
+		if (slot.active.load(std::memory_order_acquire)) {
+			std::lock_guard<std::mutex> lock(slot.blockMutex);
+			if (slot.config.maxQueueSize == 0) {
+				slot.config.maxQueueSize = count;
+			}
+		}
+	}
 }
 
 void OutputBufferManager::setReleaseCallback(ReleaseCallback callback) {
