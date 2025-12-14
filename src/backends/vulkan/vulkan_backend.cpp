@@ -1915,10 +1915,54 @@ void VulkanBackend::process(IOBuffer& input) {
 	VkCommandBuffer transferCmd = this->impl->transferCommandBuffers[idx];
 	VkSemaphore transferCompleteSemaphore = this->impl->transferToComputeSemaphores[idx];
 
-	VkSubmitInfo transferSubmit = {};
+	// Diagnostic: Check if we're about to submit H2D before previous slot completed
+	uint64_t slotWaitValue = this->impl->stagingLastWriteValue[idx];
+	uint64_t currentTimelineValue = 0;
+	vkGetSemaphoreCounterValue(this->impl->device, this->impl->outputOrderingSemaphore, &currentTimelineValue);
+
+	std::cout << "[H2D DIAGNOSTIC] idx=" << idx
+	          << " slotWaitValue=" << slotWaitValue
+	          << " currentTimeline=" << currentTimelineValue
+	          << " needWait=" << (slotWaitValue > 0)
+	          << " SAFE=" << (currentTimelineValue >= slotWaitValue || slotWaitValue == 0)
+	          << std::endl;
+
+	// Wait on previous "slot complete" value for this idx (recorded when D2H for this idx was submitted)
+	bool needSlotWait = (slotWaitValue > 0);
+
+	std::cout << "[H2D DEBUG] idx=" << idx
+	          << " slotWaitValue=" << slotWaitValue
+	          << " needWait=" << needSlotWait << std::endl;
+
+	VkTimelineSemaphoreSubmitInfo h2dTimelineInfo{};
+	VkSubmitInfo transferSubmit{};
 	transferSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+	VkSemaphore h2dWaitSemaphores[1] = { this->impl->outputOrderingSemaphore };
+	VkPipelineStageFlags h2dWaitStages[1] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
+	uint64_t h2dWaitValues[1] = { slotWaitValue };
+
+	if (needSlotWait) {
+		h2dTimelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+		h2dTimelineInfo.waitSemaphoreValueCount = 1;
+		h2dTimelineInfo.pWaitSemaphoreValues = h2dWaitValues;
+		h2dTimelineInfo.signalSemaphoreValueCount = 0;
+		h2dTimelineInfo.pSignalSemaphoreValues = nullptr;
+
+		transferSubmit.pNext = &h2dTimelineInfo;
+		transferSubmit.waitSemaphoreCount = 1;
+		transferSubmit.pWaitSemaphores = h2dWaitSemaphores;
+		transferSubmit.pWaitDstStageMask = h2dWaitStages;
+	} else {
+		transferSubmit.pNext = nullptr;
+		transferSubmit.waitSemaphoreCount = 0;
+		transferSubmit.pWaitSemaphores = nullptr;
+		transferSubmit.pWaitDstStageMask = nullptr;
+	}
+
 	transferSubmit.commandBufferCount = 1;
 	transferSubmit.pCommandBuffers = &transferCmd;
+
 	transferSubmit.signalSemaphoreCount = 1;
 	transferSubmit.pSignalSemaphores = &transferCompleteSemaphore;
 
@@ -2080,6 +2124,10 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 		return;
 	}
 
+	// Ensure no in-flight work is using the curve buffer we're about to update
+	// Curve updates are rare (user interaction, not per-frame), so vkDeviceWaitIdle is acceptable
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+
 	// Create staging buffer for upload
 	VkBuffer stagingBuffer;
 	VkDeviceMemory stagingMemory;
@@ -2139,6 +2187,9 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
+
+	// Re-record command buffers to ensure they use the updated curve data
+	this->recordCommandBuffers();
 }
 
 void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
@@ -2163,6 +2214,10 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 	if (this->impl->dispersionCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength * 2)) {
 		return;
 	}
+
+	// Ensure no in-flight work is using the curve buffer we're about to update
+	// Curve updates are rare (user interaction, not per-frame), so vkDeviceWaitIdle is acceptable
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
 
 	// Create staging buffer for upload (complex data: 2 floats per element)
 	VkBuffer stagingBuffer;
@@ -2223,6 +2278,9 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
+
+	// Re-record command buffers to ensure they use the updated curve data
+	this->recordCommandBuffers();
 }
 
 void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
@@ -2247,6 +2305,10 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 	if (this->impl->windowCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
+
+	// Ensure no in-flight work is using the curve buffer we're about to update
+	// Curve updates are rare (user interaction, not per-frame), so vkDeviceWaitIdle is acceptable
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
 
 	// Create staging buffer for upload
 	VkBuffer stagingBuffer;
@@ -2307,6 +2369,9 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
+
+	// Re-record command buffers to ensure they use the updated curve data
+	this->recordCommandBuffers();
 }
 
 // ============================================
