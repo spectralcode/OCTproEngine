@@ -1,5 +1,6 @@
 @echo off
-REM Simple build script for OCTproEngine with Python bindings on Windows
+setlocal
+REM Simple build script for OCTproEngine on Windows
 
 echo ============================================
 echo OCTproEngine Build Script (Windows)
@@ -13,6 +14,25 @@ if not exist "CMakeLists.txt" (
 	pause
 	exit /b 1
 )
+
+REM Ask if Python bindings should be built
+echo.
+echo ========================================
+echo Python Bindings
+echo ========================================
+echo.
+echo Python bindings are optional.
+choice /C YN /N /M "Do you want to build Python bindings? [Y/N]: "
+if errorlevel 2 (
+	set "BUILD_PYTHON=OFF"
+) else (
+	set "BUILD_PYTHON=ON"
+)
+echo.
+echo Python bindings build: %BUILD_PYTHON%
+echo.
+
+if /i "%BUILD_PYTHON%"=="OFF" goto :python_configured
 
 REM Find Python
 REM Priority: 1) User-set PYTHON_EXE, 2) python in PATH, 3) py -3, 4) py
@@ -62,6 +82,8 @@ echo Installing Python dependencies...
 "%PYTHON_EXE%" -m pip install pybind11 numpy
 echo.
 
+:python_configured
+
 REM Create build directory
 if not exist "build" mkdir build
 cd build
@@ -103,9 +125,6 @@ if /i "%DOWNLOAD_CHOICE%"=="Y" (
 
 REM Ask if OCTproViewer should be built
 :viewer_option_start
-if /i "%BUILD_OCT_VIEWER%"=="ON" goto :viewer_option_ready
-if /i "%BUILD_OCT_VIEWER%"=="OFF" goto :viewer_option_ready
-
 echo.
 echo ========================================
 echo OCTproViewer (ImGui app)
@@ -129,7 +148,7 @@ echo.
 
 REM Configure (FFTW will auto-download to thirdparty/fftw if user said yes)
 echo Configuring CMake...
-cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=ON -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DBUILD_OCT_VIEWER=%BUILD_OCT_VIEWER% -DCMAKE_BUILD_TYPE=Release
+cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=%BUILD_PYTHON% -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DBUILD_OCT_VIEWER=%BUILD_OCT_VIEWER% -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 (
 	echo.
 	echo ERROR: CMake configuration failed!
@@ -155,24 +174,26 @@ echo ============================================
 echo Build completed successfully!
 echo ============================================
 echo.
-echo Python module location:
-dir /b python\Release\octproengine*.pyd 2>nul
-echo.
-echo To quickly test:
-echo   cd build\python\Release
-echo   "%PYTHON_EXE%" -c "import octproengine; print('SUCCESS!')"
-echo.
-echo To use the Python module, set PYTHONPATH:
-echo   set PYTHONPATH=%CD%\python\Release;%%PYTHONPATH%%
-echo.
-echo Then you can import from anywhere:
-echo   python -c "import octproengine; print('SUCCESS!')"
-echo.
-echo Or run tests:
-echo   cd python\tests (from project root)
-echo   python run_all_tests.py
-echo.
-echo Note: If python is not in your PATH, use py instead of python in the commands above, for example: py run_all_tests.py
+if /i "%BUILD_PYTHON%"=="ON" (
+	echo Python module location:
+	dir /b python\Release\octproengine*.pyd 2>nul
+	echo.
+	echo To quickly test:
+	echo   cd build\python\Release
+	echo   "%PYTHON_EXE%" -c "import octproengine; print('SUCCESS!')"
+	echo.
+	echo To use the Python module, set PYTHONPATH:
+	echo   set PYTHONPATH=%CD%\python\Release;%%PYTHONPATH%%
+	echo.
+	echo Then you can import from anywhere:
+	echo   python -c "import octproengine; print('SUCCESS!')"
+	echo.
+	echo Or run tests:
+	echo   cd python\tests (from project root)
+	echo   python run_all_tests.py
+	echo.
+	echo Note: If python is not in your PATH, use py instead of python in the commands above, for example: py run_all_tests.py
+)
 if /i "%BUILD_OCT_VIEWER%"=="ON" (
 	echo.
 	echo To start the ImGui app:
