@@ -17,6 +17,7 @@
 
 #include "processor.h"
 #include "processorconfiguration.h"
+#include "octproviewer_benchmark.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -25,6 +26,7 @@
 #include <atomic>
 #include <limits>
 #include <cmath>
+#include <algorithm>
 
 // ============================================================================
 // Data Structures
@@ -107,6 +109,8 @@ struct AppState {
 
 	std::vector<uint8_t> rawDataCache;
 	bool hasDataLoaded = false;
+
+	BenchmarkState benchmark;
 };
 
 // ============================================================================
@@ -786,15 +790,21 @@ int main(int argc, char** argv) {
 	// Main loop
 	while (!glfwWindowShouldClose(window)) {
 		glfwPollEvents();
+		finalizeBenchmarkThread(state.benchmark);
 		updateTexture(&state);
 
 		ImGui_ImplOpenGL3_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		ImGui::NewFrame();
 
+		renderBenchmarkMenuBar(state.benchmark, window);
+		renderBenchmarkDialog(state.benchmark);
+
+		const float topOffset = ImGui::GetFrameHeight() + 10.0f;
+
 		// Control Panel
 		if (firstFrame) {
-			ImGui::SetNextWindowPos(ImVec2(10, 10));
+			ImGui::SetNextWindowPos(ImVec2(10, topOffset));
 			ImGui::SetNextWindowSize(ImVec2(400, 850));
 		}
 		ImGui::Begin("OCT Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -814,13 +824,15 @@ int main(int argc, char** argv) {
 
 		// Image Display
 		if (firstFrame) {
-			ImGui::SetNextWindowPos(ImVec2(420, 10));
+			ImGui::SetNextWindowPos(ImVec2(420, topOffset));
 			ImGui::SetNextWindowSize(ImVec2(1160, 850));
 			firstFrame = false;
 		}
 		ImGui::Begin("OCT Image");
 		renderImageDisplay(&state);
 		ImGui::End();
+
+		renderBenchmarkResultsWindow(state.benchmark);
 
 		// Render
 		ImGui::Render();
@@ -838,6 +850,7 @@ int main(int argc, char** argv) {
 	if (state.display.textureID != 0) {
 		glDeleteTextures(1, &state.display.textureID);
 	}
+	stopBenchmarkThread(state.benchmark);
 	if (state.processor) {
 		state.processor->cleanup();
 		delete state.processor;

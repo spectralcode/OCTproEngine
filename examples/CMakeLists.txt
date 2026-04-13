@@ -102,7 +102,11 @@ if(BUILD_OCT_VIEWER)
 	)
 
 	# Create octproviewer executable
-	add_executable(octproviewer octproviewer.cpp ${IMGUI_SOURCES})
+	add_executable(octproviewer
+		octproviewer.cpp
+		octproviewer_benchmark.cpp
+		${IMGUI_SOURCES}
+	)
 
 	# Include directories
 	target_include_directories(octproviewer PRIVATE
