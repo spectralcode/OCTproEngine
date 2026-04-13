@@ -638,30 +638,57 @@ void testDiskWritePerformance() {
 	recorder.setMode(ope::tools::Recorder::Mode::BOTH);
 	recorder.setOutputBaseName("test_perf_both");
 
+	// Add timing callback to measure actual processing throughput
+	std::atomic<int> processedCount{0};
+	std::chrono::high_resolution_clock::time_point processingEnd;
+	processor.addOutputCallback([&](const ope::IOBuffer& buf) {
+		int count = ++processedCount;
+		if (count == numBuffers) {
+			processingEnd = std::chrono::high_resolution_clock::now();
+		}
+	});
+
 	recorder.startRecording();
 
+	// Measure processing performance (with recorder attached)
+	auto processingStart = std::chrono::high_resolution_clock::now();
 	for (int i = 0; i < numBuffers; i++) {
 		auto& inputBuffer = processor.getNextAvailableInputBuffer();
 		fillTestData(inputBuffer, processor, i);
 		processor.process(inputBuffer);
 	}
 
+	// Wait for all processing to complete (not disk write)
+	while (processedCount < numBuffers) {
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+
+	double processingDurationSec = std::chrono::duration<double>(processingEnd - processingStart).count();
+	double processingBscansPerSec = numBuffers * bscansPerBuffer / processingDurationSec;
+	double processingMBs = (rawGBperBuffer * numBuffers * 1024.0) / processingDurationSec;
+
+	std::cout << "    Processing performance (with recorder):" << std::endl;
+	std::cout << "      Duration: " << processingDurationSec << " seconds" << std::endl;
+	std::cout << "      B-scans/s: " << processingBscansPerSec << std::endl;
+	std::cout << "      Input throughput: " << processingMBs << " MB/s" << std::endl;
+
 	startTime = std::chrono::high_resolution_clock::now();
 	TEST_ASSERT(recorder.waitForCompletion(30000), "BOTH mode recording timeout");
 	std::string errorMsgBoth = recorder.getLastError();
 	if (!errorMsgBoth.empty()) {
 		std::cout << "Error message: " << errorMsgBoth << std::endl;
-	}	
+	}
 	endTime = std::chrono::high_resolution_clock::now();
 
 	durationSec = std::chrono::duration<double>(endTime - startTime).count();
 	totalGB = (rawGBperBuffer + processedGBperBuffer) * numBuffers;
 	speedMBs = (totalGB * 1024.0) / durationSec;
 
-	std::cout << "    Expected total: " << totalGB << " GB (" << rawGBperBuffer << " + " << processedGBperBuffer << " GB x " << numBuffers << " buffers)" << std::endl;
-	std::cout << "    Duration: " << durationSec << " seconds" << std::endl;
-	std::cout << "    Total written: " << totalGB << " GB (raw + processed)" << std::endl;
-	std::cout << "    Estimated combined write speed: " << speedMBs << " MB/s" << std::endl;
+	std::cout << "    Disk write performance:" << std::endl;
+	std::cout << "      Expected total: " << totalGB << " GB (" << rawGBperBuffer << " + " << processedGBperBuffer << " GB x " << numBuffers << " buffers)" << std::endl;
+	std::cout << "      Duration: " << durationSec << " seconds" << std::endl;
+	std::cout << "      Total written: " << totalGB << " GB (raw + processed)" << std::endl;
+	std::cout << "      Estimated combined write speed: " << speedMBs << " MB/s" << std::endl;
 
 	deleteTestFile("test_perf_both_raw.raw");
 	deleteTestFile("test_perf_both.raw");

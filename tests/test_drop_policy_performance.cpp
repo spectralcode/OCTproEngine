@@ -23,9 +23,9 @@ constexpr ope::Backend TEST_BACKEND = ope::Backend::CUDA;
 constexpr int SIGNAL_LENGTH = 2048;
 constexpr int ASCANS_PER_BSCAN = 512;
 constexpr int BSCANS_PER_BUFFER = 1;
-constexpr int NUM_ITERATIONS = 1000;
+constexpr int NUM_ITERATIONS = 10000;
 constexpr int MAX_CONSUMERS = 8;
-constexpr int CONSUMER_DELAY_US = 500; 
+constexpr int CONSUMER_DELAY_US = 1000000; 
 
 int main() {
 	std::cout << "========================================" << std::endl;
@@ -56,15 +56,30 @@ int main() {
 		config.processingParams.dcRemoval.enabled = false;
 		config.processingParams.intensity.logScale = true;
 		processor.setConfig(config);
+
+		//manually set number of output buffers for CUDA backend
+		if(TEST_BACKEND == ope::Backend::CUDA){
+			auto backendConfig = processor.getBackendConfig();
+			auto* cudaConfig = static_cast<ope::CudaConfig*>(backendConfig.get());
+			cudaConfig->numOutputBuffers = 16;
+			processor.setBackendConfig(*backendConfig);  // Dereference the unique_ptr
+		} 
+/*  		if(TEST_BACKEND == ope::Backend::VULKAN){
+			auto backendConfig = processor.getBackendConfig();
+			auto* vulkanConfig = static_cast<ope::VulkanConfig*>(backendConfig.get());
+			vulkanConfig->numOutputBuffers = 16;
+			processor.setBackendConfig(*backendConfig);  // Dereference the unique_ptr
+		}  */
+
 		processor.initialize();
 
 		auto& dataParams = processor.getConfig().dataParams;
 		size_t outputBufferSize = dataParams.outputSignalLength() * dataParams.ascansPerBscan * dataParams.bscansPerBuffer * dataParams.getOutputBytesPerSample();
 
-		// Add one fast BLOCK consumer (should receive all frames)
+		// Add one fast BLOCK consumer (shoSuld receive all frames)
 		ope::ConsumerConfig blockConfig;
 		blockConfig.dropPolicy = ope::DropPolicy::BLOCK;
-		blockConfig.maxQueueSize = 32;
+		blockConfig.maxQueueSize = 1;  // Keep small to avoid buffer accumulation
 		ope::ConsumerId blockConsumer = processor.addConsumer(blockConfig);
 		std::atomic<int> blockReceivedCount{0};
 		std::chrono::high_resolution_clock::time_point endTime;
@@ -93,16 +108,27 @@ int main() {
 		std::atomic<bool> done{false};
 		std::vector<std::thread> threads;
 
+		// Copy buffers for slow consumers
+		std::vector<std::vector<char>> slowCopyBuffers(numConsumers);
+		for (int c = 0; c < numConsumers; ++c) {
+			slowCopyBuffers[c].resize(outputBufferSize);
+		}
+
 		for (int c = 0; c < numConsumers; ++c) {
 			ope::ConsumerConfig consumerConfig;
 			consumerConfig.dropPolicy = ope::DropPolicy::DROP_OLDEST;
-			consumerConfig.maxQueueSize = 16;
+			consumerConfig.maxQueueSize = 1;  // Must be < output buffer count for drops to happen
 			consumers.push_back(processor.addConsumer(consumerConfig));
 
 			threads.emplace_back([&, c]() {
 				while (!done.load()) {
+					//if(receivedCounts[c] < 10){
 					ope::IOBuffer* output = processor.getNextOutputBuffer(consumers[c]);
 					if (!output) break;
+
+					// Copy output data (simulates real consumer work)
+					std::memcpy(slowCopyBuffers[c].data(), output->getDataPointer(), outputBufferSize);
+
 
 					// Simulate slow consumer
 					std::this_thread::sleep_for(std::chrono::microseconds(CONSUMER_DELAY_US));
@@ -193,7 +219,7 @@ int main() {
 	std::cout << std::endl;
 	std::cout << "DROP_OLDEST allows processing to continue at full speed." << std::endl;
 	std::cout << std::endl;
-	std::cout << "PASSED" << std::endl;
+	std::cout << "PASSED" << std::endl; //todo: this is not a real pass/fail test. its more of a performance test. this "PASSED" doesnt make sense here. seperate performance tests from functional tests
 
 	return 0;
 }

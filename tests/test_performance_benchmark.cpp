@@ -25,15 +25,15 @@
 // ============================================
 // Desktop: Full benchmark with all backends
 // ============================================
-const bool BENCHMARK_CPU = true;
+const bool BENCHMARK_CPU = false;
 const bool BENCHMARK_CUDA = true;
-const bool BENCHMARK_OPENCL = true;
+const bool BENCHMARK_OPENCL = false;
 const bool BENCHMARK_VULKAN = true;
 
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
 const int BSCANS_PER_BUFFER[] = {1};
-const int ITERATIONS = 100;
+const int ITERATIONS = 1000;
 
 #else
 // ============================================
@@ -274,22 +274,23 @@ BenchmarkResult runBenchmark(
 	                 (backend == ope::Backend::VULKAN) ? "Vulkan" : "OpenCL";
 	result.iterations = ITERATIONS;
 	result.speedup = 1.0;
-	
+		
+	std::atomic<int> completedIterations(0);
+	size_t outputBufferSize = (signalLength / 2) * ascansPerBscan * bscansPerBuffer * sizeof(float);
+	std::vector<uint8_t> tempBuffer(outputBufferSize);
+
 	ope::Processor processor(backend);
 	configureProcessor(processor, signalLength, ascansPerBscan, bscansPerBuffer);
 	processor.initialize();
 	
 	size_t dataSizeBytes = testData.size() * sizeof(uint16_t);
-	
-	std::atomic<int> completedIterations(0);
-	size_t outputBufferSize = (signalLength / 2) * ascansPerBscan * bscansPerBuffer * sizeof(float);
-	std::vector<uint8_t> tempBuffer(outputBufferSize);
 
-	processor.setOutputCallback([&completedIterations, &tempBuffer, outputBufferSize](const ope::IOBuffer& output) {
-		completedIterations++;
 
+	processor.addOutputCallback([&completedIterations, &tempBuffer, outputBufferSize](const ope::IOBuffer& output) {
 		// copy output data to temp buffer to simulate actual use of data
 		std::memcpy(tempBuffer.data(), output.getDataPointer(), outputBufferSize);
+
+		completedIterations++;
 	});
 	
 	auto startTime = std::chrono::high_resolution_clock::now();
