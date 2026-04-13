@@ -119,7 +119,7 @@ if(BUILD_OCT_VIEWER)
 
 	# Platform-specific OpenGL linking
 	if(WIN32)
-		target_link_libraries(octproviewer PRIVATE opengl32)
+		target_link_libraries(octproviewer PRIVATE opengl32 Comdlg32)
 	else()
 		# Linux/Unix/MacOS
 		find_package(OpenGL REQUIRED)

@@ -6,6 +6,15 @@
 #include "imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <commdlg.h>
+#endif
+
 #include "processor.h"
 #include "processorconfiguration.h"
 #include <iostream>
@@ -113,6 +122,32 @@ std::vector<unsigned char> rotateImage90CCW(const unsigned char* input, int widt
 	}
 	return output;
 }
+
+#ifdef _WIN32
+bool browseForCustomFile(AppState* state) {
+	char selectedPath[sizeof(state->filePathBuffer)] = "";
+	if (state->filePathBuffer[0] != '\0') {
+		strncpy(selectedPath, state->filePathBuffer, sizeof(selectedPath) - 1);
+		selectedPath[sizeof(selectedPath) - 1] = '\0';
+	}
+
+	OPENFILENAMEA dialog = {};
+	dialog.lStructSize = sizeof(dialog);
+	dialog.lpstrFile = selectedPath;
+	dialog.nMaxFile = static_cast<DWORD>(sizeof(selectedPath));
+	dialog.lpstrFilter = "All Files\0*.*\0\0";
+	dialog.lpstrTitle = "Select OCT data file";
+	dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+
+	if (!GetOpenFileNameA(&dialog)) {
+		return false;
+	}
+
+	strncpy(state->filePathBuffer, selectedPath, sizeof(state->filePathBuffer) - 1);
+	state->filePathBuffer[sizeof(state->filePathBuffer) - 1] = '\0';
+	return true;
+}
+#endif
 
 void onProcessedData(const ope::IOBuffer& output, AppState* state) {
 	std::lock_guard<std::mutex> lock(state->display.dataMutex);
@@ -524,7 +559,18 @@ void renderDataLoadingUI(AppState* state) {
 		}
 	} else {
 		ImGui::InputText("File Path", state->filePathBuffer, sizeof(state->filePathBuffer));
+#ifdef _WIN32
+		ImGui::SameLine();
+		if (ImGui::Button("Browse...")) {
+			browseForCustomFile(state);
+		}
+#endif
 		if (ImGui::Button("Load & Process Custom File", ImVec2(-1, 0))) {
+#ifdef _WIN32
+			if (state->filePathBuffer[0] == '\0' && !browseForCustomFile(state)) {
+				return;
+			}
+#endif
 			loadFileData(state);
 		}
 	}
