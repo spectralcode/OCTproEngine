@@ -15,7 +15,7 @@ if not exist "CMakeLists.txt" (
 )
 
 REM Find Python
-REM Priority: 1) User-set PYTHON_EXE, 2) python in PATH
+REM Priority: 1) User-set PYTHON_EXE, 2) python in PATH, 3) py -3, 4) py
 if not "%PYTHON_EXE%"=="" (
 	echo Using user-specified Python: %PYTHON_EXE%
 	goto :python_found
@@ -25,6 +25,20 @@ REM Try python in PATH
 where python.exe >nul 2>&1
 if %errorlevel% equ 0 (
 	for /f "delims=" %%i in ('where python.exe') do set "PYTHON_EXE=%%i"
+	goto :python_found
+)
+
+REM Try the Windows Python launcher with Python 3 first
+py -3 -c "import sys; print(sys.executable)" >nul 2>&1
+if %errorlevel% equ 0 (
+	for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)"') do set "PYTHON_EXE=%%i"
+	goto :python_found
+)
+
+REM Fall back to the default Windows Python launcher
+py -c "import sys; print(sys.executable)" >nul 2>&1
+if %errorlevel% equ 0 (
+	for /f "delims=" %%i in ('py -c "import sys; print(sys.executable)"') do set "PYTHON_EXE=%%i"
 	goto :python_found
 )
 
@@ -134,6 +148,6 @@ echo Or run tests:
 echo   cd python\tests (from project root)
 echo   python run_all_tests.py
 echo.
-
+echo Note: If python is not in your PATH, use py instead of python in the commands above, for example: py run_all_tests.py
 cd ..
 pause
