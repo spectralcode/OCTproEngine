@@ -1,0 +1,2 @@
+- remove output_buffer_manager
+- separate functional tests from performance tests
