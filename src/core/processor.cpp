@@ -12,7 +12,7 @@
 #ifdef OPE_VULKAN_AVAILABLE
 #include "../backends/vulkan/vulkan_backend.h"
 #endif
-#include "output_buffer_manager.h"
+#include "buffer_manager.h"
 #include "callback_manager.h"
 #include <stdexcept>
 #include <fstream>
@@ -35,7 +35,8 @@ public:
 	bool initialized = false;
 	ProcessorConfiguration::DataParameters lastInitializedDataParams = {};
 
-	OutputBufferManager outputManager;
+	BufferManager outputBufferManager;   // For processed data consumers
+	BufferManager inputBufferManager;    // For raw data consumers
 	CallbackManager inputCallbackManager;
 	uint64_t nextBufferId = 0;  // Simple counter, not atomic
 
@@ -68,7 +69,8 @@ public:
 			}
 		}
 		// Remove all consumers (wakes up waiting threads)
-		this->outputManager.shutdown();
+		this->outputBufferManager.shutdown();
+		this->inputBufferManager.shutdown();
 		// Join all callback threads
 		{
 			std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
@@ -305,17 +307,23 @@ public:
 		this->backend->initialize(this->config);
 
 		// Set buffer count from backend before setting callbacks
-		this->outputManager.setBufferCount(this->backend->getOutputBufferCount());
+		this->outputBufferManager.setBufferCount(this->backend->getOutputBufferCount());
 
 		// Setup release callback for OutputBufferManager
-		this->outputManager.setReleaseCallback([this](IOBuffer* buf) {
+		this->outputBufferManager.setReleaseCallback([this](IOBuffer* buf) {
 			this->backend->releaseOutputBuffer(buf);
 		});
 
 		// Setup internal callback that distributes to all consumers via OutputBufferManager
 		this->backend->setOutputCallback([this](const IOBuffer& output) {
-			this->outputManager.publish(const_cast<IOBuffer*>(&output));
+			this->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
 		});
+
+		// Setup input buffers for raw data consumers
+		this->inputBufferManager.setBufferCount(this->backend->getNumInputBuffers());
+
+		// No release callback needed. backend manages buffer lifecycle independently
+		// Consumers just read the data, backend processes and releases buffers
 
 		this->initialized = true;
 
@@ -513,16 +521,16 @@ void Processor::setBackend(Backend backend) {
 		this->impl->backend->initialize(this->impl->config);
 
 		// Set buffer count from backend before setting callbacks
-		this->impl->outputManager.setBufferCount(this->impl->backend->getOutputBufferCount());
+		this->impl->outputBufferManager.setBufferCount(this->impl->backend->getOutputBufferCount());
 
 		// Setup release callback for OutputBufferManager
-		this->impl->outputManager.setReleaseCallback([this](IOBuffer* buf) {
+		this->impl->outputBufferManager.setReleaseCallback([this](IOBuffer* buf) {
 			this->impl->backend->releaseOutputBuffer(buf);
 		});
 
 		// Setup internal callback that distributes to all consumers via OutputBufferManager
 		this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
-			this->impl->outputManager.publish(const_cast<IOBuffer*>(&output));
+			this->impl->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
 		});
 
 		this->impl->initialized = true;
@@ -548,7 +556,7 @@ Processor::CallbackId Processor::addOutputCallback(OutputCallback callback, Cons
 	CallbackId callbackId = this->impl->nextCallbackId++;
 
 	// Register a consumer for this callback
-	ConsumerId consumerId = this->impl->outputManager.addConsumer(config);
+	ConsumerId consumerId = this->impl->outputBufferManager.addConsumer(config);
 
 	// Create callback state and store it first (before starting thread)
 	auto state = std::make_unique<Impl::CallbackState>();
@@ -566,7 +574,7 @@ Processor::CallbackId Processor::addOutputCallback(OutputCallback callback, Cons
 	// Now spawn thread with stable pointer to running flag
 	statePtr->thread = std::thread([this, consumerId, callback, statePtr]() {
 		while (statePtr->running.load(std::memory_order_acquire)) {
-			IOBuffer* buffer = this->impl->outputManager.getNext(consumerId);
+			IOBuffer* buffer = this->impl->outputBufferManager.getNext(consumerId);
 			if (!buffer) {
 				// Consumer was removed or shutdown
 				break;
@@ -576,7 +584,7 @@ Processor::CallbackId Processor::addOutputCallback(OutputCallback callback, Cons
 			} catch (...) {
 				// Callback threw exception - still need to release buffer
 			}
-			this->impl->outputManager.release(consumerId, buffer);
+			this->impl->outputBufferManager.release(consumerId, buffer);
 		}
 	});
 
@@ -594,7 +602,7 @@ bool Processor::removeOutputCallback(CallbackId id) {
 	it->second->running = false;
 
 	// Remove consumer (wakes up waiting thread)
-	this->impl->outputManager.removeConsumer(it->second->consumerId);
+	this->impl->outputBufferManager.removeConsumer(it->second->consumerId);
 
 	// Join thread
 	if (it->second->thread.joinable()) {
@@ -610,7 +618,7 @@ void Processor::clearOutputCallbacks() {
 	std::lock_guard<std::mutex> lock(this->impl->callbackStatesMutex);
 	for (auto& pair : this->impl->callbackStates) {
 		pair.second->running = false;
-		this->impl->outputManager.removeConsumer(pair.second->consumerId);
+		this->impl->outputBufferManager.removeConsumer(pair.second->consumerId);
 		if (pair.second->thread.joinable()) {
 			pair.second->thread.join();
 		}
@@ -646,9 +654,15 @@ void Processor::process(IOBuffer& input) {
 	uint64_t bufferId = this->impl->nextBufferId++;
 	input.setBufferId(bufferId);
 
+	// Existing: input callbacks (synchronous, before consumers)
 	this->impl->inputCallbackManager.invokeAll(input);
 
+	// Start backend processing immediately (uploads to GPU, returns buffer when done)
 	this->impl->backend->process(input);
+
+	// Also publish to input consumers so they can read raw data
+	// Consumers read from CPU buffer while GPU is processing
+	this->impl->inputBufferManager.publish(&input);
 }
 
 // ============================================
@@ -677,27 +691,55 @@ int Processor::getNumInputBuffers() const {
 // ============================================
 
 ConsumerId Processor::addConsumer(ConsumerConfig config) {
-	return this->impl->outputManager.addConsumer(config);
+	return this->impl->outputBufferManager.addConsumer(config);
 }
 
 void Processor::removeConsumer(ConsumerId id) {
-	this->impl->outputManager.removeConsumer(id);
+	this->impl->outputBufferManager.removeConsumer(id);
 }
 
 bool Processor::tryGetOutputBuffer(ConsumerId id, IOBuffer** output) {
-	return this->impl->outputManager.tryGet(id, output);
+	return this->impl->outputBufferManager.tryGet(id, output);
 }
 
 IOBuffer* Processor::getNextOutputBuffer(ConsumerId id) {
-	return this->impl->outputManager.getNext(id);
+	return this->impl->outputBufferManager.getNext(id);
 }
 
 void Processor::releaseOutputBuffer(ConsumerId id, IOBuffer* buffer) {
-	this->impl->outputManager.release(id, buffer);
+	this->impl->outputBufferManager.release(id, buffer);
 }
 
 uint64_t Processor::getDroppedFrameCount(ConsumerId id) const {
-	return this->impl->outputManager.getDroppedCount(id);
+	return this->impl->outputBufferManager.getDroppedCount(id);
+}
+
+// ============================================
+// INPUT POLLING API
+// ============================================
+
+ConsumerId Processor::addInputConsumer(ConsumerConfig config) {
+	return this->impl->inputBufferManager.addConsumer(config);
+}
+
+void Processor::removeInputConsumer(ConsumerId id) {
+	this->impl->inputBufferManager.removeConsumer(id);
+}
+
+bool Processor::tryGetInputBuffer(ConsumerId id, IOBuffer** output) {
+	return this->impl->inputBufferManager.tryGet(id, output);
+}
+
+IOBuffer* Processor::getNextInputBuffer(ConsumerId id) {
+	return this->impl->inputBufferManager.getNext(id);
+}
+
+void Processor::releaseInputBuffer(ConsumerId id, IOBuffer* buffer) {
+	this->impl->inputBufferManager.release(id, buffer);
+}
+
+uint64_t Processor::getInputDroppedFrameCount(ConsumerId id) const {
+	return this->impl->inputBufferManager.getDroppedCount(id);
 }
 
 // ============================================

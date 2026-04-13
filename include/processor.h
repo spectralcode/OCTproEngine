@@ -139,6 +139,30 @@ public:
 	void clearInputCallbacks();
 	size_t getInputCallbackCount() const;
 
+	// ============================================
+	// INPUT POLLING API (alternative to input callbacks)
+	// For reading raw camera/input data before processing
+	// ============================================
+
+	// Register a consumer for polling-based input buffer retrieval
+	ConsumerId addInputConsumer(ConsumerConfig config = {});
+
+	// Remove an input consumer (releases any queued buffers)
+	void removeInputConsumer(ConsumerId id);
+
+	// Non-blocking: returns true if input buffer available
+	bool tryGetInputBuffer(ConsumerId id, IOBuffer** output);
+
+	// Blocking: waits for next raw input buffer
+	// Returns nullptr if consumer was removed or shutdown
+	IOBuffer* getNextInputBuffer(ConsumerId id);
+
+	// Release input buffer back (required after tryGetInputBuffer/getNextInputBuffer)
+	void releaseInputBuffer(ConsumerId id, IOBuffer* buffer);
+
+	// Get number of dropped frames for input consumer (only for DROP_OLDEST policy)
+	uint64_t getInputDroppedFrameCount(ConsumerId id) const;
+
 	//dont use this, only for testing. will be removed
 	IOBuffer& getInputBuffer(int index);
 	int getNumInputBuffers() const;
