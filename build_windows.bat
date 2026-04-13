@@ -70,7 +70,7 @@ REM Check if FFTW already exists
 if exist "..\thirdparty\fftw\libfftw3f-3.dll" (
 	echo FFTW3 found in thirdparty folder
 	set FFTW_DOWNLOAD_FLAG=
-	goto :configure
+	goto :viewer_option_start
 )
 
 REM Ask user if they want to download FFTW
@@ -101,11 +101,35 @@ if /i "%DOWNLOAD_CHOICE%"=="Y" (
 	echo.
 )
 
+REM Ask if OCTproViewer should be built
+:viewer_option_start
+if /i "%BUILD_OCT_VIEWER%"=="ON" goto :viewer_option_ready
+if /i "%BUILD_OCT_VIEWER%"=="OFF" goto :viewer_option_ready
+
+echo.
+echo ========================================
+echo OCTproViewer (ImGui app)
+echo ========================================
+echo.
+echo OCTproViewer is an optional interactive ImGui app.
+echo Enabling it may download GLFW and ImGui on first build.
+choice /C YN /N /M "Do you want to build OCTproViewer? [Y/N]: "
+if errorlevel 2 (
+	set "BUILD_OCT_VIEWER=OFF"
+) else (
+	set "BUILD_OCT_VIEWER=ON"
+)
+echo.
+
+:viewer_option_ready
+echo OCTproViewer build: %BUILD_OCT_VIEWER%
+echo.
+
 :configure
 
 REM Configure (FFTW will auto-download to thirdparty/fftw if user said yes)
 echo Configuring CMake...
-cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=ON -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DCMAKE_BUILD_TYPE=Release
+cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=ON -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DBUILD_OCT_VIEWER=%BUILD_OCT_VIEWER% -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 (
 	echo.
 	echo ERROR: CMake configuration failed!
@@ -149,5 +173,11 @@ echo   cd python\tests (from project root)
 echo   python run_all_tests.py
 echo.
 echo Note: If python is not in your PATH, use py instead of python in the commands above, for example: py run_all_tests.py
+if /i "%BUILD_OCT_VIEWER%"=="ON" (
+	echo.
+	echo To start the ImGui app:
+	echo   cd build\examples\Release
+	echo   octproviewer.exe
+)
 cd ..
 pause
