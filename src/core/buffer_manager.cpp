@@ -140,6 +140,10 @@ void BufferManager::publish(IOBuffer* buffer) {
 		return;
 	}
 
+	// A buffer must be fully released before the producer publishes it again
+	// (the Processor gates input-buffer reuse via waitUntilReleased())
+	assert(ref->count.load(std::memory_order_acquire) == 0);
+
 	// The publisher holds its own reference while distributing. This way the
 	// refcount can never drop to zero before all pushes are accounted for,
 	// no matter how consumers are added or removed concurrently.
@@ -273,6 +277,7 @@ void BufferManager::decrementRef(IOBuffer* buffer) {
 	}
 
 	int prevCount = ref->count.fetch_sub(1, std::memory_order_acq_rel);
+	assert(prevCount > 0);
 	if (prevCount == 1) {
 		// Last reference - return buffer to pool
 		if (this->releaseCallback) {
@@ -294,6 +299,40 @@ void BufferManager::waitUntilReleased(IOBuffer* buffer) {
 	if (!ref) {
 		// Never published, no consumer can hold a reference
 		return;
+	}
+
+	// Fast path: buffer already fully released (common case without consumers)
+	if (ref->count.load(std::memory_order_acquire) <= 0) {
+		return;
+	}
+
+	// Reclaim copies still queued at DROP_OLDEST consumers first: their contract
+	// is to never block the producer, so a copy waiting in such a queue is
+	// dropped (counted as dropped frame) instead of gating buffer reuse.
+	// Without this, drop-on-publish can never fire because the producer blocks
+	// here before it can publish, and DROP_OLDEST would degenerate into BLOCK.
+	// References held by BLOCK consumers or by currently dequeued buffers
+	// still block below until they are released.
+	for (auto& slot : this->slots) {
+		int reclaimed = 0;
+		{
+			std::lock_guard<std::mutex> lock(slot.blockMutex);
+			if (slot.active.load(std::memory_order_acquire) &&
+			    slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
+				for (auto it = slot.queue.begin(); it != slot.queue.end();) {
+					if (*it == buffer) {
+						it = slot.queue.erase(it);
+						reclaimed++;
+					} else {
+						++it;
+					}
+				}
+			}
+		}
+		for (int i = 0; i < reclaimed; i++) {
+			slot.droppedCount.fetch_add(1, std::memory_order_relaxed);
+			this->decrementRef(buffer);
+		}
 	}
 
 	std::unique_lock<std::mutex> lock(this->refReleaseMutex);

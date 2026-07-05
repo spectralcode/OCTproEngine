@@ -684,7 +684,12 @@ IOBuffer& Processor::getInputBuffer(int index) {
 
 IOBuffer& Processor::getNextAvailableInputBuffer() {
 	//this->impl->ensureInitialized();
-	return this->impl->backend->getNextAvailableInputBuffer();
+	IOBuffer& buffer = this->impl->backend->getNextAvailableInputBuffer();
+	// The backend only tracks its own use of the buffer (upload/processing).
+	// Input consumers may still be reading it, so block here until every
+	// consumer has released its reference before the caller overwrites the data.
+	this->impl->inputBufferManager.waitUntilReleased(&buffer);
+	return buffer;
 }
 
 int Processor::getNumInputBuffers() const {
