@@ -59,11 +59,15 @@ add_ope_test(test_input_consumer test_input_consumer.cpp)
 add_ope_test(test_consumer_performance_impact test_consumer_performance_impact.cpp)
 add_ope_test(test_consumers_performance test_consumers_performance.cpp)
 
-# Standalone BufferManager stress test: compiles buffer_manager.cpp directly
+# Standalone BufferManager stress tests: compile buffer_manager.cpp directly
 # because BufferManager is internal and not exported from the library
 add_ope_test(test_consumer_churn_stress test_consumer_churn_stress.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
 target_include_directories(test_consumer_churn_stress PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_tests_properties(test_consumer_churn_stress PROPERTIES TIMEOUT 120)
+
+add_ope_test(test_consumer_lifecycle test_consumer_lifecycle.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
+target_include_directories(test_consumer_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_consumer_lifecycle PROPERTIES TIMEOUT 120)
 
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)

@@ -1,5 +1,6 @@
 #include "buffer_manager.h"
 #include <cassert>
+#include <climits>
 #include <iostream>
 
 namespace ope {
@@ -9,6 +10,14 @@ BufferManager::BufferManager() {
 
 BufferManager::~BufferManager() {
 	this->shutdown();
+}
+
+int BufferManager::slotIndexFromId(ConsumerId id) {
+	if (id < 0) {
+		return -1;
+	}
+	// Low part encodes the slot index, upper part the slot generation (see addConsumer)
+	return id % MAX_CONSUMERS;
 }
 
 void BufferManager::setBufferCount(size_t count) {
@@ -72,10 +81,15 @@ ConsumerId BufferManager::addConsumer(ConsumerConfig config) {
 				if (slot.config.maxQueueSize == 0) {
 					slot.config.maxQueueSize = this->bufferCount;
 				}
+				slot.queue.clear();
 				slot.droppedCount.store(0, std::memory_order_relaxed);
+				// Encode a per-slot generation into the ID so a stale ID of a removed
+				// consumer can never address a new consumer in the same slot
+				slot.generation = (slot.generation + 1) % (INT_MAX / MAX_CONSUMERS);
+				slot.currentId = static_cast<ConsumerId>(slot.generation) * MAX_CONSUMERS + i;
 				slot.active.store(true, std::memory_order_release);
 				this->activeCount.fetch_add(1, std::memory_order_relaxed);
-				return i;
+				return slot.currentId;
 			}
 		}
 	}
@@ -83,13 +97,14 @@ ConsumerId BufferManager::addConsumer(ConsumerConfig config) {
 }
 
 void BufferManager::removeConsumer(ConsumerId id) {
-	if (id < 0 || id >= MAX_CONSUMERS) return;
+	int index = slotIndexFromId(id);
+	if (index < 0) return;
 
-	auto& slot = this->slots[id];
+	auto& slot = this->slots[index];
 	std::vector<IOBuffer*> drained;
 	{
 		std::lock_guard<std::mutex> lock(slot.blockMutex);
-		if (!slot.active.load(std::memory_order_acquire)) return;
+		if (!slot.active.load(std::memory_order_acquire) || slot.currentId != id) return;
 
 		slot.active.store(false, std::memory_order_release);
 		this->activeCount.fetch_sub(1, std::memory_order_relaxed);
@@ -196,11 +211,12 @@ bool BufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
 }
 
 bool BufferManager::tryGet(ConsumerId id, IOBuffer** output) {
-	if (id < 0 || id >= MAX_CONSUMERS) return false;
+	int index = slotIndexFromId(id);
+	if (index < 0) return false;
 
-	auto& slot = this->slots[id];
+	auto& slot = this->slots[index];
 	std::lock_guard<std::mutex> lock(slot.blockMutex);
-	if (!slot.active.load(std::memory_order_acquire)) return false;
+	if (!slot.active.load(std::memory_order_acquire) || slot.currentId != id) return false;
 	if (slot.queue.empty()) return false;
 
 	*output = slot.queue.front();
@@ -211,18 +227,20 @@ bool BufferManager::tryGet(ConsumerId id, IOBuffer** output) {
 }
 
 IOBuffer* BufferManager::getNext(ConsumerId id) {
-	if (id < 0 || id >= MAX_CONSUMERS) return nullptr;
+	int index = slotIndexFromId(id);
+	if (index < 0) return nullptr;
 
-	auto& slot = this->slots[id];
+	auto& slot = this->slots[index];
 	std::unique_lock<std::mutex> lock(slot.blockMutex);
 
 	slot.blockCV.wait(lock, [&]() {
 		return !slot.queue.empty() ||
 		       !slot.active.load(std::memory_order_acquire) ||
+		       slot.currentId != id ||
 		       !this->running.load(std::memory_order_acquire);
 	});
 
-	if (slot.queue.empty()) {
+	if (slot.currentId != id || slot.queue.empty()) {
 		return nullptr;
 	}
 
@@ -237,8 +255,11 @@ IOBuffer* BufferManager::getNext(ConsumerId id) {
 }
 
 void BufferManager::release(ConsumerId id, IOBuffer* buffer) {
-	if (id < 0 || id >= MAX_CONSUMERS) return;
+	int index = slotIndexFromId(id);
+	if (index < 0) return;
 
+	// Deliberately no currentId validation: a consumer must be able to release
+	// an in-flight buffer after removeConsumer() (removal only drains queued buffers)
 	this->decrementRef(buffer);
 }
 
@@ -283,14 +304,20 @@ void BufferManager::waitUntilReleased(IOBuffer* buffer) {
 }
 
 uint64_t BufferManager::getDroppedCount(ConsumerId id) const {
-	if (id < 0 || id >= MAX_CONSUMERS) return 0;
-	return this->slots[id].droppedCount.load(std::memory_order_acquire);
+	int index = slotIndexFromId(id);
+	if (index < 0) return 0;
+	auto& slot = this->slots[index];
+	std::lock_guard<std::mutex> lock(slot.blockMutex);
+	if (slot.currentId != id) return 0;
+	return slot.droppedCount.load(std::memory_order_acquire);
 }
 
 size_t BufferManager::getQueueSize(ConsumerId id) const {
-	if (id < 0 || id >= MAX_CONSUMERS) return 0;
-	auto& slot = this->slots[id];
+	int index = slotIndexFromId(id);
+	if (index < 0) return 0;
+	auto& slot = this->slots[index];
 	std::lock_guard<std::mutex> lock(slot.blockMutex);
+	if (slot.currentId != id) return 0;
 	return slot.queue.size();
 }
 

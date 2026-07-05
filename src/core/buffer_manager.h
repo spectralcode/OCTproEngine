@@ -128,6 +128,11 @@ private:
 		ConsumerConfig config;
 		std::atomic<bool> active{false};
 		std::atomic<uint64_t> droppedCount{0};
+		// Generation counter makes ConsumerIds unique across slot reuse,
+		// so a stale ID of a removed consumer can never address a new consumer
+		// that happens to occupy the same slot (ABA problem)
+		int generation = 0;
+		ConsumerId currentId = -1;
 	};
 
 	// Reference counting is keyed by buffer pointer instead of IOBuffer::getBackendIndex(),
@@ -153,6 +158,7 @@ private:
 	ReleaseCallback releaseCallback;
 	std::atomic<bool> running{true};
 
+	static int slotIndexFromId(ConsumerId id);
 	RefSlot* findRefSlot(IOBuffer* buffer);
 	RefSlot* acquireRefSlot(IOBuffer* buffer);
 	bool pushToSlot(ConsumerSlot& slot, IOBuffer* buffer);
