@@ -3,11 +3,6 @@
 
 namespace ope {
 
-BufferManager::ConsumerSlot::ConsumerSlot()
-	: queue(8)
-{
-}
-
 BufferManager::BufferManager() {
 }
 
@@ -50,7 +45,6 @@ ConsumerId BufferManager::addConsumer(ConsumerConfig config) {
 					slot.config.maxQueueSize = this->bufferCount;
 				}
 				slot.droppedCount.store(0, std::memory_order_relaxed);
-				slot.queueDepth.store(0, std::memory_order_relaxed);
 				slot.active.store(true, std::memory_order_release);
 				this->activeCount.fetch_add(1, std::memory_order_relaxed);
 				return i;
@@ -64,6 +58,7 @@ void BufferManager::removeConsumer(ConsumerId id) {
 	if (id < 0 || id >= MAX_CONSUMERS) return;
 
 	auto& slot = this->slots[id];
+	std::vector<IOBuffer*> drained;
 	{
 		std::lock_guard<std::mutex> lock(slot.blockMutex);
 		if (!slot.active.load(std::memory_order_acquire)) return;
@@ -72,11 +67,14 @@ void BufferManager::removeConsumer(ConsumerId id) {
 		this->activeCount.fetch_sub(1, std::memory_order_relaxed);
 
 		// Release refs for any queued buffers
-		IOBuffer* buf;
-		while (slot.queue.try_dequeue(buf)) {
-			slot.queueDepth.fetch_sub(1, std::memory_order_relaxed);
-			this->decrementRef(buf);
+		while (!slot.queue.empty()) {
+			drained.push_back(slot.queue.front());
+			slot.queue.pop_front();
 		}
+	}
+	// Decrement outside the lock: the release callback may call back into the backend
+	for (IOBuffer* buf : drained) {
+		this->decrementRef(buf);
 	}
 	slot.blockCV.notify_all();
 }
@@ -120,62 +118,47 @@ void BufferManager::publish(IOBuffer* buffer) {
 }
 
 void BufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
-	// For DROP_OLDEST policy, drop old buffers if at capacity
-	// NOTE: Must use mutex because ReaderWriterQueue is SPSC, but both publisher
-	// (dropping old buffers) and consumer (getting buffers) dequeue from it
-	if (slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
-		std::vector<IOBuffer*> toDrop;
-		{
-			std::lock_guard<std::mutex> lock(slot.blockMutex);
+	std::vector<IOBuffer*> toDrop;
+	{
+		// slot.config must only be read under the lock, addConsumer() writes it
+		std::unique_lock<std::mutex> lock(slot.blockMutex);
+		if (!slot.active.load(std::memory_order_acquire)) {
+			// Consumer was removed between publish()'s check and here
+			this->decrementRef(buffer);
+			return;
+		}
+
+		// For DROP_OLDEST policy, drop old buffers if at capacity
+		if (slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
 			// Collect buffers to drop while holding the lock
-			while (slot.queueDepth.load(std::memory_order_acquire) >= slot.config.maxQueueSize) {
-				IOBuffer* dropped;
-				if (slot.queue.try_dequeue(dropped)) {
-					slot.queueDepth.fetch_sub(1, std::memory_order_relaxed);
-					toDrop.push_back(dropped);
-				} else {
-					break;
-				}
+			while (!slot.queue.empty() && slot.queue.size() >= slot.config.maxQueueSize) {
+				toDrop.push_back(slot.queue.front());
+				slot.queue.pop_front();
 			}
 			// Enqueue new buffer while holding lock
-			if (slot.queue.try_enqueue(buffer)) {
-				slot.queueDepth.fetch_add(1, std::memory_order_relaxed);
-			} else {
-				toDrop.push_back(buffer);
-			}
-		}
-		// Release dropped buffers outside the lock
-		for (IOBuffer* dropped : toDrop) {
-			this->decrementRef(dropped);
-			slot.droppedCount.fetch_add(1, std::memory_order_relaxed);
-		}
-		// Notify consumer
-		slot.blockCV.notify_one();
-		return;
-	}
-
-	// BLOCK policy: wait for space in queue, then enqueue
-	{
-		std::unique_lock<std::mutex> lock(slot.blockMutex);
-		// Wait until there's space in the queue or consumer is deactivated
-		slot.blockCV.wait(lock, [&]() {
-			return !slot.active.load(std::memory_order_acquire) ||
-			       slot.queueDepth.load(std::memory_order_acquire) < slot.config.maxQueueSize;
-		});
-
-		if (!slot.active.load(std::memory_order_acquire)) {
-			// Consumer was removed while waiting
-			this->decrementRef(buffer);
-			return;
-		}
-
-		if (slot.queue.try_enqueue(buffer)) {
-			slot.queueDepth.fetch_add(1, std::memory_order_relaxed);
+			slot.queue.push_back(buffer);
 		} else {
-			// Enqueue failed (very rare - only if out of memory)
-			this->decrementRef(buffer);
-			return;
+			// BLOCK policy: wait for space in queue, then enqueue
+			// Wait until there's space in the queue or consumer is deactivated
+			slot.blockCV.wait(lock, [&]() {
+				return !slot.active.load(std::memory_order_acquire) ||
+				       !this->running.load(std::memory_order_acquire) ||
+				       slot.queue.size() < slot.config.maxQueueSize;
+			});
+
+			if (!slot.active.load(std::memory_order_acquire) || !this->running.load(std::memory_order_acquire)) {
+				// Consumer was removed while waiting
+				this->decrementRef(buffer);
+				return;
+			}
+
+			slot.queue.push_back(buffer);
 		}
+	}
+	// Release dropped buffers outside the lock
+	for (IOBuffer* dropped : toDrop) {
+		this->decrementRef(dropped);
+		slot.droppedCount.fetch_add(1, std::memory_order_relaxed);
 	}
 	// Notify consumer that buffer is available
 	slot.blockCV.notify_one();
@@ -185,68 +168,35 @@ bool BufferManager::tryGet(ConsumerId id, IOBuffer** output) {
 	if (id < 0 || id >= MAX_CONSUMERS) return false;
 
 	auto& slot = this->slots[id];
+	std::lock_guard<std::mutex> lock(slot.blockMutex);
 	if (!slot.active.load(std::memory_order_acquire)) return false;
+	if (slot.queue.empty()) return false;
 
-	// For DROP_OLDEST, need mutex since publisher also dequeues (SPSC violation otherwise)
-	if (slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
-		std::lock_guard<std::mutex> lock(slot.blockMutex);
-		if (slot.queue.try_dequeue(*output)) {
-			slot.queueDepth.fetch_sub(1, std::memory_order_relaxed);
-			return true;
-		}
-		return false;
-	}
-
-	// BLOCK policy: lock-free dequeue is safe (only consumer dequeues)
-	if (slot.queue.try_dequeue(*output)) {
-		// Use release so producer's acquire load sees the decrement before waking
-		slot.queueDepth.fetch_sub(1, std::memory_order_release);
-		// Notify any waiting publisher that space is available
-		slot.blockCV.notify_one();
-		return true;
-	}
-	return false;
+	*output = slot.queue.front();
+	slot.queue.pop_front();
+	// Notify any waiting publisher that space is available
+	slot.blockCV.notify_one();
+	return true;
 }
 
 IOBuffer* BufferManager::getNext(ConsumerId id) {
 	if (id < 0 || id >= MAX_CONSUMERS) return nullptr;
 
 	auto& slot = this->slots[id];
-	IOBuffer* buffer;
-
-	// For DROP_OLDEST, must always use mutex since publisher also dequeues
-	if (slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
-		std::unique_lock<std::mutex> lock(slot.blockMutex);
-		while (!slot.queue.try_dequeue(buffer)) {
-			if (!slot.active.load(std::memory_order_acquire) || !this->running.load(std::memory_order_acquire)) {
-				return nullptr;
-			}
-			slot.blockCV.wait_for(lock, std::chrono::microseconds(100));
-		}
-		slot.queueDepth.fetch_sub(1, std::memory_order_relaxed);
-		return buffer;
-	}
-
-	// BLOCK policy: fast path without mutex (only consumer dequeues)
-	if (slot.queue.try_dequeue(buffer)) {
-		// Use release so producer's acquire load sees the decrement before waking
-		slot.queueDepth.fetch_sub(1, std::memory_order_release);
-		slot.blockCV.notify_one();
-		return buffer;
-	}
-
-	// Slow path: wait for buffer with timeout to handle lost wakeups
 	std::unique_lock<std::mutex> lock(slot.blockMutex);
 
-	while (!slot.queue.try_dequeue(buffer)) {
-		if (!slot.active.load(std::memory_order_acquire) || !this->running.load(std::memory_order_acquire)) {
-			return nullptr;
-		}
-		slot.blockCV.wait_for(lock, std::chrono::microseconds(100));
+	slot.blockCV.wait(lock, [&]() {
+		return !slot.queue.empty() ||
+		       !slot.active.load(std::memory_order_acquire) ||
+		       !this->running.load(std::memory_order_acquire);
+	});
+
+	if (slot.queue.empty()) {
+		return nullptr;
 	}
 
-	// Use release so producer's acquire load sees the decrement before waking
-	slot.queueDepth.fetch_sub(1, std::memory_order_release);
+	IOBuffer* buffer = slot.queue.front();
+	slot.queue.pop_front();
 
 	// Notify any waiting publisher that space is available
 	lock.unlock();
@@ -289,7 +239,9 @@ uint64_t BufferManager::getDroppedCount(ConsumerId id) const {
 
 size_t BufferManager::getQueueSize(ConsumerId id) const {
 	if (id < 0 || id >= MAX_CONSUMERS) return 0;
-	return this->slots[id].queueDepth.load(std::memory_order_acquire);
+	auto& slot = this->slots[id];
+	std::lock_guard<std::mutex> lock(slot.blockMutex);
+	return slot.queue.size();
 }
 
 void BufferManager::shutdown() {
@@ -297,17 +249,26 @@ void BufferManager::shutdown() {
 
 	// Wake all waiting consumers
 	for (auto& slot : this->slots) {
+		{
+			// Empty critical section prevents lost wakeups for threads that
+			// evaluated their wait predicate just before running was cleared
+			std::lock_guard<std::mutex> lock(slot.blockMutex);
+		}
 		slot.blockCV.notify_all();
 	}
 
 	// Release all queued buffers
 	for (auto& slot : this->slots) {
-		if (slot.active.load(std::memory_order_acquire)) {
-			IOBuffer* buf;
-			while (slot.queue.try_dequeue(buf)) {
-				slot.queueDepth.fetch_sub(1, std::memory_order_relaxed);
-				this->decrementRef(buf);
+		std::vector<IOBuffer*> drained;
+		{
+			std::lock_guard<std::mutex> lock(slot.blockMutex);
+			while (!slot.queue.empty()) {
+				drained.push_back(slot.queue.front());
+				slot.queue.pop_front();
 			}
+		}
+		for (IOBuffer* buf : drained) {
+			this->decrementRef(buf);
 		}
 	}
 }

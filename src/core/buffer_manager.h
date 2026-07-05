@@ -2,12 +2,12 @@
 #define OPE_BUFFER_MANAGER_H
 
 #include <array>
+#include <deque>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <functional>
-#include "readerwriterqueue.h"
 #include "../../include/processor.h"
 
 namespace ope {
@@ -113,15 +113,12 @@ public:
 
 private:
 	struct ConsumerSlot {
-		moodycamel::ReaderWriterQueue<IOBuffer*> queue;
-		std::mutex blockMutex;
+		std::deque<IOBuffer*> queue;
+		mutable std::mutex blockMutex;
 		std::condition_variable blockCV;
 		ConsumerConfig config;
 		std::atomic<bool> active{false};
 		std::atomic<uint64_t> droppedCount{0};
-		std::atomic<size_t> queueDepth{0}; //used to enforce maxQueueSize per consumer
-
-		ConsumerSlot();
 	};
 
 	std::array<ConsumerSlot, MAX_CONSUMERS> slots;

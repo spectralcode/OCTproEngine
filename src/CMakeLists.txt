@@ -135,7 +135,7 @@ if(BUILD_VULKAN)
 	target_include_directories(octproengine PRIVATE ${GLSLANG_INCLUDE_DIRS})
 endif()
 
-target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES} ReaderWriterQueue::ReaderWriterQueue)
+target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES})
 
 # CUDA-specific properties
 if(BUILD_CUDA)
@@ -202,14 +202,6 @@ if(WIN32)
 		NOMINMAX
 		_CRT_SECURE_NO_WARNINGS
 	)
-endif()
-
-# MSVC: Suppress C4316 (object may not be aligned to 64 bytes on heap)
-# ReaderWriterQueue uses alignas(64) for cache line optimization.
-# todo: investigate if this may have measurable performance implications if the
-# objects we use with ReaderWriterQueue are not aligned
-if(MSVC)
-	target_compile_options(octproengine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/wd4316>)
 endif()
 
 # Linux/GCC-specific settings - set default symbol visibility
