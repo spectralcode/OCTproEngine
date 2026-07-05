@@ -321,8 +321,9 @@ public:
 		// Setup input buffers for raw data consumers
 		this->inputBufferManager.setBufferCount(this->backend->getNumInputBuffers());
 
-		// No release callback needed. backend manages buffer lifecycle independently
-		// Consumers just read the data, backend processes and releases buffers
+		// No release callback needed: the backend manages the buffer memory itself,
+		// and getNextAvailableInputBuffer() waits via waitUntilReleased() until all
+		// consumers have released a buffer before it is handed out for reuse
 
 		this->initialized = true;
 

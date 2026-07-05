@@ -119,9 +119,13 @@ public:
 	// ============================================
 
 	// Register a consumer for polling-based output retrieval
+	// Throws std::runtime_error when all slots are taken: callbacks and
+	// consumers of one direction share 32 slots
 	ConsumerId addConsumer(ConsumerConfig config = {});
 
 	// Remove a consumer (releases any queued buffers)
+	// Buffers already obtained via tryGet/getNext must still be released
+	// afterwards; the ID stays valid for releaseOutputBuffer() only
 	void removeConsumer(ConsumerId id);
 
 	// Non-blocking: returns true if buffer available
@@ -138,7 +142,9 @@ public:
 	uint64_t getDroppedFrameCount(ConsumerId id) const;
 
 	// Input callbacks - receive input buffer before processing
-	// WARNING: Buffer is still in use by backend, copy data if needed beyond callback
+	// Callbacks run asynchronously on their own worker thread; process() does
+	// not wait for them. The buffer is reference-protected and stays valid for
+	// the duration of the callback, copy the data if needed beyond it
 	CallbackId addInputCallback(InputCallback callback);
 	bool removeInputCallback(CallbackId id);
 	void clearInputCallbacks();
@@ -150,6 +156,9 @@ public:
 	// ============================================
 
 	// Register a consumer for polling-based input buffer retrieval
+	// Held input buffers gate producer-side reuse: BLOCK consumers backpressure
+	// getNextAvailableInputBuffer(), DROP_OLDEST consumers lose queued frames
+	// instead of blocking it
 	ConsumerId addInputConsumer(ConsumerConfig config = {});
 
 	// Remove an input consumer (releases any queued buffers)
@@ -173,7 +182,9 @@ public:
 	int getNumInputBuffers() const;
 
 	// Get next available input buffer for processing
-	// Blocks if no buffer is available
+	// Blocks if no buffer is available, and until input consumers have released
+	// the buffer (a BLOCK-policy input consumer that stops polling without
+	// releasing blocks this call until it releases or is removed)
 	IOBuffer& getNextAvailableInputBuffer();
 
 	

@@ -24,10 +24,13 @@ using ReleaseCallback = std::function<void(IOBuffer*)>;
  * - Input: releaseCallback triggers backend processing
  * - Output: releaseCallback returns buffer to backend pool
  *
- * Uses lock-free SPSC queues per consumer with reference counting.
+ * Uses one FIFO queue per consumer, guarded by a per-consumer mutex, with
+ * reference counting keyed by buffer pointer.
  *
  * Drop Policies:
  * - BLOCK: Holds buffer references. Safe but slow consumers block producer.
+ *   Publishing is sequential across consumers, so one full BLOCK queue also
+ *   delays delivery to the consumers after it (head-of-line blocking).
  * - DROP_OLDEST: Holds buffer references but drops oldest when queue full.
  *   Never blocks processing, dropped buffers are released and can be reused by backend.
  */
