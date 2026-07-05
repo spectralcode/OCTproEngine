@@ -20,8 +20,8 @@ using ReleaseCallback = std::function<void(IOBuffer*)>;
  * @brief Manages buffer distribution to multiple consumers
  *
  * Used for both input buffers (raw data distribution) and output buffers (processed data distribution).
- * The only difference is the release callback:
- * - Input: releaseCallback triggers backend processing
+ * The only difference is the release handling:
+ * - Input: no release callback; waitUntilReleased() gates producer-side buffer reuse
  * - Output: releaseCallback returns buffer to backend pool
  *
  * Uses one FIFO queue per consumer, guarded by a per-consumer mutex, with

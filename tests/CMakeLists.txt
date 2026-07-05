@@ -71,6 +71,10 @@ add_ope_test(test_consumer_lifecycle test_consumer_lifecycle.cpp ${CMAKE_SOURCE_
 target_include_directories(test_consumer_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_tests_properties(test_consumer_lifecycle PROPERTIES TIMEOUT 120)
 
+add_ope_test(test_consumer_policies test_consumer_policies.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
+target_include_directories(test_consumer_policies PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_consumer_policies PROPERTIES TIMEOUT 120)
+
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)
 	add_executable(test_recorder test_recorder.cpp)

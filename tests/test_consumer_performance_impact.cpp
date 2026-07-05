@@ -110,6 +110,7 @@ PerformanceResult runPerformanceTest(
 
 	// Add input consumers (DROP_OLDEST)
 	std::vector<ope::ConsumerId> inputConsumers;
+	inputConsumers.reserve(numInputConsumers); // threads index this vector, no reallocation allowed
 	std::vector<std::atomic<int>> inputReceivedCounts(numInputConsumers);
 	std::atomic<bool> doneInput{false};
 	std::vector<std::thread> inputThreads;
@@ -143,6 +144,7 @@ PerformanceResult runPerformanceTest(
 
 	// Add output consumers (DROP_OLDEST)
 	std::vector<ope::ConsumerId> outputConsumers;
+	outputConsumers.reserve(numOutputConsumers); // threads index this vector, no reallocation allowed
 	std::vector<std::atomic<int>> outputReceivedCounts(numOutputConsumers);
 	std::atomic<bool> doneOutput{false};
 	std::vector<std::thread> outputThreads;

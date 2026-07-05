@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <map>
+#include <mutex>
 
 const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
 
@@ -21,12 +22,15 @@ public:
 
 	std::vector<BufferRecord> recordedBuffers;
 	std::map<uint64_t, int> idMatchCount;  // Tracks how many times each ID appears
+	std::mutex recordMutex;  // raw and processed callbacks arrive on different worker threads
 
 	void recordBuffer(const ope::IOBuffer& buffer, bool isRaw) {
 		BufferRecord record;
 		record.bufferId = buffer.getBufferId();
 		record.isRaw = isRaw;
 		record.dataSize = buffer.getSizeInBytes();
+
+		std::lock_guard<std::mutex> lock(recordMutex);
 		recordedBuffers.push_back(record);
 
 		// Track ID appearances

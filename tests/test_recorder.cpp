@@ -235,6 +235,16 @@ void testVolumeSynchronizationBothMode() {
 	TEST_ASSERT(summary.rawRecorded == buffersToRecord, "Raw buffers should be " + std::to_string(buffersToRecord) + ", but got " + std::to_string(summary.rawRecorded));
 	TEST_ASSERT(summary.processedRecorded == buffersToRecord, "Processed buffers should be " + std::to_string(buffersToRecord) + ", but got " + std::to_string(summary.processedRecorded));
 
+	// The recording must start exactly at the next volume boundary after
+	// startRecording() (called after buffer 11 -> first boundary is 16),
+	// stay sequential, and raw/processed pairs must carry identical IDs
+	TEST_ASSERT(summary.rawBufferIds[0] % buffersPerVolume == 0, "First recorded buffer must sit on a volume boundary");
+	TEST_ASSERT(summary.rawBufferIds[0] == static_cast<uint64_t>(2 * buffersPerVolume), "First recorded buffer should be ID 16");
+	for (int i = 0; i < buffersToRecord; i++) {
+		TEST_ASSERT(summary.rawBufferIds[i] == summary.rawBufferIds[0] + static_cast<uint64_t>(i), "Raw buffer IDs must be sequential");
+		TEST_ASSERT(summary.rawBufferIds[i] == summary.processedBufferIds[i], "Raw and processed buffer IDs must match per index");
+	}
+
 	// Cleanup
 	deleteTestFile("test_volume_both_raw.raw");
 	deleteTestFile("test_volume_both.raw");
@@ -507,13 +517,17 @@ void testProgressiveDataPattern() {
 	std::ifstream processedFile("test_progressive.raw", std::ios::binary);
 	TEST_ASSERT(processedFile.is_open(), "Failed to open processed data file");
 
-	size_t processedSamplesPerBuffer = signalLength * ascansPerBscan * bscansPerBuffer;
+	// The recorder stores processed buffers with the OUTPUT geometry (the output
+	// signal length differs from the input signal length)
+	int processedSignalLength = processor.getConfig().dataParams.outputSignalLength();
+	size_t processedSamplesPerBuffer = static_cast<size_t>(processedSignalLength) * ascansPerBscan * bscansPerBuffer;
 	std::vector<float> processedReadBuffer(processedSamplesPerBuffer);
 
 	// Verify each processed buffer
 	for (int bufferIdx = 0; bufferIdx < numBuffers; bufferIdx++) {
 		// Read buffer from file
 		processedFile.read(reinterpret_cast<char*>(processedReadBuffer.data()), processedSamplesPerBuffer * sizeof(float));
+		TEST_ASSERT(processedFile.good(), "Failed to read processed buffer from file");
 
 		// Verify pattern
 		// (filled A-scans should have non-zero values, unfilled should be background)
@@ -525,14 +539,34 @@ void testProgressiveDataPattern() {
 		// Check that filled A-scans have non-zero processed data
 		for (int ascan = 0; ascan < expectedLinesToFill; ascan++) {
 			bool hasNonZeroData = false;
-			for (int sample = 0; sample < signalLength; sample++) {
-				size_t idx = ascan * signalLength + sample;
+			for (int sample = 0; sample < processedSignalLength; sample++) {
+				size_t idx = static_cast<size_t>(ascan) * processedSignalLength + sample;
 				if (processedReadBuffer[idx] != 0.0f) {
 					hasNonZeroData = true;
 					break;
 				}
 			}
 			TEST_ASSERT(hasNonZeroData, "Processed filled A-scan should have non-zero data");
+		}
+
+		// Content pairing check: processed buffer at index i must be the processing
+		// result of raw frame i, i.e. exactly (i + 1) filled A-scans. The last
+		// expected filled A-scan must be brighter than the first unfilled one, which
+		// catches a substituted earlier frame (last line dark) as well as a
+		// substituted later frame (line beyond the fill boundary bright).
+		if (expectedLinesToFill < ascansPerBscan) {
+			float lastFilledMax = -1e30f;
+			float firstUnfilledMax = -1e30f;
+			for (int sample = 0; sample < processedSignalLength; sample++) {
+				size_t filledIdx = static_cast<size_t>(expectedLinesToFill - 1) * processedSignalLength + sample;
+				size_t unfilledIdx = static_cast<size_t>(expectedLinesToFill) * processedSignalLength + sample;
+				if (processedReadBuffer[filledIdx] > lastFilledMax) lastFilledMax = processedReadBuffer[filledIdx];
+				if (processedReadBuffer[unfilledIdx] > firstUnfilledMax) firstUnfilledMax = processedReadBuffer[unfilledIdx];
+			}
+			TEST_ASSERT(lastFilledMax > firstUnfilledMax,
+				"Processed buffer " + std::to_string(bufferIdx) + " does not belong to raw frame " + std::to_string(bufferIdx) +
+				": expected fill boundary at A-scan " + std::to_string(expectedLinesToFill) +
+				" (last filled max " + std::to_string(lastFilledMax) + ", first unfilled max " + std::to_string(firstUnfilledMax) + ")");
 		}
 	}
 

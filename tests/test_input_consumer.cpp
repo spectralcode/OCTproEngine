@@ -1,12 +1,11 @@
 /**
  * Test: Input Consumer Polling API
  *
- * Tests that multiple consumers can poll for and read raw input buffers
- * before GPU processing. Verifies delayed backend processing pattern:
+ * Tests that multiple consumers can poll for and read raw input buffers:
  * - Camera fills buffer → process(buffer) is called
- * - Raw data is published to input consumers
- * - Consumers poll and read raw data
- * - Backend processing only starts when ALL consumers release
+ * - Backend processing starts immediately, raw data is published to input consumers
+ * - Consumers poll and read raw data in parallel to GPU processing
+ * - The buffer is only reused by the producer when ALL consumers released it
  */
 
 #include <iostream>
@@ -131,6 +130,7 @@ bool test_multiple_input_consumers() {
 	const int NUM_CONSUMERS = 2;
 	const int TEST_FRAMES = 50;  // Reduced to avoid overwhelming the system
 	std::vector<ope::ConsumerId> consumers;
+	consumers.reserve(NUM_CONSUMERS); // threads index this vector, no reallocation allowed
 	std::vector<std::atomic<int>> receivedCounts(NUM_CONSUMERS);
 	std::atomic<bool> stopThreads{false};
 	std::vector<std::thread> threads;
@@ -296,6 +296,7 @@ bool test_input_data_integrity() {
 
 	const int NUM_CONSUMERS = 3;
 	std::vector<ope::ConsumerId> consumers;
+	consumers.reserve(NUM_CONSUMERS); // threads index this vector, no reallocation allowed
 	std::vector<std::vector<uint16_t>> receivedData(NUM_CONSUMERS);
 	std::atomic<bool> stopThreads{false};
 	std::vector<std::thread> threads;
