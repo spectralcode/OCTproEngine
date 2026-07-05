@@ -1,4 +1,5 @@
 #include "buffer_manager.h"
+#include <cassert>
 #include <iostream>
 
 namespace ope {
@@ -12,10 +13,9 @@ BufferManager::~BufferManager() {
 
 void BufferManager::setBufferCount(size_t count) {
 	this->bufferCount = count;
-	this->refCounts = std::vector<std::atomic<int>>(count);
-	for (auto& ref : this->refCounts) {
-		ref.store(0, std::memory_order_relaxed);
-	}
+	// Recreating the table also clears stale pointer bindings from a previous
+	// backend initialization (buffers get new addresses after reinitialization)
+	this->refSlots = std::vector<RefSlot>(count);
 
 	// Update existing consumers that have maxQueueSize=0 (using default)
 	// This handles the case where consumers were added before initialize()
@@ -32,6 +32,34 @@ void BufferManager::setBufferCount(size_t count) {
 
 void BufferManager::setReleaseCallback(ReleaseCallback callback) {
 	this->releaseCallback = std::move(callback);
+}
+
+BufferManager::RefSlot* BufferManager::findRefSlot(IOBuffer* buffer) {
+	for (size_t i = 0; i < this->refSlots.size(); i++) {
+		if (this->refSlots[i].buffer.load(std::memory_order_acquire) == buffer) {
+			return &this->refSlots[i];
+		}
+	}
+	return nullptr;
+}
+
+BufferManager::RefSlot* BufferManager::acquireRefSlot(IOBuffer* buffer) {
+	// Fast path: buffer was published before and already has a slot
+	if (RefSlot* existing = this->findRefSlot(buffer)) {
+		return existing;
+	}
+	// Bind the buffer to a free slot. Only the publisher claims slots, but CAS
+	// keeps this safe even if two threads ever race on the same table.
+	for (size_t i = 0; i < this->refSlots.size(); i++) {
+		IOBuffer* expected = nullptr;
+		if (this->refSlots[i].buffer.compare_exchange_strong(expected, buffer, std::memory_order_acq_rel)) {
+			return &this->refSlots[i];
+		}
+		if (expected == buffer) {
+			return &this->refSlots[i];
+		}
+	}
+	return nullptr;
 }
 
 ConsumerId BufferManager::addConsumer(ConsumerConfig config) {
@@ -84,54 +112,57 @@ size_t BufferManager::getConsumerCount() const {
 }
 
 void BufferManager::publish(IOBuffer* buffer) {
-	int consumers = this->activeCount.load(std::memory_order_acquire);
-	if (consumers == 0) {
+	if (!buffer) return;
+
+	RefSlot* ref = this->acquireRefSlot(buffer);
+	if (!ref) {
+		// More distinct buffers than announced via setBufferCount().
+		// The buffer cannot be tracked, so it must not be handed to consumers.
+		assert(false && "publish(): no free reference slot, check setBufferCount()");
 		if (this->releaseCallback) {
 			this->releaseCallback(buffer);
 		}
 		return;
 	}
 
-	int idx = buffer->getBackendIndex();
+	// The publisher holds its own reference while distributing. This way the
+	// refcount can never drop to zero before all pushes are accounted for,
+	// no matter how consumers are added or removed concurrently.
+	ref->count.store(1, std::memory_order_seq_cst);
 
-	// Set initial refCount BEFORE pushing (so any immediate consumer release has valid refCount)
-	// Use seq_cst to ensure store is visible to all threads before any queue operation
-	if (idx >= 0 && idx < static_cast<int>(this->bufferCount)) {
-		this->refCounts[idx].store(consumers, std::memory_order_seq_cst);
-	}
-
-	// Push to all active consumer queues, count how many we actually pushed to
-	int actualPushes = 0;
+	// Push to all active consumer queues
 	for (auto& slot : this->slots) {
-		if (slot.active.load(std::memory_order_acquire)) {
-			this->pushToSlot(slot, buffer);
-			actualPushes++;
+		if (!slot.active.load(std::memory_order_acquire)) {
+			continue;
+		}
+		ref->count.fetch_add(1, std::memory_order_acq_rel);
+		if (!this->pushToSlot(slot, buffer)) {
+			// Consumer was removed while we tried to push; take its reference back.
+			// Safe as a plain decrement because the publisher reference is still held.
+			ref->count.fetch_sub(1, std::memory_order_acq_rel);
 		}
 	}
 
-	// Adjust for any consumers that became inactive between reading activeCount and iterating
-	// This handles the race where a consumer is removed during publish
-	int missed = consumers - actualPushes;
-	for (int i = 0; i < missed; i++) {
-		this->decrementRef(buffer);
-	}
+	// Drop the publisher reference. If no consumer accepted the buffer,
+	// this releases it back to the pool immediately.
+	this->decrementRef(buffer);
 }
 
-void BufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
+bool BufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
 	std::vector<IOBuffer*> toDrop;
 	{
 		// slot.config must only be read under the lock, addConsumer() writes it
 		std::unique_lock<std::mutex> lock(slot.blockMutex);
 		if (!slot.active.load(std::memory_order_acquire)) {
 			// Consumer was removed between publish()'s check and here
-			this->decrementRef(buffer);
-			return;
+			return false;
 		}
 
 		// For DROP_OLDEST policy, drop old buffers if at capacity
+		// (maxQueueSize == 0 means the consumer was added before setBufferCount(); treat as capacity 1)
 		if (slot.config.dropPolicy == DropPolicy::DROP_OLDEST) {
 			// Collect buffers to drop while holding the lock
-			while (!slot.queue.empty() && slot.queue.size() >= slot.config.maxQueueSize) {
+			while (!slot.queue.empty() && slot.queue.size() >= (slot.config.maxQueueSize > 0 ? slot.config.maxQueueSize : 1)) {
 				toDrop.push_back(slot.queue.front());
 				slot.queue.pop_front();
 			}
@@ -143,13 +174,12 @@ void BufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
 			slot.blockCV.wait(lock, [&]() {
 				return !slot.active.load(std::memory_order_acquire) ||
 				       !this->running.load(std::memory_order_acquire) ||
-				       slot.queue.size() < slot.config.maxQueueSize;
+				       slot.queue.size() < (slot.config.maxQueueSize > 0 ? slot.config.maxQueueSize : 1);
 			});
 
 			if (!slot.active.load(std::memory_order_acquire) || !this->running.load(std::memory_order_acquire)) {
 				// Consumer was removed while waiting
-				this->decrementRef(buffer);
-				return;
+				return false;
 			}
 
 			slot.queue.push_back(buffer);
@@ -162,6 +192,7 @@ void BufferManager::pushToSlot(ConsumerSlot& slot, IOBuffer* buffer) {
 	}
 	// Notify consumer that buffer is available
 	slot.blockCV.notify_one();
+	return true;
 }
 
 bool BufferManager::tryGet(ConsumerId id, IOBuffer** output) {
@@ -214,22 +245,41 @@ void BufferManager::release(ConsumerId id, IOBuffer* buffer) {
 void BufferManager::decrementRef(IOBuffer* buffer) {
 	if (!buffer) return;
 
-	int idx = buffer->getBackendIndex();
-	if (idx < 0 || idx >= static_cast<int>(this->bufferCount)) {
-		// Invalid index, just call release callback directly
-		if (this->releaseCallback) {
-			this->releaseCallback(buffer);
-		}
+	RefSlot* ref = this->findRefSlot(buffer);
+	if (!ref) {
+		// Buffer was never published through this manager, nothing to release
 		return;
 	}
 
-	int prevCount = this->refCounts[idx].fetch_sub(1, std::memory_order_acq_rel);
+	int prevCount = ref->count.fetch_sub(1, std::memory_order_acq_rel);
 	if (prevCount == 1) {
 		// Last reference - return buffer to pool
 		if (this->releaseCallback) {
 			this->releaseCallback(buffer);
 		}
+		// Empty critical section pairs with the predicate check in waitUntilReleased()
+		// so the notification cannot be lost
+		{
+			std::lock_guard<std::mutex> lock(this->refReleaseMutex);
+		}
+		this->refReleaseCV.notify_all();
 	}
+}
+
+void BufferManager::waitUntilReleased(IOBuffer* buffer) {
+	if (!buffer) return;
+
+	RefSlot* ref = this->findRefSlot(buffer);
+	if (!ref) {
+		// Never published, no consumer can hold a reference
+		return;
+	}
+
+	std::unique_lock<std::mutex> lock(this->refReleaseMutex);
+	this->refReleaseCV.wait(lock, [&]() {
+		return ref->count.load(std::memory_order_acquire) <= 0 ||
+		       !this->running.load(std::memory_order_acquire);
+	});
 }
 
 uint64_t BufferManager::getDroppedCount(ConsumerId id) const {
@@ -256,6 +306,12 @@ void BufferManager::shutdown() {
 		}
 		slot.blockCV.notify_all();
 	}
+
+	// Wake any producer blocked in waitUntilReleased()
+	{
+		std::lock_guard<std::mutex> lock(this->refReleaseMutex);
+	}
+	this->refReleaseCV.notify_all();
 
 	// Release all queued buffers
 	for (auto& slot : this->slots) {

@@ -107,6 +107,15 @@ public:
 	size_t getQueueSize(ConsumerId id) const;
 
 	/**
+	 * @brief Block until no consumer holds a reference to the given buffer
+	 *
+	 * Returns immediately if the buffer was never published through this manager
+	 * or if shutdown() was called. Used to gate producer-side buffer reuse
+	 * (e.g. before the acquisition loop writes new data into a recycled input buffer).
+	 */
+	void waitUntilReleased(IOBuffer* buffer);
+
+	/**
 	 * @brief Shutdown manager, wake all waiting consumers
 	 */
 	void shutdown();
@@ -121,16 +130,32 @@ private:
 		std::atomic<uint64_t> droppedCount{0};
 	};
 
+	// Reference counting is keyed by buffer pointer instead of IOBuffer::getBackendIndex(),
+	// because backendIndex is an internal backend concept (staging/command buffer mapping)
+	// that is not guaranteed to be set or unique per buffer (e.g. OpenCL maps several
+	// input buffers to the same command queue index, CUDA and CPU do not set it at all
+	// for some buffer types).
+	struct RefSlot {
+		std::atomic<IOBuffer*> buffer{nullptr};
+		std::atomic<int> count{0};
+	};
+
 	std::array<ConsumerSlot, MAX_CONSUMERS> slots;
 	std::atomic<int> activeCount{0};
 
-	std::vector<std::atomic<int>> refCounts; //tracks how many consumers still hold a reference to a specific buffer.
+	std::vector<RefSlot> refSlots; //tracks how many consumers still hold a reference to a specific buffer.
 	size_t bufferCount = 0;
+
+	// Signaled whenever a refcount drops to zero; used by waitUntilReleased()
+	std::mutex refReleaseMutex;
+	std::condition_variable refReleaseCV;
 
 	ReleaseCallback releaseCallback;
 	std::atomic<bool> running{true};
 
-	void pushToSlot(ConsumerSlot& slot, IOBuffer* buffer);
+	RefSlot* findRefSlot(IOBuffer* buffer);
+	RefSlot* acquireRefSlot(IOBuffer* buffer);
+	bool pushToSlot(ConsumerSlot& slot, IOBuffer* buffer);
 	void decrementRef(IOBuffer* buffer);
 };
 

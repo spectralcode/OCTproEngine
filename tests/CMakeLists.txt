@@ -1,6 +1,6 @@
 function(add_ope_test TEST_NAME SOURCE_FILE)
-	# Create executable
-	add_executable(${TEST_NAME} ${SOURCE_FILE})
+	# Create executable (extra arguments are compiled into the test, e.g. internal sources)
+	add_executable(${TEST_NAME} ${SOURCE_FILE} ${ARGN})
 	
 	# Link to octproengine library
 	target_link_libraries(${TEST_NAME} PRIVATE octproengine)
@@ -58,6 +58,12 @@ add_ope_test(test_drop_policy_performance test_drop_policy_performance.cpp)
 add_ope_test(test_input_consumer test_input_consumer.cpp)
 add_ope_test(test_consumer_performance_impact test_consumer_performance_impact.cpp)
 add_ope_test(test_consumers_performance test_consumers_performance.cpp)
+
+# Standalone BufferManager stress test: compiles buffer_manager.cpp directly
+# because BufferManager is internal and not exported from the library
+add_ope_test(test_consumer_churn_stress test_consumer_churn_stress.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
+target_include_directories(test_consumer_churn_stress PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_consumer_churn_stress PROPERTIES TIMEOUT 120)
 
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)

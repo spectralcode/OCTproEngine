@@ -336,9 +336,14 @@ public:
 		if (!this->config.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
-		
+
 		this->backend->cleanup();
 		this->backend->initialize(this->config);
+
+		// Backend buffers were reallocated, refresh the reference tracking tables
+		// (buffer count may have changed and all buffer addresses are new)
+		this->outputBufferManager.setBufferCount(this->backend->getOutputBufferCount());
+		this->inputBufferManager.setBufferCount(this->backend->getNumInputBuffers());
 
 		// Send curves to backend
 		this->updateAllBackendCurves();
@@ -532,6 +537,9 @@ void Processor::setBackend(Backend backend) {
 		this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
 			this->impl->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
 		});
+
+		// Setup input buffers for raw data consumers
+		this->impl->inputBufferManager.setBufferCount(this->impl->backend->getNumInputBuffers());
 
 		this->impl->initialized = true;
 
