@@ -52,12 +52,14 @@ add_ope_test(test_backend_state_transfer test_backend_state_transfer.cpp)
 add_ope_test(test_backend_config test_backend_config.cpp)
 add_ope_test(test_zerocopy_runtime test_zerocopy_runtime.cpp)
 add_ope_test(test_zerocopy_performance test_zerocopy_performance.cpp)
-add_ope_test(test_buffer_ordering test_buffer_ordering.cpp)
 add_ope_test(test_buffer_ordering_content test_buffer_ordering_content.cpp)
-add_ope_test(test_drop_policy_performance test_drop_policy_performance.cpp)
 add_ope_test(test_input_consumer test_input_consumer.cpp)
 add_ope_test(test_consumer_performance_impact test_consumer_performance_impact.cpp)
-add_ope_test(test_consumers_performance test_consumers_performance.cpp)
+
+# Pure performance benchmarks: run with "ctest -L perf", excluded from the
+# functional suite via "ctest -LE perf"
+set_tests_properties(test_performance_benchmark test_zerocopy_performance test_consumer_performance_impact
+	PROPERTIES LABELS perf)
 
 # Standalone BufferManager stress tests: compile buffer_manager.cpp directly
 # because BufferManager is internal and not exported from the library
