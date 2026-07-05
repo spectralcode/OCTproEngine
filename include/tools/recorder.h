@@ -291,7 +291,6 @@ public:
 
 protected:
 	void configureCallbacks() override;
-	void cleanupCallbacks() override;
 
 private:
 	Mode mode = Mode::BOTH;
@@ -311,7 +310,11 @@ private:
 	std::atomic<Status> status{Status::IDLE};
 	std::atomic<size_t> rawBuffersRecorded{0};
 	std::atomic<size_t> processedBuffersRecorded{0};
-	std::atomic<uint64_t> firstRawBufferId{UINT64_MAX}; 
+	std::atomic<uint64_t> firstRawBufferId{UINT64_MAX};
+	// ID fence captured at startRecording(): only buffers with an ID >= this
+	// are recorded, so stale frames still queued at the always-registered
+	// callbacks can never leak into a new recording
+	std::atomic<uint64_t> recordStartId{0};
 
 	size_t rawBufferSize = 0;
 	size_t processedBufferSize = 0;

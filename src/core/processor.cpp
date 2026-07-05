@@ -13,7 +13,6 @@
 #include "../backends/vulkan/vulkan_backend.h"
 #endif
 #include "buffer_manager.h"
-#include "callback_manager.h"
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
@@ -37,12 +36,12 @@ public:
 
 	BufferManager outputBufferManager;   // For processed data consumers
 	BufferManager inputBufferManager;    // For raw data consumers
-	CallbackManager inputCallbackManager;
-	uint64_t nextBufferId = 0;  // Simple counter, not atomic
+	std::atomic<uint64_t> nextBufferId{0};  // atomic so getNextBufferId() can be read from any thread
 
 	// Callback state management (callbacks built on top of polling)
 	struct CallbackState {
 		ConsumerId consumerId;
+		BufferManager* manager = nullptr;  // which manager the consumer belongs to (input or output)
 		std::thread thread;
 		std::atomic<bool> running{true};
 	};
@@ -367,6 +366,103 @@ public:
 		       current.ascansPerBscan != last.ascansPerBscan ||
 		       current.bscansPerBuffer != last.bscansPerBuffer;
 	}
+
+	// Shared worker machinery for input and output callbacks: each callback is
+	// a consumer on the given manager plus a thread that delivers its buffers
+	CallbackId addCallbackWorker(BufferManager& manager, std::function<void(const IOBuffer&)> callback, ConsumerConfig config) {
+		// Generate a new callback ID
+		CallbackId callbackId = this->nextCallbackId++;
+
+		// Register a consumer for this callback
+		ConsumerId consumerId = manager.addConsumer(config);
+
+		// Create callback state and store it first (before starting thread)
+		auto state = std::make_unique<CallbackState>();
+		state->consumerId = consumerId;
+		state->manager = &manager;
+		state->running = true;
+
+		// Store state first - we need a stable pointer before starting the thread
+		CallbackState* statePtr = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+			this->callbackStates[callbackId] = std::move(state);
+			statePtr = this->callbackStates[callbackId].get();
+		}
+
+		// Now spawn thread with stable pointer to running flag
+		statePtr->thread = std::thread([callback, consumerId, statePtr]() {
+			while (statePtr->running.load(std::memory_order_acquire)) {
+				IOBuffer* buffer = statePtr->manager->getNext(consumerId);
+				if (!buffer) {
+					// Consumer was removed or shutdown
+					break;
+				}
+				try {
+					callback(*buffer);
+				} catch (...) {
+					// Callback threw exception - still need to release buffer
+				}
+				statePtr->manager->release(consumerId, buffer);
+			}
+		});
+
+		return callbackId;
+	}
+
+	bool removeCallbackWorker(BufferManager& manager, CallbackId id) {
+		std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+		auto it = this->callbackStates.find(id);
+		if (it == this->callbackStates.end()) {
+			return false;
+		}
+		if (it->second->manager != &manager) {
+			// ID belongs to the other callback direction (input vs output)
+			return false;
+		}
+
+		// Signal thread to stop
+		it->second->running = false;
+
+		// Remove consumer (wakes up waiting thread)
+		manager.removeConsumer(it->second->consumerId);
+
+		// Join thread
+		if (it->second->thread.joinable()) {
+			it->second->thread.join();
+		}
+
+		// Remove state
+		this->callbackStates.erase(it);
+		return true;
+	}
+
+	void clearCallbackWorkers(BufferManager& manager) {
+		std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+		for (auto it = this->callbackStates.begin(); it != this->callbackStates.end();) {
+			if (it->second->manager != &manager) {
+				++it;
+				continue;
+			}
+			it->second->running = false;
+			manager.removeConsumer(it->second->consumerId);
+			if (it->second->thread.joinable()) {
+				it->second->thread.join();
+			}
+			it = this->callbackStates.erase(it);
+		}
+	}
+
+	size_t countCallbackWorkers(const BufferManager& manager) {
+		std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+		size_t count = 0;
+		for (const auto& pair : this->callbackStates) {
+			if (pair.second->manager == &manager) {
+				count++;
+			}
+		}
+		return count;
+	}
 };
 
 // ============================================
@@ -560,110 +656,45 @@ Processor::CallbackId Processor::addOutputCallback(OutputCallback callback) {
 }
 
 Processor::CallbackId Processor::addOutputCallback(OutputCallback callback, ConsumerConfig config) {
-	// Generate a new callback ID
-	CallbackId callbackId = this->impl->nextCallbackId++;
-
-	// Register a consumer for this callback
-	ConsumerId consumerId = this->impl->outputBufferManager.addConsumer(config);
-
-	// Create callback state and store it first (before starting thread)
-	auto state = std::make_unique<Impl::CallbackState>();
-	state->consumerId = consumerId;
-	state->running = true;
-
-	// Store state first - we need a stable pointer before starting the thread
-	Impl::CallbackState* statePtr = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(this->impl->callbackStatesMutex);
-		this->impl->callbackStates[callbackId] = std::move(state);
-		statePtr = this->impl->callbackStates[callbackId].get();
-	}
-
-	// Now spawn thread with stable pointer to running flag
-	statePtr->thread = std::thread([this, consumerId, callback, statePtr]() {
-		while (statePtr->running.load(std::memory_order_acquire)) {
-			IOBuffer* buffer = this->impl->outputBufferManager.getNext(consumerId);
-			if (!buffer) {
-				// Consumer was removed or shutdown
-				break;
-			}
-			try {
-				callback(*buffer);
-			} catch (...) {
-				// Callback threw exception - still need to release buffer
-			}
-			this->impl->outputBufferManager.release(consumerId, buffer);
-		}
-	});
-
-	return callbackId;
+	return this->impl->addCallbackWorker(this->impl->outputBufferManager, callback, config);
 }
 
 bool Processor::removeOutputCallback(CallbackId id) {
-	std::lock_guard<std::mutex> lock(this->impl->callbackStatesMutex);
-	auto it = this->impl->callbackStates.find(id);
-	if (it == this->impl->callbackStates.end()) {
-		return false;
-	}
-
-	// Signal thread to stop
-	it->second->running = false;
-
-	// Remove consumer (wakes up waiting thread)
-	this->impl->outputBufferManager.removeConsumer(it->second->consumerId);
-
-	// Join thread
-	if (it->second->thread.joinable()) {
-		it->second->thread.join();
-	}
-
-	// Remove state
-	this->impl->callbackStates.erase(it);
-	return true;
+	return this->impl->removeCallbackWorker(this->impl->outputBufferManager, id);
 }
 
 void Processor::clearOutputCallbacks() {
-	std::lock_guard<std::mutex> lock(this->impl->callbackStatesMutex);
-	for (auto& pair : this->impl->callbackStates) {
-		pair.second->running = false;
-		this->impl->outputBufferManager.removeConsumer(pair.second->consumerId);
-		if (pair.second->thread.joinable()) {
-			pair.second->thread.join();
-		}
-	}
-	this->impl->callbackStates.clear();
+	this->impl->clearCallbackWorkers(this->impl->outputBufferManager);
 }
 
 size_t Processor::getOutputCallbackCount() const {
-	std::lock_guard<std::mutex> lock(this->impl->callbackStatesMutex);
-	return this->impl->callbackStates.size();
+	return this->impl->countCallbackWorkers(this->impl->outputBufferManager);
 }
 
 // Input callbacks
 Processor::CallbackId Processor::addInputCallback(InputCallback callback) {
-	return this->impl->inputCallbackManager.addCallback(callback);
+	// Default ConsumerConfig = BLOCK with maxQueueSize = buffer count: lossless,
+	// backpressure applies through getNextAvailableInputBuffer() instead of process()
+	return this->impl->addCallbackWorker(this->impl->inputBufferManager, callback, ConsumerConfig{});
 }
 
 bool Processor::removeInputCallback(CallbackId id) {
-	return this->impl->inputCallbackManager.removeCallback(id);
+	return this->impl->removeCallbackWorker(this->impl->inputBufferManager, id);
 }
 
 void Processor::clearInputCallbacks() {
-	this->impl->inputCallbackManager.clear();
+	this->impl->clearCallbackWorkers(this->impl->inputBufferManager);
 }
 
 size_t Processor::getInputCallbackCount() const {
-	return this->impl->inputCallbackManager.getCallbackCount();
+	return this->impl->countCallbackWorkers(this->impl->inputBufferManager);
 }
 
 void Processor::process(IOBuffer& input) {
 	this->impl->ensureInitialized();
 
-	uint64_t bufferId = this->impl->nextBufferId++;
+	uint64_t bufferId = this->impl->nextBufferId.fetch_add(1, std::memory_order_relaxed);
 	input.setBufferId(bufferId);
-
-	// Existing: input callbacks (synchronous, before consumers)
-	this->impl->inputCallbackManager.invokeAll(input);
 
 	// Start backend processing immediately (uploads to GPU, returns buffer when done)
 	this->impl->backend->process(input);
@@ -671,6 +702,10 @@ void Processor::process(IOBuffer& input) {
 	// Also publish to input consumers so they can read raw data
 	// Consumers read from CPU buffer while GPU is processing
 	this->impl->inputBufferManager.publish(&input);
+}
+
+uint64_t Processor::getNextBufferId() const {
+	return this->impl->nextBufferId.load(std::memory_order_relaxed);
 }
 
 // ============================================

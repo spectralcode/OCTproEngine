@@ -8,7 +8,6 @@ set(CORE_SOURCES
 	core/processor.cpp
 	core/processorconfiguration.cpp
 	core/backendconfig.cpp
-	core/callback_manager.cpp
 	core/buffer_manager.cpp
 	core/processortool.cpp
 )

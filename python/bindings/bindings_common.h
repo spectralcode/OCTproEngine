@@ -145,7 +145,10 @@ public:
 	py::function callback;
 	py::function error_callback;
 
-	std::map<ope::Processor::CallbackId, py::function> pyCallbacks;
+	// Keepalives for Python callback objects, split by callback direction so
+	// clearing one direction cannot free the other direction's live callbacks
+	std::map<ope::Processor::CallbackId, py::function> pyOutputCallbacks;
+	std::map<ope::Processor::CallbackId, py::function> pyInputCallbacks;
 	std::mutex callbacksMutex;
 
 	ProcessorWrapper(ope::Backend backend) : processor(backend) {}
@@ -158,7 +161,7 @@ public:
 
 		// Set C++ callback that will call Python callback
 		// Clear existing callbacks and add new one (legacy behavior)
-		processor.clearOutputCallbacks();
+		this->clear_output_callbacks();
 		processor.addOutputCallback([this](const ope::IOBuffer& output) {
 			// Capture buffer ID immediately before buffer can be recycled
 			uint64_t bufferId = output.getBufferId();
@@ -226,7 +229,7 @@ public:
 		// Store Python function to prevent garbage collection
 		{
 			std::lock_guard<std::mutex> lock(callbacksMutex);
-			pyCallbacks[id] = cb;
+			pyOutputCallbacks[id] = cb;
 		}
 
 		return id;
@@ -241,7 +244,7 @@ public:
 
 		if (removed) {
 			std::lock_guard<std::mutex> lock(callbacksMutex);
-			pyCallbacks.erase(id);
+			pyOutputCallbacks.erase(id);
 		}
 
 		return removed;
@@ -254,7 +257,7 @@ public:
 		}
 
 		std::lock_guard<std::mutex> lock(callbacksMutex);
-		pyCallbacks.clear();
+		pyOutputCallbacks.clear();
 	}
 
 	size_t get_output_callback_count() const {
@@ -299,7 +302,7 @@ public:
 		// Store Python function to prevent garbage collection
 		{
 			std::lock_guard<std::mutex> lock(callbacksMutex);
-			pyCallbacks[id] = cb;
+			pyInputCallbacks[id] = cb;
 		}
 
 		return id;
@@ -314,7 +317,7 @@ public:
 
 		if (removed) {
 			std::lock_guard<std::mutex> lock(callbacksMutex);
-			pyCallbacks.erase(id);
+			pyInputCallbacks.erase(id);
 		}
 
 		return removed;
@@ -326,8 +329,8 @@ public:
 			processor.clearInputCallbacks();
 		}
 
-		// Note: We don't clear pyCallbacks here as they might contain output callbacks too
-		// They'll be cleaned up when individual callbacks are removed
+		std::lock_guard<std::mutex> lock(callbacksMutex);
+		pyInputCallbacks.clear();
 	}
 
 	size_t get_input_callback_count() const {

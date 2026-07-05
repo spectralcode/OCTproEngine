@@ -451,6 +451,15 @@ void testProgressiveDataPattern() {
 	TEST_ASSERT(summary.rawRecorded == numBuffers, "Raw buffers recorded should match numBuffers");
 	TEST_ASSERT(summary.processedRecorded == numBuffers, "Processed buffers recorded should match numBuffers");
 
+	// Raw content is verified bit-exactly below, so pinning both ID sequences to
+	// the record index ties the processed buffers to the same frames: processed[i]
+	// carries the ID whose raw content is proven, and backend content-per-ID
+	// integrity is covered by test_buffer_ordering_content
+	for (int i = 0; i < numBuffers; i++) {
+		TEST_ASSERT(summary.rawBufferIds[i] == static_cast<uint64_t>(i), "Raw buffer ID should equal record index");
+		TEST_ASSERT(summary.processedBufferIds[i] == static_cast<uint64_t>(i), "Processed buffer ID should equal record index");
+	}
+
 	std::cout << "  Recording complete, verifying saved data..." << std::endl;
 
 	// ===== Verify RAW data file =====

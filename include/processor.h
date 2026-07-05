@@ -90,6 +90,11 @@ public:
 	// processing is asynchronous; output is delivered via registered callbacks
 	void process(IOBuffer& input);
 
+	// ID that will be assigned to the next buffer passed to process()
+	// Useful as a fence: all buffers with an ID >= this value are processed
+	// after this call (e.g. tools that must start capturing "from now on")
+	uint64_t getNextBufferId() const;
+
 	// Add an output callback for processed data
 	// Each callback runs on its own dedicated thread. Callbacks execute
 	// in parallel when processing completes.
