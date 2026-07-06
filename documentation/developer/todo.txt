@@ -1,0 +1,1 @@
+- fix setNumBuffers: currently only reaches the CUDA backend, OpenCL/Vulkan pick the value up only at backend creation, so calling it on those backends is a silent no-op. minimal fix: drop the CUDA special case and push the value once inside initialize(). long term: move numInputBuffers into the per-backend BackendConfig (like numOutputBuffers)
