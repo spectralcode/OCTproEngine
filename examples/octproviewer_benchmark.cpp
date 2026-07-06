@@ -48,6 +48,19 @@ std::string backendName(ope::Backend backend) {
 	       backend == ope::Backend::OPENCL ? "OpenCL" : "Vulkan";
 }
 
+std::string interpolationName(ope::InterpolationMethod method) {
+	return method == ope::InterpolationMethod::LINEAR ? "linear" :
+	       method == ope::InterpolationMethod::CUBIC ? "cubic" : "Lanczos";
+}
+
+std::string windowName(ope::WindowType type) {
+	return type == ope::WindowType::HANN ? "Hann" :
+	       type == ope::WindowType::GAUSS ? "Gauss" :
+	       type == ope::WindowType::SINE ? "sine" :
+	       type == ope::WindowType::LANCZOS ? "Lanczos" :
+	       type == ope::WindowType::RECTANGULAR ? "rectangular" : "flat-top";
+}
+
 bool sameBenchmarkConfig(const BenchmarkResult& a, const BenchmarkResult& b) {
 	return a.signalLength == b.signalLength &&
 	       a.ascansPerBscan == b.ascansPerBscan &&
@@ -92,6 +105,15 @@ std::string buildPresetSummary() {
 	}
 
 	ss << " | Iterations: " << BENCHMARK_ITERATIONS;
+	return ss.str();
+}
+
+std::string buildProcessingSummary() {
+	std::ostringstream ss;
+	ss << "Processing steps: " << interpolationName(BENCHMARK_INTERPOLATION) << " resampling, "
+	   << windowName(BENCHMARK_WINDOW_TYPE) << " window, dispersion compensation, FFT, log scaling ("
+	   << BENCHMARK_GRAYSCALE_MIN << "-" << BENCHMARK_GRAYSCALE_MAX << ").\n"
+	   << "Disabled: background removal, fixed pattern noise removal, post-process background subtraction, B-scan flip.";
 	return ss.str();
 }
 
@@ -469,9 +491,11 @@ void renderBenchmarkDialog(BenchmarkState& benchmark) {
 		return;
 	}
 
-	ImGui::TextWrapped("Run the preset sweep used for throughput benchmarking.");
+	ImGui::TextWrapped("Measures processing throughput on synthetic OCT data: every combination of the buffer sizes below runs on each selected backend.");
 	ImGui::Spacing();
 	ImGui::TextWrapped("%s", buildPresetSummary().c_str());
+	ImGui::Spacing();
+	ImGui::TextWrapped("%s", buildProcessingSummary().c_str());
 	ImGui::Spacing();
 	ImGui::SeparatorText("Backends");
 
@@ -541,6 +565,7 @@ void renderBenchmarkResultsWindow(BenchmarkState& benchmark) {
 	}
 
 	ImGui::TextWrapped("%s", buildPresetSummary().c_str());
+	ImGui::TextWrapped("%s", buildProcessingSummary().c_str());
 	ImGui::Separator();
 	ImGui::Text("Status: %s", status.c_str());
 
