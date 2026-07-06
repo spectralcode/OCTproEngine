@@ -57,11 +57,13 @@ add_ope_test(test_input_consumer test_input_consumer.cpp)
 add_ope_test(test_processor_teardown test_processor_teardown.cpp)
 set_tests_properties(test_processor_teardown PROPERTIES TIMEOUT 300)
 add_ope_test(test_consumer_performance_impact test_consumer_performance_impact.cpp)
+add_ope_test(test_dual_processor_performance test_dual_processor_performance.cpp)
+set_tests_properties(test_dual_processor_performance PROPERTIES TIMEOUT 600)
 
 # Pure performance benchmarks: run with "ctest -L perf", excluded from the
 # functional suite via "ctest -LE perf"
 set_tests_properties(test_performance_benchmark test_zerocopy_performance test_consumer_performance_impact
-	PROPERTIES LABELS perf)
+	test_dual_processor_performance PROPERTIES LABELS perf)
 
 # Standalone BufferManager stress tests: compile buffer_manager.cpp directly
 # because BufferManager is internal and not exported from the library
