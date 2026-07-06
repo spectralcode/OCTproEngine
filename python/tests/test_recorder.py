@@ -10,6 +10,15 @@ import octproengine as ope
 import numpy as np
 import time
 
+DELETE_TEST_FILES = True
+
+def delete_test_files(*names):
+	if not DELETE_TEST_FILES:
+		return
+	for name in names:
+		if os.path.exists(name):
+			os.remove(name)
+
 def test_recorder_enums():
 	"""Test that all recorder enums are accessible"""
 	print("Testing Recorder enums...")
@@ -114,6 +123,7 @@ def test_recorder_basic():
 
 	# Cleanup
 	proc.stop()
+	delete_test_files("test_python_recording_raw.raw", "test_python_recording.raw")
 	print("  [OK] Cleanup complete")
 
 def test_start_recording_while_processing():
@@ -195,6 +205,7 @@ def test_start_recording_while_processing():
 
 	# Cleanup
 	proc.stop()
+	delete_test_files("test_python_midstream_raw.raw", "test_python_midstream.raw")
 	print("  [OK] Recording started successfully during ongoing processing")
 
 if __name__ == "__main__":

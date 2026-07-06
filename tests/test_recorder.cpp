@@ -282,9 +282,33 @@ void testAbortRecording() {
 	TEST_ASSERT(summary.processedRecorded == 0, "Buffers should be cleared");
 	TEST_ASSERT(recorder.getStatus() == ope::tools::Recorder::Status::IDLE, "Recorder status should be IDLE");
 
+	// A recording after the abort must be complete and correctly paired
+	recorder.setOutputBaseName("test_abort_second");
+	recorder.startRecording();
+	for (int i = 0; i < 10; i++) {
+		auto& inputBuffer = processor.getNextAvailableInputBuffer();
+		fillTestData(inputBuffer, processor, i + 10);
+		processor.process(inputBuffer);
+	}
+	TEST_ASSERT(recorder.waitForCompletion(10000), "Recording after abort should complete");
+	summary = recorder.getLastRecordingSummary();
+	TEST_ASSERT(summary.rawRecorded == 10, "Recording after abort should record all raw buffers");
+	TEST_ASSERT(summary.processedRecorded == 10, "Recording after abort should record all processed buffers");
+	// Explicit size checks so the ID loop below cannot pass vacuously on empty arrays
+	TEST_ASSERT(summary.rawBufferIds.size() == 10, "Raw ID array after abort should hold all IDs");
+	TEST_ASSERT(summary.processedBufferIds.size() == 10, "Processed ID array after abort should hold all IDs");
+	for (size_t i = 0; i < summary.rawBufferIds.size(); i++) {
+		TEST_ASSERT(summary.rawBufferIds[i] == summary.processedBufferIds[i], "Buffer IDs after abort should match");
+		if (i > 0) {
+			TEST_ASSERT(summary.rawBufferIds[i] == summary.rawBufferIds[i - 1] + 1, "Buffer IDs after abort should be sequential");
+		}
+	}
+
 	// Cleanup (abort should discard files, but delete in case any were created)
 	deleteTestFile("test_abort_raw.raw");
 	deleteTestFile("test_abort.raw");
+	deleteTestFile("test_abort_second_raw.raw");
+	deleteTestFile("test_abort_second.raw");
 
 	std::cout << "  [OK] abortRecording()" << std::endl;
 }
@@ -313,7 +337,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 1 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 1 should record all buffers");
 	TEST_ASSERT(recorder.isAllocated(), "Buffers should be allocated");  // Still allocated (manual mode)
 
 	// Recording 2: Switch to auto mode - should enable auto-free
@@ -327,7 +352,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 2 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 2 should record all buffers");
 	TEST_ASSERT(!recorder.isAllocated(), "Buffers should not be allocated");  // Should be auto-freed now!
 
 	// Recording 3: Switch back to manual mode
@@ -341,7 +367,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 3 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 3 should record all buffers");
 	TEST_ASSERT(recorder.isAllocated(), "Buffers should be allocated");  // Preserved (manual mode)
 
 	// Recording 4: Switch to auto mode again
@@ -355,7 +382,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 4 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 4 should record all buffers");
 	TEST_ASSERT(!recorder.isAllocated(), "Buffers should not be allocated");  // Auto-freed again
 
 	// Cleanup
@@ -626,6 +654,7 @@ void testDiskWritePerformance() {
 
 	auto startTime = std::chrono::high_resolution_clock::now();
 	TEST_ASSERT(recorder.waitForCompletion(30000), "RAW_ONLY recording timeout");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == static_cast<size_t>(numBuffers), "RAW_ONLY should record all buffers");
 	std::string errorMsg = recorder.getLastError();
 	if (!errorMsg.empty()) {
 		std::cout << "Error message: " << errorMsg << std::endl;
@@ -658,7 +687,7 @@ void testDiskWritePerformance() {
 	startTime = std::chrono::high_resolution_clock::now();
 
 	TEST_ASSERT(recorder.waitForCompletion(30000), "PROCESSED_ONLY recording timeout");
-	recorder.waitForCompletion(30000);
+	TEST_ASSERT(recorder.getLastRecordingSummary().processedRecorded == static_cast<size_t>(numBuffers), "PROCESSED_ONLY should record all buffers");
 	std::string errorMsgProcessed = recorder.getLastError();
 	if (!errorMsgProcessed.empty()) {
 		std::cout << "Error message: " << errorMsgProcessed << std::endl;
@@ -717,6 +746,8 @@ void testDiskWritePerformance() {
 
 	startTime = std::chrono::high_resolution_clock::now();
 	TEST_ASSERT(recorder.waitForCompletion(30000), "BOTH mode recording timeout");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == static_cast<size_t>(numBuffers), "BOTH mode should record all raw buffers");
+	TEST_ASSERT(recorder.getLastRecordingSummary().processedRecorded == static_cast<size_t>(numBuffers), "BOTH mode should record all processed buffers");
 	std::string errorMsgBoth = recorder.getLastError();
 	if (!errorMsgBoth.empty()) {
 		std::cout << "Error message: " << errorMsgBoth << std::endl;

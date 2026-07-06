@@ -337,6 +337,11 @@ void Recorder::abortRecording() {
 	this->rawBufferIds.clear();
 	this->processedBufferIds.clear();
 
+	// The storage was just cleared, so the next recording must allocate again.
+	// Without this, startRecording() would skip allocateBuffers() and the
+	// collectors would write into the emptied vectors.
+	this->buffersAllocated = false;
+
 	this->rawBuffersRecorded = 0;
 	this->processedBuffersRecorded = 0;
 	this->rawPartComplete = false;
