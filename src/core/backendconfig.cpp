@@ -270,8 +270,7 @@ bool BackendUtils::isOpenCLAvailable() {
 
 bool BackendUtils::isVulkanAvailable() {
 #ifdef OPE_VULKAN_AVAILABLE
-	//	todo: ceck if Vulkan runtime is available
-	return true;
+	return VulkanBackend::isRuntimeUsable();
 #else
 	return false;
 #endif

@@ -120,6 +120,8 @@ if(BUILD_VULKAN)
 	)
 
 	list(APPEND LINK_LIBRARIES Vulkan::Vulkan VkFFT::VkFFT ${SHADERC_LIB})
+	# The Vulkan availability probe loads the loader via dlopen on POSIX
+	list(APPEND LINK_LIBRARIES ${CMAKE_DL_LIBS})
 	if(GLSLANG_LIB)
 		list(APPEND LINK_LIBRARIES ${GLSLANG_LIB})
 		message(STATUS "Found glslang library: ${GLSLANG_LIB}")

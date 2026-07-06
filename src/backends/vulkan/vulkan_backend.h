@@ -95,6 +95,15 @@ public:
 
 	static std::vector<VulkanDeviceInfo> getAvailableDevices();
 
+	//	Probes whether a Vulkan runtime is present and offers at least one
+	//	device satisfying this backend's hard requirements (Vulkan 1.2 with
+	//	timeline semaphores and a compute queue family). The default-selected
+	//	device (deviceId 0) is not necessarily the device that qualified.
+	//	The probe resolves all Vulkan entry points dynamically and must never
+	//	use link-time imports, so it can report false instead of failing on
+	//	machines without a Vulkan runtime
+	static bool isRuntimeUsable();
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> impl;

@@ -23,6 +23,20 @@
 #include <shaderc/shaderc.hpp>
 #include <glslang_c_interface.h>
 
+//	The runtime probe loads the Vulkan loader dynamically instead of using
+//	the link-time import (the loader ships with GPU drivers and may be absent)
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 // Helper macro for checking Vulkan errors
 #define checkVulkanErrors(call) \
 	do { \
@@ -5172,6 +5186,143 @@ void VulkanBackend::destroyComputePipelines() {
 // ============================================
 // Static Device Management Methods
 // ============================================
+
+namespace {
+
+//	Checks the devices behind an already loaded Vulkan loader against this
+//	backend's hard initialization requirements (the instance is created with
+//	VK_API_VERSION_1_2 and device setup refuses devices without timeline
+//	semaphores or a compute queue family), so availability is only reported
+//	on machines where initialization can actually succeed
+bool probeVulkanDevices(PFN_vkGetInstanceProcAddr getInstanceProcAddr) {
+	if (getInstanceProcAddr == nullptr) {
+		return false;
+	}
+
+	//	vkEnumerateInstanceVersion exists only on Vulkan 1.1+ loaders; a 1.0
+	//	loader would reject the 1.2 instance this backend requests
+	if (getInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion") == nullptr) {
+		return false;
+	}
+
+	auto createInstance = reinterpret_cast<PFN_vkCreateInstance>(
+		getInstanceProcAddr(nullptr, "vkCreateInstance"));
+	if (createInstance == nullptr) {
+		return false;
+	}
+
+	VkApplicationInfo appInfo = {};
+	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	appInfo.pApplicationName = "OCTproEngine Availability Probe";
+	appInfo.apiVersion = VK_API_VERSION_1_2;	//	same version initializeVulkan() requests
+
+	VkInstanceCreateInfo createInfo = {};
+	createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	createInfo.pApplicationInfo = &appInfo;
+
+	VkInstance instance = VK_NULL_HANDLE;
+	if (createInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
+		return false;
+	}
+
+	auto destroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
+		getInstanceProcAddr(instance, "vkDestroyInstance"));
+	auto enumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+		getInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
+	auto getPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+		getInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties"));
+	auto getPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+		getInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
+	auto getPhysicalDeviceQueueFamilyProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+		getInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+
+	bool usableDeviceFound = false;
+	if (enumeratePhysicalDevices != nullptr && getPhysicalDeviceProperties != nullptr &&
+	    getPhysicalDeviceFeatures2 != nullptr && getPhysicalDeviceQueueFamilyProperties != nullptr) {
+		uint32_t deviceCount = 0;
+		enumeratePhysicalDevices(instance, &deviceCount, nullptr);
+		std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+		if (deviceCount > 0) {
+			enumeratePhysicalDevices(instance, &deviceCount, physicalDevices.data());
+		}
+
+		for (VkPhysicalDevice device : physicalDevices) {
+			VkPhysicalDeviceProperties properties = {};
+			getPhysicalDeviceProperties(device, &properties);
+			//	a device below 1.2 cannot report the Vulkan 1.2 feature struct
+			if (properties.apiVersion < VK_API_VERSION_1_2) {
+				continue;
+			}
+
+			VkPhysicalDeviceVulkan12Features features12 = {};
+			features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+			VkPhysicalDeviceFeatures2 features2 = {};
+			features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+			features2.pNext = &features12;
+			getPhysicalDeviceFeatures2(device, &features2);
+			if (features12.timelineSemaphore != VK_TRUE) {
+				continue;
+			}
+
+			uint32_t queueFamilyCount = 0;
+			getPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
+			std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+			if (queueFamilyCount > 0) {
+				getPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+			}
+			for (const VkQueueFamilyProperties& family : queueFamilies) {
+				if (family.queueFlags & VK_QUEUE_COMPUTE_BIT) {
+					usableDeviceFound = true;
+					break;
+				}
+			}
+			if (usableDeviceFound) {
+				break;
+			}
+		}
+	}
+
+	if (destroyInstance != nullptr) {
+		destroyInstance(instance, nullptr);
+	}
+	return usableDeviceFound;
+}
+
+//	Per the Khronos loader documentation the loader is a system component
+//	installed with GPU drivers, so it is loaded dynamically here and probed
+//	through vkGetInstanceProcAddr only
+bool probeVulkanRuntime() {
+#ifdef _WIN32
+	HMODULE loader = LoadLibraryW(L"vulkan-1.dll");
+	if (loader == nullptr) {
+		return false;
+	}
+	PFN_vkGetInstanceProcAddr getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+		reinterpret_cast<void*>(GetProcAddress(loader, "vkGetInstanceProcAddr")));
+	bool available = probeVulkanDevices(getInstanceProcAddr);
+	FreeLibrary(loader);
+	return available;
+#else
+	void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (loader == nullptr) {
+		loader = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+	}
+	if (loader == nullptr) {
+		return false;
+	}
+	PFN_vkGetInstanceProcAddr getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+		dlsym(loader, "vkGetInstanceProcAddr"));
+	bool available = probeVulkanDevices(getInstanceProcAddr);
+	dlclose(loader);
+	return available;
+#endif
+}
+
+} // namespace
+
+bool VulkanBackend::isRuntimeUsable() {
+	return probeVulkanRuntime();
+}
 
 std::vector<VulkanDeviceInfo> VulkanBackend::getAvailableDevices() {
 	std::vector<VulkanDeviceInfo> devices;
