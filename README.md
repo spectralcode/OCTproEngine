@@ -24,6 +24,10 @@ Preliminary results: [Performance Benchmark](documentation/developer/PERFORMANCE
 
 ### Windows
 
+For a complete walkthrough from installing the prerequisites to running the
+Python examples, see the [Getting Started on Windows](documentation/GETTING_STARTED_WINDOWS.md)
+guide. The short version:
+
 Open **Developer Command Prompt for VS 2022** (or your Visual Studio version), navigate to the project root directory:
 
 ```bash
@@ -116,6 +120,12 @@ Then you can run Python tests:
 cd python/tests
 python run_all_tests.py
 ```
+
+## Manual Verification
+
+You can use the OCTproViewer app to visually verify the processing and run a basic performance benchmark. You can find the app in `build/examples/Release/octproviewer.exe` if you built it. 
+
+![OCTproViewer](documentation/images/octproviewer_screenshot.png)
 
 ## Quick Start - C++
 
