@@ -1,7 +1,6 @@
 #include "buffer_manager.h"
 #include <cassert>
 #include <climits>
-#include <iostream>
 
 namespace ope {
 
