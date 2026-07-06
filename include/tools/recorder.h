@@ -196,6 +196,10 @@ public:
 	 * Use manual mode when reusing buffers across multiple recordings
 	 * to avoid repeated allocation/deallocation overhead.
 	 *
+	 * Manual storage also survives abortRecording(). Automatic mode frees the
+	 * buffers after every completed or aborted recording and allocates inside
+	 * startRecording(), which delays the recording start for large buffers.
+	 *
 	 * Default: false (automatic mode)
 	 */
 	void setManualAllocation(bool manual);

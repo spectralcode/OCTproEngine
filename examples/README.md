@@ -3,7 +3,12 @@
 ## Files
 
 - **example_basic.cpp** - Minimal example showing library usage
+- **example_recorder.cpp** - Recording raw and processed data to disk with the Recorder tool
+- **example_cuda_device_selection.cpp** - Enumerating CUDA devices and selecting one via backend configuration
 - **octproviewer.cpp** - OCTproViewer - Interactive GUI for OCTproEngine.
+- **octproviewer_benchmark.cpp** - Throughput benchmark variant of OCTproViewer
+
+Python examples live in [python/examples/](../python/examples/).
 
 ## Building
 

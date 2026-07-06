@@ -79,13 +79,20 @@ See [Jetson Build Instructions](documentation/BUILDING_JETSON.md) for NVIDIA Jet
 
 ### C++ Tests
 
-```bash
-cd build/tests/Release
+Functional tests (from the build directory):
 
-test_backend_output_comparison
-test_performance_benchmark
-test_curve_functionality
+```bash
+cd build
+ctest -C Release -LE perf
 ```
+
+Performance benchmarks:
+
+```bash
+ctest -C Release -L perf
+```
+
+Individual tests can also be run directly from `build/tests/Release/`.
 
 ### Python Tests
 

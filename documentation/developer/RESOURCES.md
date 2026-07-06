@@ -26,6 +26,6 @@
 
 ## Resources that may help with the basics:
 
-## Oline
+## Online
 - **James Akl: CUDA ontology**
   https://jamesakl.com/posts/cuda-ontology/
