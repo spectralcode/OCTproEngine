@@ -118,20 +118,18 @@ def main():
 	
 	def on_result(output_array, buffer_id):
 		"""Callback function that receives processed output"""
-		print(f"Received processed output: shape={output_array.shape}, dtype={output_array.dtype}, buffer_id={buffer_id}")
+		try:
+			print(f"Received processed output: shape={output_array.shape}, dtype={output_array.dtype}, buffer_id={buffer_id}")
 
-		# Save reference to output data
-		output_data['array'] = output_array.copy()
+			# Save reference to output data
+			output_data['array'] = output_array.copy()
+		except Exception as e:
+			print(f"Error in callback: {e}")
+		finally:
+			# Signal that result is ready
+			result_ready.set()
 
-		# Signal that result is ready
-		result_ready.set()
-	
-	def on_error(error_msg):
-		"""Error callback"""
-		print(f"Error in callback: {error_msg}")
-		result_ready.set()
-	
-	processor.set_callback(on_result, error_callback=on_error)
+	processor.add_output_callback(on_result)
 	print("Callback configured\n")
 	
 	# Generate test data
