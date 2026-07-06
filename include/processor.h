@@ -177,10 +177,6 @@ public:
 	// Get number of dropped frames for input consumer (only for DROP_OLDEST policy)
 	uint64_t getInputDroppedFrameCount(ConsumerId id) const;
 
-	//dont use this, only for testing. will be removed
-	IOBuffer& getInputBuffer(int index);
-	int getNumInputBuffers() const;
-
 	// Get next available input buffer for processing
 	// Blocks if no buffer is available, and until input consumers have released
 	// the buffer (a BLOCK-policy input consumer that stops polling without

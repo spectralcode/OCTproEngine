@@ -148,7 +148,7 @@ bool processData(ope::Processor& processor, const std::vector<uint16_t>& testDat
 		result.cv.notify_one();
 	});
 
-	ope::IOBuffer& inputBuf = processor.getInputBuffer(0);
+	ope::IOBuffer& inputBuf = processor.getNextAvailableInputBuffer();
 	std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
 	processor.process(inputBuf);
 

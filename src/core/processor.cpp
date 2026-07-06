@@ -713,11 +713,6 @@ uint64_t Processor::getNextBufferId() const {
 // BUFFER MANAGEMENT
 // ============================================
 
-IOBuffer& Processor::getInputBuffer(int index) {
-	//this->impl->ensureInitialized();
-	return this->impl->backend->getInputBuffer(index);
-}
-
 IOBuffer& Processor::getNextAvailableInputBuffer() {
 	//this->impl->ensureInitialized();
 	IOBuffer& buffer = this->impl->backend->getNextAvailableInputBuffer();
@@ -726,13 +721,6 @@ IOBuffer& Processor::getNextAvailableInputBuffer() {
 	// consumer has released its reference before the caller overwrites the data.
 	this->impl->inputBufferManager.waitUntilReleased(&buffer);
 	return buffer;
-}
-
-int Processor::getNumInputBuffers() const {
-	if (!this->impl->initialized) {
-		return 0;
-	}
-	return this->impl->backend->getNumInputBuffers();
 }
 
 // ============================================
