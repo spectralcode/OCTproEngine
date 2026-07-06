@@ -70,6 +70,56 @@
 	#define VKDBG_LOG(x) do { } while (0)
 #endif
 
+namespace {
+
+//	Platform wrappers for loading the Vulkan loader dynamically. The loader
+//	ships with GPU drivers and may be absent, so these must not rely on the
+//	link-time import being resolvable
+void* loadVulkanLoaderLibrary() {
+#ifdef _WIN32
+	return reinterpret_cast<void*>(LoadLibraryW(L"vulkan-1.dll"));
+#else
+	void* library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (library == nullptr) {
+		library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+	}
+	return library;
+#endif
+}
+
+void unloadVulkanLoaderLibrary(void* library) {
+#ifdef _WIN32
+	FreeLibrary(reinterpret_cast<HMODULE>(library));
+#else
+	dlclose(library);
+#endif
+}
+
+PFN_vkGetInstanceProcAddr resolveVulkanGetInstanceProcAddr(void* library) {
+#ifdef _WIN32
+	return reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+		reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(library), "vkGetInstanceProcAddr")));
+#else
+	return reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
+#endif
+}
+
+//	Cheap check used to fail with a catchable error before the first direct
+//	Vulkan call would reach a missing loader. Also requires the bootstrap
+//	entry point to resolve so a stale library that loads but does not export
+//	the Vulkan API is rejected as well
+bool vulkanLoaderResolvable() {
+	void* library = loadVulkanLoaderLibrary();
+	if (library == nullptr) {
+		return false;
+	}
+	bool resolvable = resolveVulkanGetInstanceProcAddr(library) != nullptr;
+	unloadVulkanLoaderLibrary(library);
+	return resolvable;
+}
+
+} // namespace
+
 namespace ope {
 
 // ============================================
@@ -1547,6 +1597,12 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 			break;
 		default:
 			throw std::runtime_error("Unsupported input data type");
+	}
+
+	//	Fail with a catchable error before the first direct Vulkan call: on a
+	//	machine without a Vulkan runtime the calls below cannot be resolved
+	if (!vulkanLoaderResolvable()) {
+		throw std::runtime_error("Vulkan runtime not available: no usable Vulkan loader was found on this machine");
 	}
 
 	// Create Vulkan instance
@@ -5214,7 +5270,7 @@ bool probeVulkanDevices(PFN_vkGetInstanceProcAddr getInstanceProcAddr) {
 	VkApplicationInfo appInfo = {};
 	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 	appInfo.pApplicationName = "OCTproEngine Availability Probe";
-	appInfo.apiVersion = VK_API_VERSION_1_2;	//	same version initializeVulkan() requests
+	appInfo.apiVersion = VK_API_VERSION_1_2;	//	same version initialize() requests
 
 	VkInstanceCreateInfo createInfo = {};
 	createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -5292,30 +5348,13 @@ bool probeVulkanDevices(PFN_vkGetInstanceProcAddr getInstanceProcAddr) {
 //	installed with GPU drivers, so it is loaded dynamically here and probed
 //	through vkGetInstanceProcAddr only
 bool probeVulkanRuntime() {
-#ifdef _WIN32
-	HMODULE loader = LoadLibraryW(L"vulkan-1.dll");
-	if (loader == nullptr) {
+	void* library = loadVulkanLoaderLibrary();
+	if (library == nullptr) {
 		return false;
 	}
-	PFN_vkGetInstanceProcAddr getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-		reinterpret_cast<void*>(GetProcAddress(loader, "vkGetInstanceProcAddr")));
-	bool available = probeVulkanDevices(getInstanceProcAddr);
-	FreeLibrary(loader);
+	bool available = probeVulkanDevices(resolveVulkanGetInstanceProcAddr(library));
+	unloadVulkanLoaderLibrary(library);
 	return available;
-#else
-	void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-	if (loader == nullptr) {
-		loader = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-	}
-	if (loader == nullptr) {
-		return false;
-	}
-	PFN_vkGetInstanceProcAddr getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-		dlsym(loader, "vkGetInstanceProcAddr"));
-	bool available = probeVulkanDevices(getInstanceProcAddr);
-	dlclose(loader);
-	return available;
-#endif
 }
 
 } // namespace
@@ -5326,6 +5365,11 @@ bool VulkanBackend::isRuntimeUsable() {
 
 std::vector<VulkanDeviceInfo> VulkanBackend::getAvailableDevices() {
 	std::vector<VulkanDeviceInfo> devices;
+
+	//	Without a loader the direct Vulkan calls below cannot be resolved
+	if (!vulkanLoaderResolvable()) {
+		return devices;
+	}
 
 	// Create a minimal temporary instance for device enumeration
 	VkApplicationInfo appInfo = {};
