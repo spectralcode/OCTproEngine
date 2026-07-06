@@ -135,23 +135,29 @@ struct ProcessingResult {
 bool processData(ope::Processor& processor, const std::vector<uint16_t>& testData, ProcessingResult& result) {
 	result.reset();
 
-	processor.addOutputCallback([&result](const ope::IOBuffer& output) {
+	// The callback must be removed after the capture: addOutputCallback()
+	// accumulates, so a leftover callback would overwrite this result again
+	// on every later frame and before/after comparisons would compare a
+	// frame with itself
+	ope::Processor::CallbackId callbackId = processor.addOutputCallback([&result](const ope::IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(result.mutex);
-		
+
 		size_t numFloats = output.getSizeInBytes() / sizeof(float);
 		result.output.resize(numFloats);
 		std::memcpy(result.output.data(), output.getDataPointer(), output.getSizeInBytes());
-		
+
 		result.received = true;
 		result.cv.notify_one();
 	});
-	
+
 	ope::IOBuffer& inputBuf = processor.getInputBuffer(0);
 	std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
 	processor.process(inputBuf);
-	
+
 	result.waitForCompletion();
-	
+
+	processor.removeOutputCallback(callbackId);
+
 	return result.received && !result.output.empty();
 }
 
