@@ -235,6 +235,16 @@ void testVolumeSynchronizationBothMode() {
 	TEST_ASSERT(summary.rawRecorded == buffersToRecord, "Raw buffers should be " + std::to_string(buffersToRecord) + ", but got " + std::to_string(summary.rawRecorded));
 	TEST_ASSERT(summary.processedRecorded == buffersToRecord, "Processed buffers should be " + std::to_string(buffersToRecord) + ", but got " + std::to_string(summary.processedRecorded));
 
+	// The recording must start exactly at the next volume boundary after
+	// startRecording() (called after buffer 11 -> first boundary is 16),
+	// stay sequential, and raw/processed pairs must carry identical IDs
+	TEST_ASSERT(summary.rawBufferIds[0] % buffersPerVolume == 0, "First recorded buffer must sit on a volume boundary");
+	TEST_ASSERT(summary.rawBufferIds[0] == static_cast<uint64_t>(2 * buffersPerVolume), "First recorded buffer should be ID 16");
+	for (int i = 0; i < buffersToRecord; i++) {
+		TEST_ASSERT(summary.rawBufferIds[i] == summary.rawBufferIds[0] + static_cast<uint64_t>(i), "Raw buffer IDs must be sequential");
+		TEST_ASSERT(summary.rawBufferIds[i] == summary.processedBufferIds[i], "Raw and processed buffer IDs must match per index");
+	}
+
 	// Cleanup
 	deleteTestFile("test_volume_both_raw.raw");
 	deleteTestFile("test_volume_both.raw");
@@ -272,9 +282,33 @@ void testAbortRecording() {
 	TEST_ASSERT(summary.processedRecorded == 0, "Buffers should be cleared");
 	TEST_ASSERT(recorder.getStatus() == ope::tools::Recorder::Status::IDLE, "Recorder status should be IDLE");
 
+	// A recording after the abort must be complete and correctly paired
+	recorder.setOutputBaseName("test_abort_second");
+	recorder.startRecording();
+	for (int i = 0; i < 10; i++) {
+		auto& inputBuffer = processor.getNextAvailableInputBuffer();
+		fillTestData(inputBuffer, processor, i + 10);
+		processor.process(inputBuffer);
+	}
+	TEST_ASSERT(recorder.waitForCompletion(10000), "Recording after abort should complete");
+	summary = recorder.getLastRecordingSummary();
+	TEST_ASSERT(summary.rawRecorded == 10, "Recording after abort should record all raw buffers");
+	TEST_ASSERT(summary.processedRecorded == 10, "Recording after abort should record all processed buffers");
+	// Explicit size checks so the ID loop below cannot pass vacuously on empty arrays
+	TEST_ASSERT(summary.rawBufferIds.size() == 10, "Raw ID array after abort should hold all IDs");
+	TEST_ASSERT(summary.processedBufferIds.size() == 10, "Processed ID array after abort should hold all IDs");
+	for (size_t i = 0; i < summary.rawBufferIds.size(); i++) {
+		TEST_ASSERT(summary.rawBufferIds[i] == summary.processedBufferIds[i], "Buffer IDs after abort should match");
+		if (i > 0) {
+			TEST_ASSERT(summary.rawBufferIds[i] == summary.rawBufferIds[i - 1] + 1, "Buffer IDs after abort should be sequential");
+		}
+	}
+
 	// Cleanup (abort should discard files, but delete in case any were created)
 	deleteTestFile("test_abort_raw.raw");
 	deleteTestFile("test_abort.raw");
+	deleteTestFile("test_abort_second_raw.raw");
+	deleteTestFile("test_abort_second.raw");
 
 	std::cout << "  [OK] abortRecording()" << std::endl;
 }
@@ -303,7 +337,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 1 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 1 should record all buffers");
 	TEST_ASSERT(recorder.isAllocated(), "Buffers should be allocated");  // Still allocated (manual mode)
 
 	// Recording 2: Switch to auto mode - should enable auto-free
@@ -317,7 +352,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 2 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 2 should record all buffers");
 	TEST_ASSERT(!recorder.isAllocated(), "Buffers should not be allocated");  // Should be auto-freed now!
 
 	// Recording 3: Switch back to manual mode
@@ -331,7 +367,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 3 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 3 should record all buffers");
 	TEST_ASSERT(recorder.isAllocated(), "Buffers should be allocated");  // Preserved (manual mode)
 
 	// Recording 4: Switch to auto mode again
@@ -345,7 +382,8 @@ void testAllocationModeSwitching() {
 		processor.process(inputBuffer);
 	}
 
-	recorder.waitForCompletion(5000);
+	TEST_ASSERT(recorder.waitForCompletion(5000), "Recording 4 should complete");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == 5, "Recording 4 should record all buffers");
 	TEST_ASSERT(!recorder.isAllocated(), "Buffers should not be allocated");  // Auto-freed again
 
 	// Cleanup
@@ -451,6 +489,15 @@ void testProgressiveDataPattern() {
 	TEST_ASSERT(summary.rawRecorded == numBuffers, "Raw buffers recorded should match numBuffers");
 	TEST_ASSERT(summary.processedRecorded == numBuffers, "Processed buffers recorded should match numBuffers");
 
+	// Raw content is verified bit-exactly below, so pinning both ID sequences to
+	// the record index ties the processed buffers to the same frames: processed[i]
+	// carries the ID whose raw content is proven, and backend content-per-ID
+	// integrity is covered by test_buffer_ordering_content
+	for (int i = 0; i < numBuffers; i++) {
+		TEST_ASSERT(summary.rawBufferIds[i] == static_cast<uint64_t>(i), "Raw buffer ID should equal record index");
+		TEST_ASSERT(summary.processedBufferIds[i] == static_cast<uint64_t>(i), "Processed buffer ID should equal record index");
+	}
+
 	std::cout << "  Recording complete, verifying saved data..." << std::endl;
 
 	// ===== Verify RAW data file =====
@@ -498,13 +545,17 @@ void testProgressiveDataPattern() {
 	std::ifstream processedFile("test_progressive.raw", std::ios::binary);
 	TEST_ASSERT(processedFile.is_open(), "Failed to open processed data file");
 
-	size_t processedSamplesPerBuffer = signalLength * ascansPerBscan * bscansPerBuffer;
+	// The recorder stores processed buffers with the OUTPUT geometry (the output
+	// signal length differs from the input signal length)
+	int processedSignalLength = processor.getConfig().dataParams.outputSignalLength();
+	size_t processedSamplesPerBuffer = static_cast<size_t>(processedSignalLength) * ascansPerBscan * bscansPerBuffer;
 	std::vector<float> processedReadBuffer(processedSamplesPerBuffer);
 
 	// Verify each processed buffer
 	for (int bufferIdx = 0; bufferIdx < numBuffers; bufferIdx++) {
 		// Read buffer from file
 		processedFile.read(reinterpret_cast<char*>(processedReadBuffer.data()), processedSamplesPerBuffer * sizeof(float));
+		TEST_ASSERT(processedFile.good(), "Failed to read processed buffer from file");
 
 		// Verify pattern
 		// (filled A-scans should have non-zero values, unfilled should be background)
@@ -516,14 +567,34 @@ void testProgressiveDataPattern() {
 		// Check that filled A-scans have non-zero processed data
 		for (int ascan = 0; ascan < expectedLinesToFill; ascan++) {
 			bool hasNonZeroData = false;
-			for (int sample = 0; sample < signalLength; sample++) {
-				size_t idx = ascan * signalLength + sample;
+			for (int sample = 0; sample < processedSignalLength; sample++) {
+				size_t idx = static_cast<size_t>(ascan) * processedSignalLength + sample;
 				if (processedReadBuffer[idx] != 0.0f) {
 					hasNonZeroData = true;
 					break;
 				}
 			}
 			TEST_ASSERT(hasNonZeroData, "Processed filled A-scan should have non-zero data");
+		}
+
+		// Content pairing check: processed buffer at index i must be the processing
+		// result of raw frame i, i.e. exactly (i + 1) filled A-scans. The last
+		// expected filled A-scan must be brighter than the first unfilled one, which
+		// catches a substituted earlier frame (last line dark) as well as a
+		// substituted later frame (line beyond the fill boundary bright).
+		if (expectedLinesToFill < ascansPerBscan) {
+			float lastFilledMax = -1e30f;
+			float firstUnfilledMax = -1e30f;
+			for (int sample = 0; sample < processedSignalLength; sample++) {
+				size_t filledIdx = static_cast<size_t>(expectedLinesToFill - 1) * processedSignalLength + sample;
+				size_t unfilledIdx = static_cast<size_t>(expectedLinesToFill) * processedSignalLength + sample;
+				if (processedReadBuffer[filledIdx] > lastFilledMax) lastFilledMax = processedReadBuffer[filledIdx];
+				if (processedReadBuffer[unfilledIdx] > firstUnfilledMax) firstUnfilledMax = processedReadBuffer[unfilledIdx];
+			}
+			TEST_ASSERT(lastFilledMax > firstUnfilledMax,
+				"Processed buffer " + std::to_string(bufferIdx) + " does not belong to raw frame " + std::to_string(bufferIdx) +
+				": expected fill boundary at A-scan " + std::to_string(expectedLinesToFill) +
+				" (last filled max " + std::to_string(lastFilledMax) + ", first unfilled max " + std::to_string(firstUnfilledMax) + ")");
 		}
 	}
 
@@ -583,6 +654,7 @@ void testDiskWritePerformance() {
 
 	auto startTime = std::chrono::high_resolution_clock::now();
 	TEST_ASSERT(recorder.waitForCompletion(30000), "RAW_ONLY recording timeout");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == static_cast<size_t>(numBuffers), "RAW_ONLY should record all buffers");
 	std::string errorMsg = recorder.getLastError();
 	if (!errorMsg.empty()) {
 		std::cout << "Error message: " << errorMsg << std::endl;
@@ -615,7 +687,7 @@ void testDiskWritePerformance() {
 	startTime = std::chrono::high_resolution_clock::now();
 
 	TEST_ASSERT(recorder.waitForCompletion(30000), "PROCESSED_ONLY recording timeout");
-	recorder.waitForCompletion(30000);
+	TEST_ASSERT(recorder.getLastRecordingSummary().processedRecorded == static_cast<size_t>(numBuffers), "PROCESSED_ONLY should record all buffers");
 	std::string errorMsgProcessed = recorder.getLastError();
 	if (!errorMsgProcessed.empty()) {
 		std::cout << "Error message: " << errorMsgProcessed << std::endl;
@@ -638,30 +710,59 @@ void testDiskWritePerformance() {
 	recorder.setMode(ope::tools::Recorder::Mode::BOTH);
 	recorder.setOutputBaseName("test_perf_both");
 
+	// Add timing callback to measure actual processing throughput
+	std::atomic<int> processedCount{0};
+	std::chrono::high_resolution_clock::time_point processingEnd;
+	processor.addOutputCallback([&](const ope::IOBuffer& buf) {
+		int count = ++processedCount;
+		if (count == numBuffers) {
+			processingEnd = std::chrono::high_resolution_clock::now();
+		}
+	});
+
 	recorder.startRecording();
 
+	// Measure processing performance (with recorder attached)
+	auto processingStart = std::chrono::high_resolution_clock::now();
 	for (int i = 0; i < numBuffers; i++) {
 		auto& inputBuffer = processor.getNextAvailableInputBuffer();
 		fillTestData(inputBuffer, processor, i);
 		processor.process(inputBuffer);
 	}
 
+	// Wait for all processing to complete (not disk write)
+	while (processedCount < numBuffers) {
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+
+	double processingDurationSec = std::chrono::duration<double>(processingEnd - processingStart).count();
+	double processingBscansPerSec = numBuffers * bscansPerBuffer / processingDurationSec;
+	double processingMBs = (rawGBperBuffer * numBuffers * 1024.0) / processingDurationSec;
+
+	std::cout << "    Processing performance (with recorder):" << std::endl;
+	std::cout << "      Duration: " << processingDurationSec << " seconds" << std::endl;
+	std::cout << "      B-scans/s: " << processingBscansPerSec << std::endl;
+	std::cout << "      Input throughput: " << processingMBs << " MB/s" << std::endl;
+
 	startTime = std::chrono::high_resolution_clock::now();
 	TEST_ASSERT(recorder.waitForCompletion(30000), "BOTH mode recording timeout");
+	TEST_ASSERT(recorder.getLastRecordingSummary().rawRecorded == static_cast<size_t>(numBuffers), "BOTH mode should record all raw buffers");
+	TEST_ASSERT(recorder.getLastRecordingSummary().processedRecorded == static_cast<size_t>(numBuffers), "BOTH mode should record all processed buffers");
 	std::string errorMsgBoth = recorder.getLastError();
 	if (!errorMsgBoth.empty()) {
 		std::cout << "Error message: " << errorMsgBoth << std::endl;
-	}	
+	}
 	endTime = std::chrono::high_resolution_clock::now();
 
 	durationSec = std::chrono::duration<double>(endTime - startTime).count();
 	totalGB = (rawGBperBuffer + processedGBperBuffer) * numBuffers;
 	speedMBs = (totalGB * 1024.0) / durationSec;
 
-	std::cout << "    Expected total: " << totalGB << " GB (" << rawGBperBuffer << " + " << processedGBperBuffer << " GB x " << numBuffers << " buffers)" << std::endl;
-	std::cout << "    Duration: " << durationSec << " seconds" << std::endl;
-	std::cout << "    Total written: " << totalGB << " GB (raw + processed)" << std::endl;
-	std::cout << "    Estimated combined write speed: " << speedMBs << " MB/s" << std::endl;
+	std::cout << "    Disk write performance:" << std::endl;
+	std::cout << "      Expected total: " << totalGB << " GB (" << rawGBperBuffer << " + " << processedGBperBuffer << " GB x " << numBuffers << " buffers)" << std::endl;
+	std::cout << "      Duration: " << durationSec << " seconds" << std::endl;
+	std::cout << "      Total written: " << totalGB << " GB (raw + processed)" << std::endl;
+	std::cout << "      Estimated combined write speed: " << speedMBs << " MB/s" << std::endl;
 
 	deleteTestFile("test_perf_both_raw.raw");
 	deleteTestFile("test_perf_both.raw");

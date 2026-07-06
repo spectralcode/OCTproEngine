@@ -62,6 +62,8 @@ public:
 	IOBuffer& getInputBuffer(int index) override;
 	IOBuffer& getNextAvailableInputBuffer() override;
 	int getNumInputBuffers() const override;
+	int getOutputBufferCount() const override;
+	void releaseOutputBuffer(IOBuffer* buffer) override;
 
 	// Post-process background methods
 	void requestPostProcessBackgroundRecording() override;
@@ -74,128 +76,13 @@ public:
 	const std::vector<float>& getFixedPatternNoiseProfile() const override;
 
 
-	// Individual operations (for testing/debugging)
-	std::vector<float> convertInput(
-		const void* input,
-		IOBuffer::DataType inputType,
-		int bitDepth,
-		int samples,
-		bool applyBitshift
-	) override;
-
-	std::vector<float> rollingAverageBackgroundRemoval(
-		const float* input,
-		int windowSize,
-		int lineWidth,
-		int numLines
-	) override;
-
-	std::vector<float> kLinearization(
-		const float* input,
-		const float* resampleCurve,
-		InterpolationMethod method,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> windowing(
-		const float* input,
-		const float* windowCurve,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> dispersionCompensation(
-		const float* input,
-		const float* phaseComplex,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> kLinearizationAndWindowing(
-		const float* input,
-		const float* resampleCurve,
-		const float* windowCurve,
-		InterpolationMethod method,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> kLinearizationAndWindowingAndDispersion(
-		const float* input,
-		const float* resampleCurve,
-		const float* windowCurve,
-		const float* phaseComplex,
-		InterpolationMethod method,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> dispersionCompensationAndWindowing(
-		const float* input,
-		const float* phaseComplex,
-		const float* windowCurve,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> fft(const float* input, int lineWidth, int samples) override;
-	std::vector<float> ifft(const float* input, int lineWidth, int samples) override;
-
-	std::vector<float> getMinimumVarianceMean(
-		const float* input,
-		int width,
-		int height,
-		int segments
-	) override;
-
-	std::vector<float> fixedPatternNoiseRemoval(
-		const float* input,
-		const float* meanALine,
-		int lineWidth,
-		int numLines
-	) override;
-
-	std::vector<float> postProcessTruncate(
-		const float* input,
-		bool logScaling,
-		float grayscaleMax,
-		float grayscaleMin,
-		float addend,
-		float multiplicator,
-		int lineWidth,
-		int samples
-	) override;
-
-	std::vector<float> bscanFlip(
-		const float* input,
-		int lineWidth,
-		int linesPerBscan,
-		int numBscans
-	) override;
-
-	std::vector<float> sinusoidalScanCorrection(
-		const float* input,
-		const float* resampleCurve,
-		int lineWidth,
-		int linesPerBscan,
-		int numBscans
-	) override;
-
-	std::vector<float> postProcessBackgroundSubtraction(
-		const float* input,
-		const float* backgroundLine,
-		float weight,
-		float offset,
-		int lineWidth,
-		int samples
-	) override;
-
 	// ============================================
 	// Vulkan-Specific Configuration Methods
 	// ============================================
 
 	void setNumInputBuffers(int count);  // Must be called before initialize()
+	void setNumOutputBuffers(int count);  // Must be called before initialize() (0 = auto)
+	void setNumStagingInputBuffers(int count);  // Must be called before initialize() (0 = auto, default: numCommandBuffers * 2)
 	void setNumCommandBuffers(int count);  // Equivalent to CUDA streams
 	void setDeviceId(int deviceId);  // Select physical device
 

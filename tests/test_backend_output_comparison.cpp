@@ -270,9 +270,9 @@ int main() {
 	ope::Processor cpuProcessor(ope::Backend::CPU);
 	configureProcessor(cpuProcessor);
 	cpuProcessor.initialize();
-	
+
 	ProcessingResult cpuResult;
-	cpuProcessor.setOutputCallback([&cpuResult](const ope::IOBuffer& output) {
+	cpuProcessor.addOutputCallback([&cpuResult](const ope::IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(cpuResult.mutex);
 		cpuResult.endTime = std::chrono::high_resolution_clock::now();
 		
@@ -309,9 +309,9 @@ int main() {
 	ope::Processor cudaProcessor(ope::Backend::CUDA);
 	configureProcessor(cudaProcessor);
 	cudaProcessor.initialize();
-	
+
 	ProcessingResult cudaResult;
-	cudaProcessor.setOutputCallback([&cudaResult](const ope::IOBuffer& output) {
+	cudaProcessor.addOutputCallback([&cudaResult](const ope::IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(cudaResult.mutex);
 		cudaResult.endTime = std::chrono::high_resolution_clock::now();
 		
@@ -353,7 +353,7 @@ int main() {
 		configureProcessor(openclProcessor);
 		openclProcessor.initialize();
 
-		openclProcessor.setOutputCallback([&openclResult](const ope::IOBuffer& output) {
+		openclProcessor.addOutputCallback([&openclResult](const ope::IOBuffer& output) {
 			std::lock_guard<std::mutex> lock(openclResult.mutex);
 			openclResult.endTime = std::chrono::high_resolution_clock::now();
 
@@ -406,7 +406,7 @@ int main() {
 		configureProcessor(vulkanProcessor);
 		vulkanProcessor.initialize();
 
-		vulkanProcessor.setOutputCallback([&vulkanResult](const ope::IOBuffer& output) {
+		vulkanProcessor.addOutputCallback([&vulkanResult](const ope::IOBuffer& output) {
 			std::lock_guard<std::mutex> lock(vulkanResult.mutex);
 			vulkanResult.endTime = std::chrono::high_resolution_clock::now();
 

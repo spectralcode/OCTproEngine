@@ -28,6 +28,11 @@ struct CpuBackend::Impl {
 	IOBuffer outputBuffer1;
 	IOBuffer outputBuffer2;
 	int currentOutputBuffer;
+
+	// Semaphore to limit in-flight output buffers (prevents buffer reuse before consumer release)
+	std::mutex outputSemaphoreMutex;
+	std::condition_variable outputSemaphoreCV;
+	int availableOutputBuffers = 2;  // 2 ping-pong buffers
 	
 	// Input buffer management
 	std::vector<uint8_t> processingBuffer; 
@@ -165,6 +170,15 @@ struct CpuBackend::Impl {
 				this->freeBuffersQueue.push(inputBuffer);
 			}
 			this->freeQueueCV.notify_one();
+
+			// Wait for an output buffer to be available (prevents buffer reuse before consumer release)
+			{
+				std::unique_lock<std::mutex> lock(this->outputSemaphoreMutex);
+				this->outputSemaphoreCV.wait(lock, [this]() {
+					return this->availableOutputBuffers > 0;
+				});
+				this->availableOutputBuffers--;
+			}
 
 			this->currentOutputBuffer = (this->currentOutputBuffer + 1) % 2;
 			IOBuffer& output = (this->currentOutputBuffer == 0)
@@ -609,246 +623,6 @@ void CpuBackend::updateWindowCurve(const float* curve, size_t length) {
 	this->impl->windowCurve.assign(curve, curve + length);
 }
 
-// ============================================
-// Individual operations (for testing/debugging)
-// ============================================
-
-std::vector<float> CpuBackend::convertInput(
-	const void* input,
-	IOBuffer::DataType inputType,
-	int bitDepth,
-	int samples,
-	bool applyBitshift
-) {
-	std::vector<std::complex<float>> complexData(samples);
-	cpu_kernels::convertInputData<float>(input, samples, bitDepth, complexData);
-	
-	// Extract real part
-	std::vector<float> output(samples);
-	for (int i = 0; i < samples; ++i) {
-		output[i] = complexData[i].real();
-	}
-	
-	return output;
-}
-
-std::vector<float> CpuBackend::kLinearization(
-	const float* input,
-	const float* resampleCurve,
-	InterpolationMethod method,
-	int lineWidth,
-	int samples
-) {
-	// Convert to complex
-	std::vector<std::complex<float>> complexInput(lineWidth);
-	for (int i = 0; i < lineWidth; ++i) {
-		complexInput[i] = std::complex<float>(input[i], 0.0f);
-	}
-	
-	// Convert curve to vector
-	std::vector<float> curveVec(resampleCurve, resampleCurve + lineWidth);
-	
-	// Apply linearization
-	std::vector<std::complex<float>> complexOutput(lineWidth);
-	switch (method) {
-		case InterpolationMethod::LINEAR:
-			cpu_kernels::kLinearizationLinear<float>(complexInput, curveVec, complexOutput);
-			break;
-		case InterpolationMethod::CUBIC:
-			cpu_kernels::kLinearizationCubic<float>(complexInput, curveVec, complexOutput);
-			break;
-		case InterpolationMethod::LANCZOS:
-			cpu_kernels::kLinearizationLanczos<float>(complexInput, curveVec, complexOutput);
-			break;
-	}
-	
-	// Extract real part
-	std::vector<float> output(samples);
-	for (int i = 0; i < samples; ++i) {
-		output[i] = complexOutput[i].real();
-	}
-	
-	return output;
-}
-
-std::vector<float> CpuBackend::windowing(
-	const float* input,
-	const float* windowCurve,
-	int lineWidth,
-	int samples
-) {
-	// Convert to complex
-	std::vector<std::complex<float>> complexData(lineWidth);
-	for (int i = 0; i < lineWidth; ++i) {
-		complexData[i] = std::complex<float>(input[i], 0.0f);
-	}
-	
-	// Convert curve to vector
-	std::vector<float> curveVec(windowCurve, windowCurve + lineWidth);
-	
-	// Apply window
-	cpu_kernels::applyWindow<float>(complexData, curveVec);
-	
-	// Extract real part
-	std::vector<float> output(samples);
-	for (int i = 0; i < samples; ++i) {
-		output[i] = complexData[i].real();
-	}
-	
-	return output;
-}
-
-std::vector<float> CpuBackend::dispersionCompensation(
-	const float* input,
-	const float* phaseComplex,
-	int lineWidth,
-	int samples
-) {
-	// Convert to complex
-	std::vector<std::complex<float>> complexData(lineWidth);
-	for (int i = 0; i < lineWidth; ++i) {
-		complexData[i] = std::complex<float>(input[i], 0.0f);
-	}
-	
-	// Convert phase (interleaved real/imag) to vector
-	std::vector<std::complex<float>> phaseVec(lineWidth);
-	for (int i = 0; i < lineWidth; ++i) {
-		phaseVec[i] = std::complex<float>(phaseComplex[i * 2], phaseComplex[i * 2 + 1]);
-	}
-	
-	// Apply dispersion using kernel
-	cpu_kernels::dispersionCompensation<float>(complexData, phaseVec);
-	
-	// Extract real part
-	std::vector<float> output(samples);
-	for (int i = 0; i < samples; ++i) {
-		output[i] = complexData[i].real();
-	}
-	
-	return output;
-}
-
-std::vector<float> CpuBackend::fft(const float* input, int lineWidth, int samples) {
-	// Stub for now
-	return std::vector<float>(samples);
-}
-
-std::vector<float> CpuBackend::ifft(const float* input, int lineWidth, int samples) {
-	// Convert input to complex
-	std::vector<std::complex<float>> complexInput(lineWidth);
-	for (int i = 0; i < lineWidth; ++i) {
-		complexInput[i] = std::complex<float>(input[i], 0.0f);
-	}
-	
-	// Compute IFFT using kernel
-	std::vector<std::complex<float>> complexOutput;
-	cpu_kernels::computeIFFT<float>(
-		complexInput,
-		complexOutput,
-		this->impl->fftPlan,
-		this->impl->fftIn,
-		this->impl->fftOut
-	);
-	
-	// Return magnitude
-	std::vector<float> output(lineWidth);
-	for (int i = 0; i < lineWidth; ++i) {
-		float real = complexOutput[i].real();
-		float imag = complexOutput[i].imag();
-		output[i] = std::sqrt(real * real + imag * imag);
-	}
-	
-	return output;
-}
-
-// ============================================
-// Stubs for other operations (implement as needed)
-// ============================================
-
-std::vector<float> CpuBackend::rollingAverageBackgroundRemoval(const float* input, int windowSize, int lineWidth, int numLines) {
-	return std::vector<float>(lineWidth * numLines);  // Stub
-}
-
-std::vector<float> CpuBackend::kLinearizationAndWindowing(const float* input, const float* resampleCurve, const float* windowCurve, InterpolationMethod method, int lineWidth, int samples) {
-	return std::vector<float>(samples);  // Stub
-}
-
-std::vector<float> CpuBackend::kLinearizationAndWindowingAndDispersion(const float* input, const float* resampleCurve, const float* windowCurve, const float* phaseComplex, InterpolationMethod method, int lineWidth, int samples) {
-	return std::vector<float>(samples);  // Stub
-}
-
-std::vector<float> CpuBackend::dispersionCompensationAndWindowing(const float* input, const float* phaseComplex, const float* windowCurve, int lineWidth, int samples) {
-	return std::vector<float>(samples);  // Stub
-}
-
-std::vector<float> CpuBackend::getMinimumVarianceMean(const float* input, int width, int height, int segments) {
-	if (!input) {
-		return std::vector<float>();
-	}
-
-	// Convert interleaved input into row-major vector of complex rows
-	std::vector<std::vector<std::complex<float>>> rows;
-	rows.resize(height);
-	for (int r = 0; r < height; ++r) {
-		rows[r].resize(width);
-		for (int c = 0; c < width; ++c) {
-			int idx = (r * width + c) * 2;
-			rows[r][c] = std::complex<float>(input[idx], input[idx + 1]);
-		}
-	}
-
-	return cpu_kernels::getMinimumVarianceMean<float>(rows, width, segments);
-}
-
-std::vector<float> CpuBackend::fixedPatternNoiseRemoval(const float* input, const float* meanALine, int lineWidth, int numLines) {
-	if (!input) {
-		return std::vector<float>();
-	}
-
-	int totalSamples = lineWidth * numLines;
-
-	// Build complex vector and apply mean-line subtraction via kernel
-	std::vector<std::complex<float>> data;
-	data.resize(static_cast<size_t>(totalSamples));
-	for (int i = 0; i < totalSamples; ++i) {
-		int idx = i * 2;
-		data[i] = std::complex<float>(input[idx], input[idx + 1]);
-	}
-
-	std::vector<float> meanVec;
-	if (meanALine) {
-		meanVec.assign(meanALine, meanALine + lineWidth * 2);
-	}
-
-	cpu_kernels::meanALineSubtraction<float>(data, meanVec);
-
-	// Compute magnitudes
-	std::vector<float> output;
-	output.resize(static_cast<size_t>(totalSamples));
-	for (int i = 0; i < totalSamples; ++i) {
-		float re = data[i].real();
-		float im = data[i].imag();
-		output[i] = std::sqrt(re * re + im * im);
-	}
-
-	return output;
-}
-
-std::vector<float> CpuBackend::postProcessTruncate(const float* input, bool logScaling, float grayscaleMax, float grayscaleMin, float addend, float multiplicator, int lineWidth, int samples) {
-	return std::vector<float>(samples);  // Stub
-}
-
-std::vector<float> CpuBackend::bscanFlip(const float* input, int lineWidth, int linesPerBscan, int numBscans) {
-	return std::vector<float>(lineWidth * linesPerBscan * numBscans);  // Stub
-}
-
-std::vector<float> CpuBackend::sinusoidalScanCorrection(const float* input, const float* resampleCurve, int lineWidth, int linesPerBscan, int numBscans) {
-	return std::vector<float>(lineWidth * linesPerBscan * numBscans);  // Stub
-}
-
-std::vector<float> CpuBackend::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
-	return std::vector<float>(samples);  // Stub
-}
 
 // ============================================
 // Buffer management
@@ -878,6 +652,19 @@ IOBuffer& CpuBackend::getNextAvailableInputBuffer() {
 
 int CpuBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
+}
+
+int CpuBackend::getOutputBufferCount() const {
+	return 2;  // Fixed ping-pong buffers. todo: make configurable
+}
+
+void CpuBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	(void)buffer;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->availableOutputBuffers++;
+	}
+	this->impl->outputSemaphoreCV.notify_one();
 }
 
 float CpuBackend::cubicHermiteInterpolation(float y0, float y1, float y2, float y3, float t) {

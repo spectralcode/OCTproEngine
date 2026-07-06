@@ -134,24 +134,28 @@ struct ProcessingResult {
 // Process data and get output
 bool processData(ope::Processor& processor, const std::vector<uint16_t>& testData, ProcessingResult& result) {
 	result.reset();
-	
-	processor.setOutputCallback([&result](const ope::IOBuffer& output) {
+
+	// Registered only for this capture and removed again below, so results of
+	// different processData() calls stay independent
+	ope::Processor::CallbackId callbackId = processor.addOutputCallback([&result](const ope::IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(result.mutex);
-		
+
 		size_t numFloats = output.getSizeInBytes() / sizeof(float);
 		result.output.resize(numFloats);
 		std::memcpy(result.output.data(), output.getDataPointer(), output.getSizeInBytes());
-		
+
 		result.received = true;
 		result.cv.notify_one();
 	});
-	
-	ope::IOBuffer& inputBuf = processor.getInputBuffer(0);
+
+	ope::IOBuffer& inputBuf = processor.getNextAvailableInputBuffer();
 	std::memcpy(inputBuf.getDataPointer(), testData.data(), testData.size() * sizeof(uint16_t));
 	processor.process(inputBuf);
-	
+
 	result.waitForCompletion();
-	
+
+	processor.removeOutputCallback(callbackId);
+
 	return result.received && !result.output.empty();
 }
 

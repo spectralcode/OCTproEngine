@@ -40,10 +40,10 @@ int main() {
 	processor.enableWindowing(true);
 	processor.enableLogScaling(true);
 	processor.initialize();
-	
+
 	// Set callback
-	processor.setOutputCallback(onProcessingComplete);
-	
+	processor.addOutputCallback(onProcessingComplete);
+
 	// Generate data, get buffer, process
 	auto testData = generateTestData();
 	ope::IOBuffer& buffer = processor.getNextAvailableInputBuffer();

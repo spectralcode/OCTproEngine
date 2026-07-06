@@ -12,10 +12,11 @@
 #ifdef OPE_VULKAN_AVAILABLE
 #include "../backends/vulkan/vulkan_backend.h"
 #endif
-#include "callback_manager.h"
+#include "buffer_manager.h"
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
+#include <unordered_map>
 #include "processor.h"
 
 namespace ope {
@@ -33,9 +34,20 @@ public:
 	bool initialized = false;
 	ProcessorConfiguration::DataParameters lastInitializedDataParams = {};
 
-	CallbackManager outputCallbackManager;
-	CallbackManager inputCallbackManager;
-	uint64_t nextBufferId = 0;  // Simple counter, not atomic
+	BufferManager outputBufferManager;   // For processed data consumers
+	BufferManager inputBufferManager;    // For raw data consumers
+	std::atomic<uint64_t> nextBufferId{0};  // atomic so getNextBufferId() can be read from any thread
+
+	// Callback state management (callbacks built on top of polling)
+	struct CallbackState {
+		ConsumerId consumerId;
+		BufferManager* manager = nullptr;  // which manager the consumer belongs to (input or output)
+		std::thread thread;
+		std::atomic<bool> running{true};
+	};
+	std::unordered_map<CallbackId, std::unique_ptr<CallbackState>> callbackStates;
+	std::mutex callbackStatesMutex;
+	std::atomic<CallbackId> nextCallbackId{0};
 
 	// Backend-specific settings (NOT in config)
 	int numBuffers = 2;           // currently default for all backends. todo: make configurable per backend?
@@ -48,6 +60,26 @@ public:
 	}
 	
 	~Impl() {
+		// Stop all callback threads first
+		{
+			std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+			for (auto& pair : this->callbackStates) {
+				pair.second->running = false;
+			}
+		}
+		// Remove all consumers (wakes up waiting threads)
+		this->outputBufferManager.shutdown();
+		this->inputBufferManager.shutdown();
+		// Join all callback threads
+		{
+			std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+			for (auto& pair : this->callbackStates) {
+				if (pair.second->thread.joinable()) {
+					pair.second->thread.join();
+				}
+			}
+			this->callbackStates.clear();
+		}
 		if (this->backend && this->initialized) {
 			this->backend->cleanup();
 		}
@@ -69,6 +101,7 @@ public:
 					const auto* cudaConfig = static_cast<const CudaConfig*>(this->backendConfig.get());
 					cudaBackend->setDeviceId(cudaConfig->deviceId);
 					cudaBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of cudaConfig
+					cudaBackend->setNumOutputBuffers(cudaConfig->numOutputBuffers);
 					cudaBackend->setEnableZeroCopy(cudaConfig->enableZeroCopy);
 
 					this->backend = std::move(cudaBackend);
@@ -114,6 +147,7 @@ public:
 					openclBackend->setPreferGpu(openclConfig->preferGpu);
 					openclBackend->setDeviceId(openclConfig->deviceId);
 					openclBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of openclConfig
+					openclBackend->setNumOutputBuffers(openclConfig->numOutputBuffers);
 
 					this->backend = std::move(openclBackend);
 				}
@@ -134,6 +168,7 @@ public:
 					const auto* vulkanConfig = static_cast<const VulkanConfig*>(this->backendConfig.get());
 					vulkanBackend->setDeviceId(vulkanConfig->deviceId);
 					vulkanBackend->setNumInputBuffers(this->numBuffers); //todo: numBuffers should be member of vulkanConfig
+					vulkanBackend->setNumOutputBuffers(vulkanConfig->numOutputBuffers);
 
 					this->backend = std::move(vulkanBackend);
 				}
@@ -270,10 +305,25 @@ public:
 		}
 		this->backend->initialize(this->config);
 
-		// Setup internal callback that distributes to all consumers
-		this->backend->setOutputCallback([this](const IOBuffer& output) {
-			this->internalCallback(output);
+		// Set buffer count from backend before setting callbacks
+		this->outputBufferManager.setBufferCount(this->backend->getOutputBufferCount());
+
+		// Setup release callback for OutputBufferManager
+		this->outputBufferManager.setReleaseCallback([this](IOBuffer* buf) {
+			this->backend->releaseOutputBuffer(buf);
 		});
+
+		// Setup internal callback that distributes to all consumers via OutputBufferManager
+		this->backend->setOutputCallback([this](const IOBuffer& output) {
+			this->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
+		});
+
+		// Setup input buffers for raw data consumers
+		this->inputBufferManager.setBufferCount(this->backend->getNumInputBuffers());
+
+		// No release callback needed: the backend manages the buffer memory itself,
+		// and getNextAvailableInputBuffer() waits via waitUntilReleased() until all
+		// consumers have released a buffer before it is handed out for reuse
 
 		this->initialized = true;
 
@@ -286,9 +336,14 @@ public:
 		if (!this->config.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
-		
+
 		this->backend->cleanup();
 		this->backend->initialize(this->config);
+
+		// Backend buffers were reallocated, refresh the reference tracking tables
+		// (buffer count may have changed and all buffer addresses are new)
+		this->outputBufferManager.setBufferCount(this->backend->getOutputBufferCount());
+		this->inputBufferManager.setBufferCount(this->backend->getNumInputBuffers());
 
 		// Send curves to backend
 		this->updateAllBackendCurves();
@@ -313,8 +368,101 @@ public:
 		       current.bscansPerBuffer != last.bscansPerBuffer;
 	}
 
-	void internalCallback(const IOBuffer& output) {
-		this->outputCallbackManager.invokeAll(output);
+	// Shared worker machinery for input and output callbacks: each callback is
+	// a consumer on the given manager plus a thread that delivers its buffers
+	CallbackId addCallbackWorker(BufferManager& manager, std::function<void(const IOBuffer&)> callback, ConsumerConfig config) {
+		// Generate a new callback ID
+		CallbackId callbackId = this->nextCallbackId++;
+
+		// Register a consumer for this callback
+		ConsumerId consumerId = manager.addConsumer(config);
+
+		// Create callback state and store it first (before starting thread)
+		auto state = std::make_unique<CallbackState>();
+		state->consumerId = consumerId;
+		state->manager = &manager;
+		state->running = true;
+
+		// Store state first - we need a stable pointer before starting the thread
+		CallbackState* statePtr = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+			this->callbackStates[callbackId] = std::move(state);
+			statePtr = this->callbackStates[callbackId].get();
+		}
+
+		// Now spawn thread with stable pointer to running flag
+		statePtr->thread = std::thread([callback, consumerId, statePtr]() {
+			while (statePtr->running.load(std::memory_order_acquire)) {
+				IOBuffer* buffer = statePtr->manager->getNext(consumerId);
+				if (!buffer) {
+					// Consumer was removed or shutdown
+					break;
+				}
+				try {
+					callback(*buffer);
+				} catch (...) {
+					// Callback threw exception - still need to release buffer
+				}
+				statePtr->manager->release(consumerId, buffer);
+			}
+		});
+
+		return callbackId;
+	}
+
+	bool removeCallbackWorker(BufferManager& manager, CallbackId id) {
+		std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+		auto it = this->callbackStates.find(id);
+		if (it == this->callbackStates.end()) {
+			return false;
+		}
+		if (it->second->manager != &manager) {
+			// ID belongs to the other callback direction (input vs output)
+			return false;
+		}
+
+		// Signal thread to stop
+		it->second->running = false;
+
+		// Remove consumer (wakes up waiting thread)
+		manager.removeConsumer(it->second->consumerId);
+
+		// Join thread
+		if (it->second->thread.joinable()) {
+			it->second->thread.join();
+		}
+
+		// Remove state
+		this->callbackStates.erase(it);
+		return true;
+	}
+
+	void clearCallbackWorkers(BufferManager& manager) {
+		std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+		for (auto it = this->callbackStates.begin(); it != this->callbackStates.end();) {
+			if (it->second->manager != &manager) {
+				++it;
+				continue;
+			}
+			it->second->running = false;
+			manager.removeConsumer(it->second->consumerId);
+			if (it->second->thread.joinable()) {
+				it->second->thread.join();
+			}
+			it = this->callbackStates.erase(it);
+		}
+	}
+
+	size_t countCallbackWorkers(const BufferManager& manager) {
+		std::lock_guard<std::mutex> lock(this->callbackStatesMutex);
+		size_t count = 0;
+		for (const auto& pair : this->callbackStates) {
+			if (pair.second->manager == &manager) {
+				count++;
+			}
+		}
+		return count;
 	}
 };
 
@@ -474,10 +622,21 @@ void Processor::setBackend(Backend backend) {
 	if (wasInitialized) {
 		this->impl->backend->initialize(this->impl->config);
 
-		// Setup internal callback that distributes to all consumers
-		this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
-			this->impl->internalCallback(output);
+		// Set buffer count from backend before setting callbacks
+		this->impl->outputBufferManager.setBufferCount(this->impl->backend->getOutputBufferCount());
+
+		// Setup release callback for OutputBufferManager
+		this->impl->outputBufferManager.setReleaseCallback([this](IOBuffer* buf) {
+			this->impl->backend->releaseOutputBuffer(buf);
 		});
+
+		// Setup internal callback that distributes to all consumers via OutputBufferManager
+		this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
+			this->impl->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
+		});
+
+		// Setup input buffers for raw data consumers
+		this->impl->inputBufferManager.setBufferCount(this->impl->backend->getNumInputBuffers());
 
 		this->impl->initialized = true;
 
@@ -494,76 +653,130 @@ Backend Processor::getBackend() const {
 // PROCESSING
 // ============================================
 Processor::CallbackId Processor::addOutputCallback(OutputCallback callback) {
-	return this->impl->outputCallbackManager.addCallback(callback);
+	return this->addOutputCallback(callback, ConsumerConfig{});
+}
+
+Processor::CallbackId Processor::addOutputCallback(OutputCallback callback, ConsumerConfig config) {
+	return this->impl->addCallbackWorker(this->impl->outputBufferManager, callback, config);
 }
 
 bool Processor::removeOutputCallback(CallbackId id) {
-	return this->impl->outputCallbackManager.removeCallback(id);
+	return this->impl->removeCallbackWorker(this->impl->outputBufferManager, id);
 }
 
 void Processor::clearOutputCallbacks() {
-	this->impl->outputCallbackManager.clear();
+	this->impl->clearCallbackWorkers(this->impl->outputBufferManager);
 }
 
 size_t Processor::getOutputCallbackCount() const {
-	return this->impl->outputCallbackManager.getCallbackCount();
+	return this->impl->countCallbackWorkers(this->impl->outputBufferManager);
 }
 
 // Input callbacks
 Processor::CallbackId Processor::addInputCallback(InputCallback callback) {
-	return this->impl->inputCallbackManager.addCallback(callback);
+	// Default ConsumerConfig = BLOCK with maxQueueSize = buffer count: lossless,
+	// backpressure applies through getNextAvailableInputBuffer() instead of process()
+	return this->impl->addCallbackWorker(this->impl->inputBufferManager, callback, ConsumerConfig{});
 }
 
 bool Processor::removeInputCallback(CallbackId id) {
-	return this->impl->inputCallbackManager.removeCallback(id);
+	return this->impl->removeCallbackWorker(this->impl->inputBufferManager, id);
 }
 
 void Processor::clearInputCallbacks() {
-	this->impl->inputCallbackManager.clear();
+	this->impl->clearCallbackWorkers(this->impl->inputBufferManager);
 }
 
 size_t Processor::getInputCallbackCount() const {
-	return this->impl->inputCallbackManager.getCallbackCount();
-}
-
-void Processor::setOutputCallback(OutputCallback callback) {
-	// Legacy method: clear all and add one
-	// Provided for backwards compatibility
-	// todo: remove this method und update processor.h and all examples, tests, etc
-	this->impl->outputCallbackManager.clear();
-	this->impl->outputCallbackManager.addCallback(callback);
+	return this->impl->countCallbackWorkers(this->impl->inputBufferManager);
 }
 
 void Processor::process(IOBuffer& input) {
 	this->impl->ensureInitialized();
 
-	uint64_t bufferId = this->impl->nextBufferId++;
+	uint64_t bufferId = this->impl->nextBufferId.fetch_add(1, std::memory_order_relaxed);
 	input.setBufferId(bufferId);
 
-	this->impl->inputCallbackManager.invokeAll(input);
-
+	// Start backend processing immediately (uploads to GPU, returns buffer when done)
 	this->impl->backend->process(input);
+
+	// Also publish to input consumers so they can read raw data
+	// Consumers read from CPU buffer while GPU is processing
+	this->impl->inputBufferManager.publish(&input);
+}
+
+uint64_t Processor::getNextBufferId() const {
+	return this->impl->nextBufferId.load(std::memory_order_relaxed);
 }
 
 // ============================================
 // BUFFER MANAGEMENT
 // ============================================
 
-IOBuffer& Processor::getInputBuffer(int index) {
-	//this->impl->ensureInitialized();
-	return this->impl->backend->getInputBuffer(index);
-}
-
 IOBuffer& Processor::getNextAvailableInputBuffer() {
 	//this->impl->ensureInitialized();
-	return this->impl->backend->getNextAvailableInputBuffer();
+	IOBuffer& buffer = this->impl->backend->getNextAvailableInputBuffer();
+	// The backend only tracks its own use of the buffer (upload/processing).
+	// Input consumers may still be reading it, so block here until every
+	// consumer has released its reference before the caller overwrites the data.
+	this->impl->inputBufferManager.waitUntilReleased(&buffer);
+	return buffer;
 }
 
-int Processor::getNumInputBuffers() const {
-	if (!this->impl->initialized) {
-		return 0;
-	}
-	return this->impl->backend->getNumInputBuffers();
+// ============================================
+// POLLING API (alternative to callbacks)
+// ============================================
+
+ConsumerId Processor::addConsumer(ConsumerConfig config) {
+	return this->impl->outputBufferManager.addConsumer(config);
+}
+
+void Processor::removeConsumer(ConsumerId id) {
+	this->impl->outputBufferManager.removeConsumer(id);
+}
+
+bool Processor::tryGetOutputBuffer(ConsumerId id, IOBuffer** output) {
+	return this->impl->outputBufferManager.tryGet(id, output);
+}
+
+IOBuffer* Processor::getNextOutputBuffer(ConsumerId id) {
+	return this->impl->outputBufferManager.getNext(id);
+}
+
+void Processor::releaseOutputBuffer(ConsumerId id, IOBuffer* buffer) {
+	this->impl->outputBufferManager.release(id, buffer);
+}
+
+uint64_t Processor::getDroppedFrameCount(ConsumerId id) const {
+	return this->impl->outputBufferManager.getDroppedCount(id);
+}
+
+// ============================================
+// INPUT POLLING API
+// ============================================
+
+ConsumerId Processor::addInputConsumer(ConsumerConfig config) {
+	return this->impl->inputBufferManager.addConsumer(config);
+}
+
+void Processor::removeInputConsumer(ConsumerId id) {
+	this->impl->inputBufferManager.removeConsumer(id);
+}
+
+bool Processor::tryGetInputBuffer(ConsumerId id, IOBuffer** output) {
+	return this->impl->inputBufferManager.tryGet(id, output);
+}
+
+IOBuffer* Processor::getNextInputBuffer(ConsumerId id) {
+	return this->impl->inputBufferManager.getNext(id);
+}
+
+void Processor::releaseInputBuffer(ConsumerId id, IOBuffer* buffer) {
+	this->impl->inputBufferManager.release(id, buffer);
+}
+
+uint64_t Processor::getInputDroppedFrameCount(ConsumerId id) const {
+	return this->impl->inputBufferManager.getDroppedCount(id);
 }
 
 // ============================================
@@ -1018,89 +1231,6 @@ void Processor::loadPostProcessBackgroundProfileFromFile(const std::string& file
 	this->setPostProcessBackgroundProfile(curve.data(), curve.size());
 }
 
-// ============================================
-// LOW-LEVEL API - Forward to backend
-// ============================================
-
-std::vector<float> Processor::convertInput(const void* input, IOBuffer::DataType inputType, int bitDepth, int samples, bool applyBitshift) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->convertInput(input, inputType, bitDepth, samples, applyBitshift);
-}
-
-std::vector<float> Processor::kLinearization(const float* input, const float* resampleCurve, InterpolationMethod method, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->kLinearization(input, resampleCurve, method, lineWidth, samples);
-}
-
-std::vector<float> Processor::windowing(const float* input, const float* windowCurve, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->windowing(input, windowCurve, lineWidth, samples);
-}
-
-std::vector<float> Processor::dispersionCompensation(const float* input, const float* phaseComplex, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->dispersionCompensation(input, phaseComplex, lineWidth, samples);
-}
-
-std::vector<float> Processor::fft(const float* input, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->fft(input, lineWidth, samples);
-}
-
-std::vector<float> Processor::ifft(const float* input, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->ifft(input, lineWidth, samples);
-}
-
-std::vector<float> Processor::rollingAverageBackgroundRemoval(const float* input, int windowSize, int lineWidth, int numLines) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->rollingAverageBackgroundRemoval(input, windowSize, lineWidth, numLines);
-}
-
-std::vector<float> Processor::kLinearizationAndWindowing(const float* input, const float* resampleCurve, const float* windowCurve, InterpolationMethod method, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->kLinearizationAndWindowing(input, resampleCurve, windowCurve, method, lineWidth, samples);
-}
-
-std::vector<float> Processor::kLinearizationAndWindowingAndDispersion(const float* input, const float* resampleCurve, const float* windowCurve, const float* phaseComplex, InterpolationMethod method, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->kLinearizationAndWindowingAndDispersion(input, resampleCurve, windowCurve, phaseComplex, method, lineWidth, samples);
-}
-
-std::vector<float> Processor::dispersionCompensationAndWindowing(const float* input, const float* phaseComplex, const float* windowCurve, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->dispersionCompensationAndWindowing(input, phaseComplex, windowCurve, lineWidth, samples);
-}
-
-std::vector<float> Processor::getMinimumVarianceMean(const float* input, int width, int height, int segments) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->getMinimumVarianceMean(input, width, height, segments);
-}
-
-std::vector<float> Processor::fixedPatternNoiseRemoval(const float* input, const float* meanALine, int lineWidth, int numLines) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->fixedPatternNoiseRemoval(input, meanALine, lineWidth, numLines);
-}
-
-std::vector<float> Processor::postProcessTruncate(const float* input, bool logScaling, float grayscaleMax, float grayscaleMin, float addend, float multiplicator, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->postProcessTruncate(input, logScaling, grayscaleMax, grayscaleMin, addend, multiplicator, lineWidth, samples);
-}
-
-std::vector<float> Processor::bscanFlip(const float* input, int lineWidth, int linesPerBscan, int numBscans) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->bscanFlip(input, lineWidth, linesPerBscan, numBscans);
-}
-
-std::vector<float> Processor::sinusoidalScanCorrection(const float* input, const float* resampleCurve, int lineWidth, int linesPerBscan, int numBscans) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->sinusoidalScanCorrection(input, resampleCurve, lineWidth, linesPerBscan, numBscans);
-}
-
-std::vector<float> Processor::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
-	this->impl->ensureInitialized();
-	return this->impl->backend->postProcessBackgroundSubtraction(input, backgroundLine, weight, offset, lineWidth, samples);
-}
 
 // ============================================
 // BACKEND-SPECIFIC SETTINGS

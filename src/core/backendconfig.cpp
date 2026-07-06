@@ -30,6 +30,9 @@ std::string CudaConfig::toString() const {
 	if (enableZeroCopy) {
 		oss << ", zero_copy=true";
 	}
+	if (numOutputBuffers > 0) {
+		oss << ", num_output_buffers=" << numOutputBuffers;
+	}
 	oss << ")";
 	return oss.str();
 }
@@ -42,8 +45,11 @@ std::string OpenCLConfig::toString() const {
 	std::ostringstream oss;
 	oss << "OpenCLConfig(platform=" << platformId
 		<< ", device=" << deviceId
-		<< ", prefer_gpu=" << (preferGpu ? "true" : "false")
-		<< ")";
+		<< ", prefer_gpu=" << (preferGpu ? "true" : "false");
+	if (numOutputBuffers > 0) {
+		oss << ", num_output_buffers=" << numOutputBuffers;
+	}
+	oss << ")";
 	return oss.str();
 }
 
@@ -53,7 +59,14 @@ std::string OpenCLConfig::toString() const {
 
 std::string VulkanConfig::toString() const {
 	std::ostringstream oss;
-	oss << "VulkanConfig(device=" << deviceId << ")";
+	oss << "VulkanConfig(device=" << deviceId;
+	if (numOutputBuffers > 0) {
+		oss << ", num_output_buffers=" << numOutputBuffers;
+	}
+	if (numStagingInputBuffers > 0) {
+		oss << ", num_staging_input_buffers=" << numStagingInputBuffers;
+	}
+	oss << ")";
 	return oss.str();
 }
 
@@ -310,6 +323,8 @@ std::unique_ptr<BackendConfig> BackendUtils::parseConfig(const std::string& conf
 						config->deviceId = std::stoi(value);
 					} else if (key == "zero_copy") {
 						config->enableZeroCopy = (value == "true");
+					} else if (key == "num_output_buffers") {
+						config->numOutputBuffers = std::stoi(value);
 					}
 				}
 			}
@@ -332,6 +347,8 @@ std::unique_ptr<BackendConfig> BackendUtils::parseConfig(const std::string& conf
 						config->deviceId = std::stoi(value);
 					} else if (key == "prefer_gpu") {
 						config->preferGpu = (value == "true");
+					} else if (key == "num_output_buffers") {
+						config->numOutputBuffers = std::stoi(value);
 					}
 				}
 			}
@@ -350,6 +367,10 @@ std::unique_ptr<BackendConfig> BackendUtils::parseConfig(const std::string& conf
 					std::string value = param.substr(pos + 1);
 					if (key == "device") {
 						config->deviceId = std::stoi(value);
+					} else if (key == "num_output_buffers") {
+						config->numOutputBuffers = std::stoi(value);
+					} else if (key == "num_staging_input_buffers") {
+						config->numStagingInputBuffers = std::stoi(value);
 					}
 				}
 			}
@@ -390,6 +411,9 @@ std::string BackendUtils::serializeConfig(const BackendConfig& config) {
 		if (cudaConfig.enableZeroCopy) {
 			oss << ",zero_copy=true";
 		}
+		if (cudaConfig.numOutputBuffers > 0) {
+			oss << ",num_output_buffers=" << cudaConfig.numOutputBuffers;
+		}
 		break;
 	}
 	case Backend::OPENCL: {
@@ -397,11 +421,20 @@ std::string BackendUtils::serializeConfig(const BackendConfig& config) {
 		oss << "opencl:platform=" << openclConfig.platformId
 			<< ",device=" << openclConfig.deviceId
 			<< ",prefer_gpu=" << (openclConfig.preferGpu ? "true" : "false");
+		if (openclConfig.numOutputBuffers > 0) {
+			oss << ",num_output_buffers=" << openclConfig.numOutputBuffers;
+		}
 		break;
 	}
 	case Backend::VULKAN: {
 		const auto& vulkanConfig = static_cast<const VulkanConfig&>(config);
 		oss << "vulkan:device=" << vulkanConfig.deviceId;
+		if (vulkanConfig.numOutputBuffers > 0) {
+			oss << ",num_output_buffers=" << vulkanConfig.numOutputBuffers;
+		}
+		if (vulkanConfig.numStagingInputBuffers > 0) {
+			oss << ",num_staging_input_buffers=" << vulkanConfig.numStagingInputBuffers;
+		}
 		break;
 	}
 	case Backend::CPU: {

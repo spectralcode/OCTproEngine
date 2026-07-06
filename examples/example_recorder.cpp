@@ -47,10 +47,10 @@ void example_basic_recording() {
 		memset(inputBuffer.getDataPointer(), i, inputBuffer.getSizeInBytes());
 
 		processor.process(inputBuffer);
-		std::cout << "  Processed buffer " << (i + 1) << "/10" << std::endl;
+		std::cout << "  Processed buffer " << (i + 1) << "/30" << std::endl;
 	}
 
-	// Wait for recording to complete (auto-completes at 10 buffers)
+	// Wait for recording to complete (auto-completes once the configured buffer count is recorded)
 	std::cout << "Waiting for recording to complete..." << std::endl;
 	bool success = recorder.waitForCompletion(10000); 
 	if (success) {

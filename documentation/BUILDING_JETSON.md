@@ -7,7 +7,7 @@ sudo apt-get update
 sudo apt-get install -y libglfw3-dev libgl1-mesa-dev
 
 # 2. Clone repository
-git clone https://github.com/yourusername/OCTproEngine.git
+git clone https://github.com/spectralcode/OCTproEngine.git
 cd OCTproEngine
 
 # 3. Setup ImGui dependency (optional, but required for OCTproViewer)

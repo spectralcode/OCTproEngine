@@ -6,8 +6,18 @@
 #include "imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <commdlg.h>
+#endif
+
 #include "processor.h"
 #include "processorconfiguration.h"
+#include "octproviewer_benchmark.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -16,6 +26,7 @@
 #include <atomic>
 #include <limits>
 #include <cmath>
+#include <algorithm>
 
 // ============================================================================
 // Data Structures
@@ -50,6 +61,7 @@ struct ProcessingParams {
 
 	bool fpnRemoval = false;
 	int fpnBscanCount = 1;
+	bool fpnContinuous = false;
 };
 
 struct DataParams {
@@ -97,6 +109,8 @@ struct AppState {
 
 	std::vector<uint8_t> rawDataCache;
 	bool hasDataLoaded = false;
+
+	BenchmarkState benchmark;
 };
 
 // ============================================================================
@@ -112,6 +126,32 @@ std::vector<unsigned char> rotateImage90CCW(const unsigned char* input, int widt
 	}
 	return output;
 }
+
+#ifdef _WIN32
+bool browseForCustomFile(AppState* state) {
+	char selectedPath[sizeof(state->filePathBuffer)] = "";
+	if (state->filePathBuffer[0] != '\0') {
+		strncpy(selectedPath, state->filePathBuffer, sizeof(selectedPath) - 1);
+		selectedPath[sizeof(selectedPath) - 1] = '\0';
+	}
+
+	OPENFILENAMEA dialog = {};
+	dialog.lStructSize = sizeof(dialog);
+	dialog.lpstrFile = selectedPath;
+	dialog.nMaxFile = static_cast<DWORD>(sizeof(selectedPath));
+	dialog.lpstrFilter = "All Files\0*.*\0\0";
+	dialog.lpstrTitle = "Select OCT data file";
+	dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+
+	if (!GetOpenFileNameA(&dialog)) {
+		return false;
+	}
+
+	strncpy(state->filePathBuffer, selectedPath, sizeof(state->filePathBuffer) - 1);
+	state->filePathBuffer[sizeof(state->filePathBuffer) - 1] = '\0';
+	return true;
+}
+#endif
 
 void onProcessedData(const ope::IOBuffer& output, AppState* state) {
 	std::lock_guard<std::mutex> lock(state->display.dataMutex);
@@ -171,6 +211,7 @@ void applyProcessingParams(ope::Processor* proc, const ProcessingParams& params)
 
 	proc->enableFixedPatternNoiseRemoval(params.fpnRemoval);
 	proc->setFixedPatternNoiseBscanCount(params.fpnBscanCount);
+	proc->enableContinuousFixedPatternNoiseDetermination(params.fpnContinuous);
 }
 
 void initializeProcessor(AppState* state) {
@@ -241,7 +282,7 @@ void initializeProcessor(AppState* state) {
 
 	applyProcessingParams(state->processor, state->procParams);
 
-	state->processor->setOutputCallback(
+	state->processor->addOutputCallback(
 		[state](const ope::IOBuffer& output) { onProcessedData(output, state); }
 	);
 
@@ -522,7 +563,18 @@ void renderDataLoadingUI(AppState* state) {
 		}
 	} else {
 		ImGui::InputText("File Path", state->filePathBuffer, sizeof(state->filePathBuffer));
+#ifdef _WIN32
+		ImGui::SameLine();
+		if (ImGui::Button("Browse...")) {
+			browseForCustomFile(state);
+		}
+#endif
 		if (ImGui::Button("Load & Process Custom File", ImVec2(-1, 0))) {
+#ifdef _WIN32
+			if (state->filePathBuffer[0] == '\0' && !browseForCustomFile(state)) {
+				return;
+			}
+#endif
 			loadFileData(state);
 		}
 	}
@@ -597,6 +649,7 @@ void renderProcessingUI(AppState* state) {
 	// Fixed Pattern Noise
 	ImGui::SeparatorText("Fixed-Pattern Noise Removal");
 	CheckboxWithReprocess("Enable FPN Removal", &pp.fpnRemoval, state);
+	CheckboxWithReprocess("Continuous FPN", &pp.fpnContinuous, state);
 	if (ImGui::InputInt("FPN B-scan Count", &pp.fpnBscanCount, 1, 1)) {
 		if (state->autoUpdate) reprocessData(state);
 	}
@@ -737,15 +790,21 @@ int main(int argc, char** argv) {
 	// Main loop
 	while (!glfwWindowShouldClose(window)) {
 		glfwPollEvents();
+		finalizeBenchmarkThread(state.benchmark);
 		updateTexture(&state);
 
 		ImGui_ImplOpenGL3_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		ImGui::NewFrame();
 
+		renderBenchmarkMenuBar(state.benchmark, window);
+		renderBenchmarkDialog(state.benchmark);
+
+		const float topOffset = ImGui::GetFrameHeight() + 10.0f;
+
 		// Control Panel
 		if (firstFrame) {
-			ImGui::SetNextWindowPos(ImVec2(10, 10));
+			ImGui::SetNextWindowPos(ImVec2(10, topOffset));
 			ImGui::SetNextWindowSize(ImVec2(400, 850));
 		}
 		ImGui::Begin("OCT Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -765,13 +824,15 @@ int main(int argc, char** argv) {
 
 		// Image Display
 		if (firstFrame) {
-			ImGui::SetNextWindowPos(ImVec2(420, 10));
+			ImGui::SetNextWindowPos(ImVec2(420, topOffset));
 			ImGui::SetNextWindowSize(ImVec2(1160, 850));
 			firstFrame = false;
 		}
 		ImGui::Begin("OCT Image");
 		renderImageDisplay(&state);
 		ImGui::End();
+
+		renderBenchmarkResultsWindow(state.benchmark);
 
 		// Render
 		ImGui::Render();
@@ -789,6 +850,7 @@ int main(int argc, char** argv) {
 	if (state.display.textureID != 0) {
 		glDeleteTextures(1, &state.display.textureID);
 	}
+	stopBenchmarkThread(state.benchmark);
 	if (state.processor) {
 		state.processor->cleanup();
 		delete state.processor;

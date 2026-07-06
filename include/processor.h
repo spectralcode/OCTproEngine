@@ -12,12 +12,26 @@
 
 namespace ope {
 
+// Drop policy for output buffer consumers
+enum class DropPolicy {
+	BLOCK,       // Block producer if consumer queue is full (default, backward compatible)
+	DROP_OLDEST  // Drop oldest buffer in queue if full (non-blocking)
+};
+
+// Configuration for output buffer consumers
+struct ConsumerConfig {
+	size_t maxQueueSize = 0;                  // 0 = default queue size
+	DropPolicy dropPolicy = DropPolicy::BLOCK;
+};
+
+using ConsumerId = int;
+
 class OPE_API Processor {
 public:
 // todo: Consider redesigning public API for cross-compiler/OS binary compatibility (pure C ABI).
-// maybe keep cpp style API but don't use STL (std::function, std::vector, etc.) in public API? 
+// maybe keep cpp style API but don't use STL (std::function, std::vector, etc.) in public API?
 // maybe c api and optional cpp header-only wrapper?
-	using OutputCallback = std::function<void(const IOBuffer&)>; 
+	using OutputCallback = std::function<void(const IOBuffer&)>;
 	using InputCallback = std::function<void(const IOBuffer&)>;
 	using CallbackId = int;
 
@@ -76,9 +90,10 @@ public:
 	// processing is asynchronous; output is delivered via registered callbacks
 	void process(IOBuffer& input);
 
-	// todo: remove this method and update python bindings, tests etc
-	// Set single output callback (legacy method)
-	void setOutputCallback(OutputCallback callback);
+	// ID that will be assigned to the next buffer passed to process()
+	// Useful as a fence: all buffers with an ID >= this value are processed
+	// after this call (e.g. tools that must start capturing "from now on")
+	uint64_t getNextBufferId() const;
 
 	// Add an output callback for processed data
 	// Each callback runs on its own dedicated thread. Callbacks execute
@@ -96,19 +111,76 @@ public:
 	// Get number of registered output callbacks
 	size_t getOutputCallbackCount() const;
 
+	// Add output callback with custom configuration
+	CallbackId addOutputCallback(OutputCallback callback, ConsumerConfig config);
+
+	// ============================================
+	// POLLING API (alternative to callbacks)
+	// ============================================
+
+	// Register a consumer for polling-based output retrieval
+	// Throws std::runtime_error when all slots are taken: callbacks and
+	// consumers of one direction share 32 slots
+	ConsumerId addConsumer(ConsumerConfig config = {});
+
+	// Remove a consumer (releases any queued buffers)
+	// Buffers already obtained via tryGet/getNext must still be released
+	// afterwards; the ID stays valid for releaseOutputBuffer() only
+	void removeConsumer(ConsumerId id);
+
+	// Non-blocking: returns true if buffer available
+	bool tryGetOutputBuffer(ConsumerId id, IOBuffer** output);
+
+	// Blocking: waits for next processed buffer
+	// Returns nullptr if consumer was removed or shutdown
+	IOBuffer* getNextOutputBuffer(ConsumerId id);
+
+	// Release buffer back to pool (required after tryGetOutputBuffer/getNextOutputBuffer)
+	void releaseOutputBuffer(ConsumerId id, IOBuffer* buffer);
+
+	// Get number of dropped frames for consumer (only for DROP_OLDEST policy)
+	uint64_t getDroppedFrameCount(ConsumerId id) const;
+
 	// Input callbacks - receive input buffer before processing
-	// WARNING: Buffer is still in use by backend, copy data if needed beyond callback
+	// Callbacks run asynchronously on their own worker thread; process() does
+	// not wait for them. The buffer is reference-protected and stays valid for
+	// the duration of the callback, copy the data if needed beyond it
 	CallbackId addInputCallback(InputCallback callback);
 	bool removeInputCallback(CallbackId id);
 	void clearInputCallbacks();
 	size_t getInputCallbackCount() const;
 
-	//dont use this, only for testing. will be removed
-	IOBuffer& getInputBuffer(int index);
-	int getNumInputBuffers() const;
+	// ============================================
+	// INPUT POLLING API (alternative to input callbacks)
+	// For reading raw camera/input data before processing
+	// ============================================
+
+	// Register a consumer for polling-based input buffer retrieval
+	// Held input buffers gate producer-side reuse: BLOCK consumers backpressure
+	// getNextAvailableInputBuffer(), DROP_OLDEST consumers lose queued frames
+	// instead of blocking it
+	ConsumerId addInputConsumer(ConsumerConfig config = {});
+
+	// Remove an input consumer (releases any queued buffers)
+	void removeInputConsumer(ConsumerId id);
+
+	// Non-blocking: returns true if input buffer available
+	bool tryGetInputBuffer(ConsumerId id, IOBuffer** output);
+
+	// Blocking: waits for next raw input buffer
+	// Returns nullptr if consumer was removed or shutdown
+	IOBuffer* getNextInputBuffer(ConsumerId id);
+
+	// Release input buffer back (required after tryGetInputBuffer/getNextInputBuffer)
+	void releaseInputBuffer(ConsumerId id, IOBuffer* buffer);
+
+	// Get number of dropped frames for input consumer (only for DROP_OLDEST policy)
+	uint64_t getInputDroppedFrameCount(ConsumerId id) const;
 
 	// Get next available input buffer for processing
-	// Blocks if no buffer is available
+	// Blocks if no buffer is available, and until input consumers have released
+	// the buffer (a BLOCK-policy input consumer that stops polling without
+	// releasing blocks this call until it releases or is removed)
 	IOBuffer& getNextAvailableInputBuffer();
 
 	
@@ -210,125 +282,6 @@ public:
 	void saveFixedPatternNoiseProfileToFile(const std::string& filepath) const;
 	void loadFixedPatternNoiseProfileFromFile(const std::string& filepath); 
 	
-	// ============================================
-	// LOW-LEVEL API - Individual Operations (for testing)
-	// ============================================
-	
-	std::vector<float> convertInput(
-		const void* input,
-		IOBuffer::DataType inputType,
-		int bitDepth,
-		int samples,
-		bool applyBitshift = false
-	);
-	
-	std::vector<float> rollingAverageBackgroundRemoval(
-		const float* input,
-		int windowSize,
-		int lineWidth,
-		int numLines
-	);
-	
-	std::vector<float> kLinearization(
-		const float* input,
-		const float* resampleCurve,
-		InterpolationMethod method,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> windowing(
-		const float* input,
-		const float* windowCurve,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> dispersionCompensation(
-		const float* input,
-		const float* phaseComplex,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> kLinearizationAndWindowing(
-		const float* input,
-		const float* resampleCurve,
-		const float* windowCurve,
-		InterpolationMethod method,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> kLinearizationAndWindowingAndDispersion(
-		const float* input,
-		const float* resampleCurve,
-		const float* windowCurve,
-		const float* phaseComplex,
-		InterpolationMethod method,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> dispersionCompensationAndWindowing(
-		const float* input,
-		const float* phaseComplex,
-		const float* windowCurve,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> fft(const float* input, int lineWidth, int samples);
-	std::vector<float> ifft(const float* input, int lineWidth, int samples);
-	
-	std::vector<float> getMinimumVarianceMean(
-		const float* input,
-		int width,
-		int height,
-		int segments
-	);
-	
-	std::vector<float> fixedPatternNoiseRemoval(
-		const float* input,
-		const float* meanALine,
-		int lineWidth,
-		int numLines
-	);
-	
-	std::vector<float> postProcessTruncate(
-		const float* input,
-		bool logScaling,
-		float grayscaleMax,
-		float grayscaleMin,
-		float addend,
-		float multiplicator,
-		int lineWidth,
-		int samples
-	);
-	
-	std::vector<float> bscanFlip(
-		const float* input,
-		int lineWidth,
-		int linesPerBscan,
-		int numBscans
-	);
-	
-	std::vector<float> sinusoidalScanCorrection(
-		const float* input,
-		const float* resampleCurve,
-		int lineWidth,
-		int linesPerBscan,
-		int numBscans
-	);
-	
-	std::vector<float> postProcessBackgroundSubtraction(
-		const float* input,
-		const float* backgroundLine,
-		float weight,
-		float offset,
-		int lineWidth,
-		int samples
-	);
 
 private:
 	class Impl;

@@ -45,8 +45,9 @@ class OPE_API CudaConfig : public BackendConfig {
 public:
 	int deviceId;
 	bool enableZeroCopy;
+	int numOutputBuffers;  // 0 = auto (default: numStreams * 2)
 
-	CudaConfig() : deviceId(0), enableZeroCopy(false) {}
+	CudaConfig() : deviceId(0), enableZeroCopy(false), numOutputBuffers(0) {}
 
 	Backend getBackendType() const override { return Backend::CUDA; }
 
@@ -67,8 +68,9 @@ public:
 	int platformId;
 	int deviceId;  // -1 = auto-select based on preferGpu
 	bool preferGpu;
+	int numOutputBuffers;  // 0 = auto (default: numCommandQueues * 2)
 
-	OpenCLConfig() : platformId(0), deviceId(-1), preferGpu(true) {}
+	OpenCLConfig() : platformId(0), deviceId(-1), preferGpu(true), numOutputBuffers(0) {}
 
 	Backend getBackendType() const override { return Backend::OPENCL; }
 
@@ -87,8 +89,10 @@ public:
 class OPE_API VulkanConfig : public BackendConfig {
 public:
 	int deviceId;  // Physical device index
+	int numOutputBuffers;  // 0 = auto (default: numCommandBuffers * 2)
+	int numStagingInputBuffers;  // 0 = auto (default: numCommandBuffers * 2)
 
-	VulkanConfig() : deviceId(0) {}
+	VulkanConfig() : deviceId(0), numOutputBuffers(0), numStagingInputBuffers(0) {}
 
 	Backend getBackendType() const override { return Backend::VULKAN; }
 

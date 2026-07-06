@@ -203,7 +203,7 @@ BenchmarkResult runBenchmark(
 
 	// Setup callback to count completed iterations
 	std::atomic<int> completedIterations(0);
-	processor.setOutputCallback([&completedIterations](const ope::IOBuffer& output) {
+	processor.addOutputCallback([&completedIterations](const ope::IOBuffer& output) {
 		completedIterations++;
 	});
 

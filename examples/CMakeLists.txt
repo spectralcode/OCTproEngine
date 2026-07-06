@@ -102,7 +102,11 @@ if(BUILD_OCT_VIEWER)
 	)
 
 	# Create octproviewer executable
-	add_executable(octproviewer octproviewer.cpp ${IMGUI_SOURCES})
+	add_executable(octproviewer
+		octproviewer.cpp
+		octproviewer_benchmark.cpp
+		${IMGUI_SOURCES}
+	)
 
 	# Include directories
 	target_include_directories(octproviewer PRIVATE
@@ -119,7 +123,7 @@ if(BUILD_OCT_VIEWER)
 
 	# Platform-specific OpenGL linking
 	if(WIN32)
-		target_link_libraries(octproviewer PRIVATE opengl32)
+		target_link_libraries(octproviewer PRIVATE opengl32 Comdlg32)
 	else()
 		# Linux/Unix/MacOS
 		find_package(OpenGL REQUIRED)

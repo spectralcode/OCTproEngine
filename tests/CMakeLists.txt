@@ -1,6 +1,6 @@
 function(add_ope_test TEST_NAME SOURCE_FILE)
-	# Create executable
-	add_executable(${TEST_NAME} ${SOURCE_FILE})
+	# Create executable (extra arguments are compiled into the test, e.g. internal sources)
+	add_executable(${TEST_NAME} ${SOURCE_FILE} ${ARGN})
 	
 	# Link to octproengine library
 	target_link_libraries(${TEST_NAME} PRIVATE octproengine)
@@ -52,8 +52,30 @@ add_ope_test(test_backend_state_transfer test_backend_state_transfer.cpp)
 add_ope_test(test_backend_config test_backend_config.cpp)
 add_ope_test(test_zerocopy_runtime test_zerocopy_runtime.cpp)
 add_ope_test(test_zerocopy_performance test_zerocopy_performance.cpp)
-add_ope_test(test_buffer_ordering test_buffer_ordering.cpp)
 add_ope_test(test_buffer_ordering_content test_buffer_ordering_content.cpp)
+add_ope_test(test_input_consumer test_input_consumer.cpp)
+add_ope_test(test_processor_teardown test_processor_teardown.cpp)
+set_tests_properties(test_processor_teardown PROPERTIES TIMEOUT 300)
+add_ope_test(test_consumer_performance_impact test_consumer_performance_impact.cpp)
+
+# Pure performance benchmarks: run with "ctest -L perf", excluded from the
+# functional suite via "ctest -LE perf"
+set_tests_properties(test_performance_benchmark test_zerocopy_performance test_consumer_performance_impact
+	PROPERTIES LABELS perf)
+
+# Standalone BufferManager stress tests: compile buffer_manager.cpp directly
+# because BufferManager is internal and not exported from the library
+add_ope_test(test_consumer_churn_stress test_consumer_churn_stress.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
+target_include_directories(test_consumer_churn_stress PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_consumer_churn_stress PROPERTIES TIMEOUT 120)
+
+add_ope_test(test_consumer_lifecycle test_consumer_lifecycle.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
+target_include_directories(test_consumer_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_consumer_lifecycle PROPERTIES TIMEOUT 120)
+
+add_ope_test(test_consumer_policies test_consumer_policies.cpp ${CMAKE_SOURCE_DIR}/src/core/buffer_manager.cpp)
+target_include_directories(test_consumer_policies PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_consumer_policies PROPERTIES TIMEOUT 120)
 
 # Recorder test (requires BUILD_TOOLS=ON)
 if(BUILD_TOOLS)

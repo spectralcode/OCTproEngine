@@ -1,5 +1,8 @@
 #include "vulkan_backend.h"
 
+//#define VULKAN_DEBUG  // Uncomment to enable debug output
+
+
 //	VkFFT backend selection: 0 = Vulkan
 #define VKFFT_BACKEND 0
 #include <vkFFT/vkFFT.h>
@@ -27,6 +30,9 @@
 		if (err != VK_SUCCESS) { \
 			std::stringstream ss; \
 			ss << "Vulkan error at " << __FILE__ << ":" << __LINE__ << " - code: " << err; \
+			if (err == VK_ERROR_DEVICE_LOST) { \
+				std::cerr << "!!! GPU DEVICE LOST (VK_ERROR_DEVICE_LOST) - likely shader OOB/invalid memory access !!!" << std::endl; \
+			} \
 			throw std::runtime_error(ss.str()); \
 		} \
 	} while(0)
@@ -42,6 +48,14 @@
 		} \
 	} while(0)
 
+// Unified debug macro (controls logging + validation + debug utils extension)
+#ifdef VULKAN_DEBUG
+	#include <iostream>
+	#define VKDBG_LOG(x) do { std::cout << x << std::endl; } while (0)
+#else
+	#define VKDBG_LOG(x) do { } while (0)
+#endif
+
 namespace ope {
 
 // ============================================
@@ -51,6 +65,49 @@ namespace ope {
 // glslang is process-wide, not per-instance
 static bool s_glslangInitialized = false;
 static std::mutex s_glslangMutex;
+
+// ============================================
+// Compute Shader Configuration
+// ============================================
+
+// ============================================
+// Debug Callback for Validation
+// ============================================
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+	VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+	VkDebugUtilsMessageTypeFlagsEXT messageType,
+	const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+	void* pUserData
+) {
+	(void)messageSeverity;
+	(void)messageType;
+	(void)pUserData;
+
+	std::cerr << "[Vulkan Validation] " << pCallbackData->pMessage << std::endl;
+	std::cerr.flush();
+	return VK_FALSE;
+}
+
+static VkResult CreateDebugUtilsMessengerEXT(
+	VkInstance instance,
+	const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
+	const VkAllocationCallbacks* pAllocator,
+	VkDebugUtilsMessengerEXT* pMessenger
+) {
+	auto fn = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+	if (!fn) return VK_ERROR_EXTENSION_NOT_PRESENT;
+	return fn(instance, pCreateInfo, pAllocator, pMessenger);
+}
+
+static void DestroyDebugUtilsMessengerEXT(
+	VkInstance instance,
+	VkDebugUtilsMessengerEXT messenger,
+	const VkAllocationCallbacks* pAllocator
+) {
+	auto fn = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+	if (fn) fn(instance, messenger, pAllocator);
+}
 
 // ============================================
 // Compute Shader Configuration
@@ -75,6 +132,37 @@ void createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDeviceSize
 // ============================================
 
 struct VulkanBackend::Impl {
+	// ============================================
+	// RAII Guard for Staging Buffer Exception Safety
+	// ============================================
+	struct StagingLease {
+		VulkanBackend::Impl* impl = nullptr;
+		int idx = -1;
+		bool active = false;
+
+		explicit StagingLease(VulkanBackend::Impl* i) : impl(i) {}
+
+		void acquire(int i) {
+			idx = i;
+			active = true;
+		}
+
+		void release_to_pending() {
+			active = false;  // Disarm guard - work now tracked in pendingWorkQueue
+		}
+
+		~StagingLease() noexcept {
+			if (!active || !impl || idx < 0) return;
+
+			// Return staging buffer to free queue on early-exit / exception
+			std::lock_guard<std::mutex> lock(impl->freeStagingOutputMutex);
+			if (impl->stagingInUse[idx].exchange(false, std::memory_order_acq_rel)) {
+				impl->freeStagingOutputQueue.push(idx);
+				impl->freeStagingOutputCV.notify_one();
+			}
+		}
+	};
+
 	// ============================================
 	// Pipeline Index Enumeration
 	// ============================================
@@ -115,6 +203,7 @@ struct VulkanBackend::Impl {
 
 	// Vulkan core objects
 	VkInstance instance = VK_NULL_HANDLE;
+	VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 	VkQueue computeQueue = VK_NULL_HANDLE;
@@ -139,9 +228,13 @@ struct VulkanBackend::Impl {
 	VkSemaphore outputOrderingSemaphore = VK_NULL_HANDLE;
 	uint64_t nextOutputSignalValue = 1;  // Monotonically increasing value for timeline semaphore
 	std::vector<uint64_t> lastTimelineValuePerCB;  // Last timeline value used by each command buffer
-	std::atomic<uint64_t> lastProcessedTimelineValue{0};  // Highest timeline value fully processed by completion thread
-	std::mutex stagingBufferMutex;  // Protects staging buffer access
-	std::condition_variable stagingBufferCV;  // For waiting on staging buffer availability
+	std::vector<uint64_t> stagingLastWriteValue;  // Track last timeline value that wrote to each staging buffer
+
+	// Debug utils (CRITICAL: gate on debugUtilsEnabled - vkGetDeviceProcAddr can return non-null even when extension disabled)
+	bool debugUtilsEnabled = false;  // Set true when VK_EXT_debug_utils is enabled at instance creation
+	PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT_fn = nullptr;
+	PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT_fn = nullptr;
+	PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT_fn = nullptr;
 
 	// Command buffers and synchronization
 	VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -149,6 +242,25 @@ struct VulkanBackend::Impl {
 	std::vector<VkFence> fences;
 	// Note: No round-robin index needed - zero-copy input determines CB from buffer pointer
 	bool commandBuffersValid = false;  // Track if command buffers need re-recording
+
+	// Selective VkFFT rebuild. track parameters that affect VkFFT app creation
+	struct FftKey {
+		uint32_t signalLength = 0;
+		uint32_t numberBatches = 0;
+		bool dcRemovalEnabled = false;  // Affects which buffer VkFFT uses (getFftDataBufferForSlot)
+
+		bool operator==(const FftKey& other) const {
+			return signalLength == other.signalLength &&
+			       numberBatches == other.numberBatches &&
+			       dcRemovalEnabled == other.dcRemovalEnabled;
+		}
+
+		bool operator!=(const FftKey& other) const {
+			return !(*this == other);
+		}
+	};
+
+	FftKey prevFftKey{};
 
 	// Input buffer management (queue-based, thread-safe)
 	// Zero-copy: numInputBuffers == numCommandBuffers (each input buffer is backed by staging)
@@ -158,6 +270,9 @@ struct VulkanBackend::Impl {
 	std::mutex freeQueueMutex;
 	std::condition_variable freeQueueCV;
 
+	// Output buffer management
+	int numOutputBuffers = 0;  // 0 = auto (numCommandBuffers * 2)
+
 	// Staging buffers (host-visible, one per command buffer)
 	std::vector<VkBuffer> stagingInputBuffers;
 	std::vector<VkDeviceMemory> stagingInputMemory;
@@ -166,6 +281,16 @@ struct VulkanBackend::Impl {
 	std::vector<VkBuffer> stagingOutputBuffers;
 	std::vector<VkDeviceMemory> stagingOutputMemory;
 	std::vector<void*> stagingOutputMapped;
+
+	// Free staging output buffer pool (decoupled from command buffer slots)
+	std::queue<int> freeStagingOutputQueue;
+	std::mutex freeStagingOutputMutex;
+	std::condition_variable freeStagingOutputCV;
+	std::unique_ptr<std::atomic<bool>[]> stagingInUse;  // Double-free guard (atomics can't go in vector)
+	int numStagingBuffers = 0;  // Track size of stagingInUse array
+	bool stagingOutputIsCoherent = false;  // Track if staging memory has HOST_COHERENT property
+	VkDeviceSize nonCoherentAtomSize = 1;  // Alignment requirement for non-coherent memory operations
+	std::vector<VkDeviceSize> stagingOutputAllocSize;  // Track allocation size per staging output buffer
 
 	// Device buffers (device-local)
 	std::vector<VkBuffer> deviceInputBuffers;
@@ -194,8 +319,15 @@ struct VulkanBackend::Impl {
 	// Fixed pattern noise removal
 	VkBuffer meanALineBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory meanALineMemory = VK_NULL_HANDLE;
+	std::mutex fixedPatternNoiseMutex;  // Protects fixedPatternNoiseDetermined and recordedFixedPatternNoise
 	bool fixedPatternNoiseDetermined = false;
 	std::vector<float> recordedFixedPatternNoise;
+
+	// FPN staging buffer for host readback (similar to postProcBackgroundStagingBuffer)
+	VkBuffer meanALineStagingBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory meanALineStagingMemory = VK_NULL_HANDLE;
+	void* meanALineStagingMapped = nullptr;  // Persistent mapped pointer
+	bool fpnRecordingRequested = false;
 
 	// Post-processing background
 	VkBuffer postProcBackgroundBuffer = VK_NULL_HANDLE;
@@ -203,6 +335,7 @@ struct VulkanBackend::Impl {
 	VkBuffer postProcBackgroundStagingBuffer = VK_NULL_HANDLE;  // For copying profile back to host
 	VkDeviceMemory postProcBackgroundStagingMemory = VK_NULL_HANDLE;
 	void* postProcBackgroundStagingMapped = nullptr;  // Mapped pointer for readback
+	std::mutex backgroundProfileMutex;  // Protects all background profile state below
 	bool postProcessBackgroundRecordingRequested = false;
 	bool hasValidBackgroundProfile = false;  // Track whether background profile has been set
 	std::atomic<bool> needRerecordAfterBgCapture{false};  // Trigger CB re-record after bg capture completes
@@ -265,7 +398,7 @@ struct VulkanBackend::Impl {
 
 	// VkFFT
 	VkFFTConfiguration fftConfig;
-	VkFFTApplication fftApp;
+	std::vector<VkFFTApplication> vkfftApps;  // One per command buffer slot (fixes descriptor invalidation)
 	uint64_t fftBufferSize = 0;  // Must persist for VkFFT lifetime
 	VkFence fftFence = VK_NULL_HANDLE;  // Dedicated fence for VkFFT operations
 
@@ -282,6 +415,7 @@ struct VulkanBackend::Impl {
 		int outputSignalLength;
 		uint64_t timelineValue;  // Timeline semaphore value to wait for
 		uint64_t bufferId;       // Buffer ID to restore before callback (output buffer is shared)
+		int stagingBufferIdx;    // Track which staging buffer this work uses (decoupled from commandBufferIdx)
 	};
 	std::queue<PendingWork> pendingWorkQueue;
 	std::mutex pendingWorkMutex;
@@ -289,8 +423,21 @@ struct VulkanBackend::Impl {
 	std::thread completionThread;
 	std::atomic<bool> completionThreadRunning{false};
 
+	// Shutdown synchronization (prevents race conditions during cleanup)
+	std::atomic<bool> shuttingDown{false};      // Prevents new work submission during shutdown
+	std::atomic<int> pendingWorkCount{0};       // Tracks in-flight work for graceful draining
+	std::atomic<bool> cleanupDone{false};       // Idempotency guard: prevents double-destroy crashes
+	std::mutex submitMutex;                     // Protects ALL Vulkan handle access and lifetime (critical for shutdown safety)
+
+	// Diagnostic sequence tracking
+	std::atomic<uint32_t> diagSeq{0};
+
 	// Callback
 	std::function<void(const IOBuffer&)> callback;
+
+	// Input buffers waiting for consumer release (indexed by command buffer index)
+	// Used to defer returning input buffers until OutputBufferManager releases output
+	std::vector<IOBuffer*> pendingInputBufferRelease;
 
 	Impl() = default;
 
@@ -300,16 +447,16 @@ struct VulkanBackend::Impl {
 
 	// Completion thread function (runs asynchronously, similar to CUDA stream callbacks)
 	void completionThreadFunc() {
-		while (this->completionThreadRunning) {
+		while (this->completionThreadRunning.load(std::memory_order_acquire)) {
 			PendingWork work;
 			{
 				std::unique_lock<std::mutex> lock(this->pendingWorkMutex);
 				// Wait for work or shutdown signal
 				this->pendingWorkCV.wait(lock, [this] {
-					return !this->pendingWorkQueue.empty() || !this->completionThreadRunning;
+					return !this->pendingWorkQueue.empty() || !this->completionThreadRunning.load(std::memory_order_acquire);
 				});
 
-				if (!this->completionThreadRunning && this->pendingWorkQueue.empty()) {
+				if (!this->completionThreadRunning.load(std::memory_order_acquire) && this->pendingWorkQueue.empty()) {
 					break;  // Shutdown
 				}
 
@@ -331,52 +478,141 @@ struct VulkanBackend::Impl {
 			waitInfo.pSemaphores = &this->outputOrderingSemaphore;
 			waitInfo.pValues = &work.timelineValue;
 
-			VkResult result = vkWaitSemaphores(this->device, &waitInfo, UINT64_MAX);
-			if (result != VK_SUCCESS) {
-				std::cerr << "Vulkan timeline semaphore wait failed in completion thread: " << result << std::endl;
-				continue;
+			// Wait for timeline semaphore with TIMEOUT + shutdown check (robust against DEVICE_LOST and logic bugs)
+			// Poll with timeout to allow shutdown cancellation
+			bool workCompleted = false;
+			for (;;) {
+				// Check shutdown flag BEFORE waiting
+				if (this->shuttingDown.load(std::memory_order_acquire)) {
+					// Cancelled during shutdown - clean up work item
+					this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
+					break;  // Skip to next iteration (thread will exit)
+				}
+
+				// Wait with 10ms timeout (in nanoseconds)
+				VkResult result = vkWaitSemaphores(this->device, &waitInfo, 10'000'000ULL);
+
+				if (result == VK_SUCCESS) {
+					// Normal completion - process callback
+					workCompleted = true;
+					break;  // Exit wait loop
+				} else if (result == VK_TIMEOUT) {
+					// Timeout - loop and check shutdown again
+					continue;
+				} else {
+					// Error (VK_ERROR_DEVICE_LOST, etc.)
+					if (result == VK_ERROR_DEVICE_LOST) {
+						std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkWaitSemaphores !!!" << std::endl;
+					}
+					std::cerr << "Timeline semaphore wait failed: " << result << std::endl;
+					this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
+					break;  // Skip callback, continue to next work item
+				}
+			}
+
+			// Skip callback if cancelled or error
+			if (!workCompleted || this->shuttingDown.load(std::memory_order_acquire)) {
+				continue;  // Thread will exit on next loop check
 			}
 
 
-			// If background recording was requested, copy the recorded profile from staging buffer
-			if (this->postProcessBackgroundRecordingRequested) {
-				size_t bgProfileSize = work.outputSignalLength;  // Number of floats in background profile
-				this->recordedPostProcessBackground.resize(bgProfileSize);
-				std::memcpy(this->recordedPostProcessBackground.data(),
-				            this->postProcBackgroundStagingMapped,
-				            bgProfileSize * sizeof(float));
-
-				// Mark as valid and clear the request flag
-				this->hasValidBackgroundProfile = true;
-				this->postProcessBackgroundRecordingRequested = false;
-
-				// Trigger re-record of command buffers on next process() call
-				// This removes the background recording dispatch (now only subtraction will run)
-				this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
-			}
-
-			// Restore buffer ID and invoke callback if registered
-			// Buffer ID must be restored because output buffer is shared between frames using same CB
-			work.outputBuffer->setBufferId(work.bufferId);
-			if (this->callback) {
-				this->callback(*work.outputBuffer);
-			}
-
-			// Update processed timeline value AFTER callback (output buffer is now safe to reuse)
-			// This must be done after callback to prevent next frame from overwriting buffer ID
-			{
-				std::lock_guard<std::mutex> lock(this->stagingBufferMutex);
-				this->lastProcessedTimelineValue = work.timelineValue;
-			}
-			this->stagingBufferCV.notify_all();
-
-			// Return input buffer to free queue now that GPU and callback are done
-			// Input buffer is backed by staging memory, which is now safe to write to
+			// ============================================
+			// Release Input Buffer Immediately
+			// ============================================
+			// CRITICAL: With decoupled staging buffer pool, input buffer can be released immediately
+			// after GPU completion, allowing command buffer slot reuse independent of consumer speed
 			{
 				std::lock_guard<std::mutex> lock(this->freeQueueMutex);
 				this->freeBuffersQueue.push(work.inputBuffer);
 			}
 			this->freeQueueCV.notify_one();
+
+			// ============================================
+			// Memory Coherency (Non-Coherent Memory Support)
+			// ============================================
+			// If staging memory is not coherent, invalidate mapped memory before consumers read
+			if (!this->stagingOutputIsCoherent) {
+				VkDeviceSize atom = this->nonCoherentAtomSize;
+				VkDeviceSize offset = 0;
+				VkDeviceSize end = offset + work.outputSize;
+
+				// Align down offset, align up end (required by Vulkan spec)
+				VkDeviceSize alignedOffset = (offset / atom) * atom;
+				VkDeviceSize alignedEnd = ((end + atom - 1) / atom) * atom;
+
+				// Cap to allocation size to avoid validation errors
+				VkDeviceSize allocSize = this->stagingOutputAllocSize[work.stagingBufferIdx];
+				alignedEnd = std::min(alignedEnd, allocSize);
+
+				VkMappedMemoryRange range{};
+				range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+				range.memory = this->stagingOutputMemory[work.stagingBufferIdx];
+				range.offset = alignedOffset;
+				range.size = alignedEnd - alignedOffset;
+				vkInvalidateMappedMemoryRanges(this->device, 1, &range);
+			}
+
+			// If background recording was requested, copy the recorded profile from staging buffer
+			{
+				std::lock_guard<std::mutex> lock(this->backgroundProfileMutex);
+				if (this->postProcessBackgroundRecordingRequested) {
+					size_t bgProfileSize = work.outputSignalLength;  // Number of floats in background profile
+					this->recordedPostProcessBackground.resize(bgProfileSize);
+					std::memcpy(this->recordedPostProcessBackground.data(),
+					            this->postProcBackgroundStagingMapped,
+					            bgProfileSize * sizeof(float));
+
+					// Mark as valid and clear the request flag (atomic publication)
+					this->hasValidBackgroundProfile = true;
+					this->postProcessBackgroundRecordingRequested = false;
+
+					// Sync to configuration so profile survives backend switches (matches CUDA behavior)
+					this->config.setBackgroundProfile(
+						this->recordedPostProcessBackground
+					);
+
+					// Trigger re-record of command buffers on next process() call
+					// This removes the background recording dispatch (now only subtraction will run)
+					this->needRerecordAfterBgCapture.store(true, std::memory_order_release);
+				}
+			}
+
+			// If FPN recording was requested, copy the recorded profile from staging buffer
+			{
+				std::lock_guard<std::mutex> lock(this->fixedPatternNoiseMutex);
+				if (this->fpnRecordingRequested) {
+					// FPN profile: outputSignalLength complex pairs = signalLength floats total
+					// outputSignalLength = signalLength/2, each complex = 2 floats
+					size_t numFloats = this->signalLength;  // Total number of floats in profile
+					this->recordedFixedPatternNoise.resize(numFloats);
+
+					// Copy from staging buffer (complex pairs as interleaved float array)
+					float* stagingData = static_cast<float*>(this->meanALineStagingMapped);
+					std::memcpy(this->recordedFixedPatternNoise.data(), stagingData,
+					            numFloats * sizeof(float));
+
+					this->fixedPatternNoiseDetermined = true;
+					this->fpnRecordingRequested = false;
+
+					// Sync to configuration so profile survives backend switches (matches CUDA behavior)
+					this->config.setFixedPatternNoiseProfile(
+						this->recordedFixedPatternNoise
+					);
+				}
+			}
+
+			// ============================================
+			// Invoke Callback (Output Now Safe to Read)
+			// ============================================
+			// Restore buffer ID and invoke callback if registered
+			// Buffer ID must be restored because output buffer is shared between frames
+			work.outputBuffer->setBufferId(work.bufferId);
+			if (this->callback) {
+				this->callback(*work.outputBuffer);
+			}
+
+			// Decrement pending work counter (work completed)
+			this->pendingWorkCount.fetch_sub(1, std::memory_order_release);
 		}
 	}
 
@@ -384,9 +620,37 @@ struct VulkanBackend::Impl {
 	// Called when commandBuffersValid is false (first run or after config change)
 	void recordAllCommandBuffers();
 
-	// Record D2H transfer command buffers (separate from compute for bidirectional DMA)
-	void recordD2hTransferCommandBuffers();
+	// Record D2H transfer command buffer (dynamic, supports decoupled staging buffer pool)
+	// Records a single D2H transfer command buffer to copy from deviceProcessedBuffers[commandBufferIdx]
+	// to stagingOutputBuffers[stagingBufferIdx]
+	void recordD2hTransferCommandBuffer(int commandBufferIdx, int stagingBufferIdx, size_t outputSize);
+
+	// Debug utils helpers
+	void initDebugUtils();
+	void nameObject(VkObjectType type, uint64_t handle, const char* name);
+	bool beginLabel(VkCommandBuffer cmd, const char* text);
+	void endLabel(VkCommandBuffer cmd, bool began);
+
+	// Buffer selection helper (ensures VkFFT init and recording use same buffer choice)
+	VkBuffer* getFftDataBufferForSlot(int i, const ProcessorConfiguration& cfg);
+
+	// Diagnostic helpers
+	void updateDescriptorSetsTagged(const char* tag, uint32_t writeCount, const VkWriteDescriptorSet* writes);
+	void logRecordPoint(const char* tag);
+	void logPoolOp(const char* op, VkDescriptorPool pool);
 };
+
+// ============================================
+// Buffer Selection Helper
+// ============================================
+
+VkBuffer* VulkanBackend::Impl::getFftDataBufferForSlot(int i, const ProcessorConfiguration& cfg)
+{
+	// CRITICAL: This must match the actual buffer that FFT reads/writes in recordSingleCommandBuffer()
+	// If DC removal is enabled: data is in fftBuffer after preprocessing
+	// If DC removal is disabled: data is in intermediateBuffer after preprocessing
+	return cfg.processingParams.dcRemoval.enabled ? &this->deviceFftBuffers[i] : &this->deviceIntermediateBuffers[i];
+}
 
 // ============================================
 // Command Buffer Recording
@@ -395,9 +659,37 @@ struct VulkanBackend::Impl {
 void VulkanBackend::Impl::recordAllCommandBuffers() {
 	vkDeviceWaitIdle(this->device);  // Wait for all GPU work to complete before re-recording
 
+	// Read background profile and FPN flags under mutex protection (avoid data races during command buffer recording)
+	bool bgRecordingRequested;
+	bool bgProfileValid;
+	bool fpnDetermined;
+	bool fpnRecordingRequested;
+	bool fpnContinuousMode;
+	{
+		std::lock_guard<std::mutex> bgLock(this->backgroundProfileMutex);
+		bgRecordingRequested = this->postProcessBackgroundRecordingRequested;
+		bgProfileValid = this->hasValidBackgroundProfile;
+	}
+	{
+		std::lock_guard<std::mutex> fpnLock(this->fixedPatternNoiseMutex);
+		fpnDetermined = this->fixedPatternNoiseDetermined;
+		fpnRecordingRequested = this->fpnRecordingRequested;
+		fpnContinuousMode = this->config.processingParams.fixedPatternNoise.continuous;
+	}
+
 	// Calculate input size (used in all command buffers)
 	size_t inputSize = this->samplesPerBuffer * this->bytesPerSample;
 	uint32_t numWorkgroups = (this->samplesPerBuffer + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
+
+	// Diagnostic lambda for logging descriptor set binds
+	auto logBindDS = [&](const char* tag, VkCommandBuffer cmd, VkDescriptorSet set)
+	{
+		uint32_t seq = this->diagSeq.fetch_add(1);
+		VKDBG_LOG("[" << seq << "] [DS BIND] " << tag
+			<< " cmd=" << std::hex << (uint64_t)cmd
+			<< " set=" << (uint64_t)set
+			<< std::dec);
+	};
 
 	// Loop through and record ALL command buffers (not just current frame's buffer)
 	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
@@ -406,6 +698,9 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// ============================================
 
 		VkCommandBuffer transferCmd = this->transferCommandBuffers[idx];
+
+		// Reset command buffer before re-recording (required by Vulkan spec)
+		vkResetCommandBuffer(transferCmd, 0);
 
 		VkCommandBufferBeginInfo transferBeginInfo = {};
 		transferBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -416,7 +711,15 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Copy from staging to device buffer
 		VkBufferCopy copyRegion = {};
 		copyRegion.size = inputSize;
+
+		// Balanced label for H2D copy
+		char labelName[128];
+		snprintf(labelName, sizeof(labelName),
+		         "H2D copy idx=%d dst=deviceInput[%d] src=stagingInput[%d] size=%zu offset=%zu",
+		         idx, idx, idx, (size_t)copyRegion.size, (size_t)copyRegion.dstOffset);
+		bool began = this->beginLabel(transferCmd, labelName);
 		vkCmdCopyBuffer(transferCmd, this->stagingInputBuffers[idx], this->deviceInputBuffers[idx], 1, &copyRegion);
+		this->endLabel(transferCmd, began);
 
 		// Release barrier (transfer queue releases ownership to compute queue)
 		VkBufferMemoryBarrier releaseBarrier = {};
@@ -452,6 +755,9 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// ============================================
 
 		VkCommandBuffer cmd = this->commandBuffers[idx];
+
+		// Reset command buffer before re-recording (required by Vulkan spec)
+		vkResetCommandBuffer(cmd, 0);
 
 		VkCommandBufferBeginInfo beginInfo = {};
 		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -496,6 +802,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// Bind descriptor set for this command buffer
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->pipelineLayout,
 	                        0, 1, &this->descriptorSets[idx], 0, nullptr);
+	logBindDS("InputConversion", cmd, this->descriptorSets[idx]);
 
 	// Push constants: samplesPerBuffer, inputBitDepth, bytesPerSample
 	uint32_t pushConstants[3] = {
@@ -552,6 +859,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Bind DC removal descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->dcRemovalPipelineLayout,
 		                        0, 1, &this->dcRemovalDescriptorSets[idx], 0, nullptr);
+		logBindDS("DCRemoval", cmd, this->dcRemovalDescriptorSets[idx]);
 
 		// Push constants: rollingAverageWindowSize, signalLength, ascansPerBscan, samplesPerBuffer
 		uint32_t dcPushConstants[4] = {
@@ -597,6 +905,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Bind universal pre-FFT descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->universalPreFFTPipelineLayout,
 		                        0, 1, &this->universalPreFFTDescriptorSets[idx], 0, nullptr);
+		logBindDS("UniversalPreFFT", cmd, this->universalPreFFTDescriptorSets[idx]);
 
 		// Push constants: signalLength, samplesPerBuffer
 		uint32_t universalPushConstants[2] = {
@@ -638,9 +947,10 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	VkFFTLaunchParams fftLaunchParams = {};
 	fftLaunchParams.commandBuffer = &cmd;
-	fftLaunchParams.buffer = fftBuffer;  // Use dynamic buffer selection (CUDA-style pointer swap)
+	// NOTE: Do NOT override buffer here - it's already set correctly during per-slot VkFFT app init
+	// The buffer selection logic in getFftDataBufferForSlot() matches the dataInFftBuffer logic above
 
-	checkVkFFTErrors(VkFFTAppend(&this->fftApp, 1, &fftLaunchParams));  // +1 = inverse FFT
+	checkVkFFTErrors(VkFFTAppend(&this->vkfftApps[idx], 1, &fftLaunchParams));  // +1 = inverse FFT, per-slot app
 
 	// Barrier after FFT (wait for FFT to complete before post-FFT processing)
 	VkBufferMemoryBarrier fftOutputBarrier = {};
@@ -662,82 +972,83 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                     0, nullptr);
 
 	// ============================================
-	// Fixed Pattern Noise Determination (if needed)
+	// FPN Determination (if requested or continuous mode)
 	// ============================================
 
-	// Calculate required and available A-scans for FPN determination
-	int requiredAscans = this->config.processingParams.fixedPatternNoise.bscanAverageCount * this->ascansPerBscan;
-	int availableAscans = this->ascansPerBscan * this->bscansPerBuffer;
-
-	// Warn if FPN is enabled but not enough A-scans available (once per recording)
-	static bool fpnWarningShown = false;
 	if (this->config.processingParams.fixedPatternNoise.enabled &&
-	    !this->fixedPatternNoiseDetermined &&
-	    requiredAscans > availableAscans &&
-	    !fpnWarningShown) {
-		std::cerr << "[VulkanBackend] Warning: FPN determination requires " << requiredAscans
-		          << " A-scans but only " << availableAscans << " available per buffer" << std::endl;
-		fpnWarningShown = true;
-	}
+	    (fpnRecordingRequested || fpnContinuousMode)) {
 
-	if (this->config.processingParams.fixedPatternNoise.enabled &&
-	    !this->fixedPatternNoiseDetermined &&
-	    requiredAscans <= availableAscans) {
-		// Dispatch FPN determination shader to compute mean A-line
-		// This happens once when FPN is first requested, using the current frame's data
+		// Check if we have enough A-scans
+		int requiredAscans = this->config.processingParams.fixedPatternNoise.bscanAverageCount * this->ascansPerBscan;
+		int availableAscans = this->ascansPerBscan * this->bscansPerBuffer;
 
-		// Bind FPN determination pipeline
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->getPipeline(Impl::PipelineIndex::FpnDetermination));
+		if (requiredAscans <= availableAscans) {
+			// Bind FPN determination pipeline
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                  this->getPipeline(Impl::PipelineIndex::FpnDetermination));
 
-		// Bind FPN determination descriptor set (select variant based on which buffer was used for FFT)
-		int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->fpnDeterminationPipelineLayout,
-		                        0, 1, &this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant], 0, nullptr);
+			// Bind descriptor set for THIS command buffer (idx, not hardcoded 0!)
+			int fpnDescriptorVariant = dataInFftBuffer ? 0 : 1;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        this->fpnDeterminationPipelineLayout,
+			                        0, 1, &this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant],
+			                        0, nullptr);
+			logBindDS("FpnDetermination", cmd, this->fpnDeterminationDescriptorSets[idx][fpnDescriptorVariant]);
 
-		// Push constants: width, height, segments, stride, outputSignalLength
-		struct FpnDeterminationPushConstants {
-			uint32_t width;         // outputSignalLength (samples per A-scan after truncation)
-			uint32_t height;        // Number of A-scans to use for FPN (bscanAverageCount * ascansPerBscan)
-			uint32_t segments;      // Number of segments for minimum variance calculation
-			uint32_t stride;        // fullSignalLength (stride between A-scans in input)
-			uint32_t outputSignalLength;  // Same as width
-		} fpnPush;
+			// Push constants
+			struct FpnDeterminationPushConstants {
+				uint32_t width;
+				uint32_t height;
+				uint32_t segments;
+				uint32_t stride;
+				uint32_t outputSignalLength;
+			} fpnPush;
 
-		int outputSignalLength = this->signalLength / 2; // todo: when truncate step becomes optional, outputSignalLength needs to be obtained differently
-		fpnPush.width = static_cast<uint32_t>(outputSignalLength);
-		fpnPush.height = static_cast<uint32_t>(requiredAscans);  // Use bscanAverageCount * ascansPerBscan (like CUDA/OpenCL)
-		fpnPush.segments = 8;  // FIXED_PATTERN_NOISE_REMOVAL_SEGMENTS constant from CUDA
-		fpnPush.stride = static_cast<uint32_t>(this->signalLength);
-		fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
+			int outputSignalLength = this->signalLength / 2;
+			fpnPush.width = static_cast<uint32_t>(outputSignalLength);
+			fpnPush.height = static_cast<uint32_t>(requiredAscans);
+			fpnPush.segments = 8;
+			fpnPush.stride = static_cast<uint32_t>(this->signalLength);
+			fpnPush.outputSignalLength = static_cast<uint32_t>(outputSignalLength);
 
-		vkCmdPushConstants(cmd, this->fpnDeterminationPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-		                   0, sizeof(fpnPush), &fpnPush);
+			vkCmdPushConstants(cmd, this->fpnDeterminationPipelineLayout,
+			                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fpnPush), &fpnPush);
 
-		// Dispatch FPN determination shader (one thread per sample in the output A-scan)
-		uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + 127) / 128;
-		vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
+			// Dispatch FPN determination
+			uint32_t fpnWorkgroups = (static_cast<uint32_t>(outputSignalLength) + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
+			vkCmdDispatch(cmd, fpnWorkgroups, 1, 1);
 
-		// Barrier: wait for FPN profile to be written before using it
-		VkBufferMemoryBarrier fpnBarrier = {};
-		fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		fpnBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		fpnBarrier.buffer = this->meanALineBuffer;
-		fpnBarrier.offset = 0;
-		fpnBarrier.size = VK_WHOLE_SIZE;
+			// Pipeline barrier (determination writes before staging copy reads)
+			VkBufferMemoryBarrier fpnBarrier = {};
+			fpnBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			fpnBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			fpnBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+			fpnBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			fpnBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			fpnBarrier.buffer = this->meanALineBuffer;
+			fpnBarrier.offset = 0;
+			fpnBarrier.size = VK_WHOLE_SIZE;
 
-		vkCmdPipelineBarrier(cmd,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0,
-		                     0, nullptr,
-		                     1, &fpnBarrier,
-		                     0, nullptr);
+			vkCmdPipelineBarrier(cmd,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     0, 0, nullptr, 1, &fpnBarrier, 0, nullptr);
 
-		// Mark as determined for subsequent frames
-		this->fixedPatternNoiseDetermined = true;
+			// GPU-to-GPU copy: meanALineBuffer -> meanALineStagingBuffer
+			VkBufferCopy fpnCopyRegion = {};
+			fpnCopyRegion.srcOffset = 0;
+			fpnCopyRegion.dstOffset = 0;
+			fpnCopyRegion.size = sizeof(float) * this->signalLength;  // outputSignalLength complex pairs = signalLength floats
+
+			// Balanced label for FPN copy
+			char fpnLabelName[128];
+			snprintf(fpnLabelName, sizeof(fpnLabelName),
+			         "FPN copy dst=meanALineStaging src=meanALine size=%zu",
+			         (size_t)fpnCopyRegion.size);
+			bool fpnBegan = this->beginLabel(cmd, fpnLabelName);
+			vkCmdCopyBuffer(cmd, this->meanALineBuffer, this->meanALineStagingBuffer, 1, &fpnCopyRegion);
+			this->endLabel(cmd, fpnBegan);
+		}
 	}
 
 	// ============================================
@@ -746,7 +1057,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// ============================================
 
 	// Select the appropriate universal post-FFT pipeline variant
-	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled && this->fixedPatternNoiseDetermined;
+	bool fpnEnabled = this->config.processingParams.fixedPatternNoise.enabled;
 	bool logScaling = this->config.processingParams.intensity.logScale;
 	int fpnIdx = fpnEnabled ? 1 : 0;
 	int logIdx = logScaling ? 1 : 0;
@@ -761,6 +1072,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	int postFFTDescriptorVariant = dataInFftBuffer ? 0 : 1;  // 0=FFT buffer, 1=Intermediate buffer
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->universalPostFFTPipelineLayout,
 	                        0, 1, &this->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant], 0, nullptr);
+	logBindDS("UniversalPostFFT", cmd, this->universalPostFFTDescriptorSets[idx][postFFTDescriptorVariant]);
 
 	// Push constants: fullSignalLength, outputSignalLength, samplesPerBuffer, grayscaleMax, grayscaleMin, addend, multiplicator
 	int outputSignalLength = this->signalLength / 2;
@@ -814,13 +1126,14 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	// Background Recording (if requested)
 	// ============================================
 
-	if (this->postProcessBackgroundRecordingRequested) {
+	if (bgRecordingRequested) {
 		// Bind background recording pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundRecordingPipeline);
 
 		// Bind background recording descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundRecordingPipelineLayout,
 		                        0, 1, &this->backgroundRecordingDescriptorSets[idx], 0, nullptr);
+		logBindDS("BackgroundRecording", cmd, this->backgroundRecordingDescriptorSets[idx]);
 
 		// Push constants: samplesPerAscan, ascansPerBuffer
 		struct BackgroundRecordingPushConstants {
@@ -835,7 +1148,7 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		                   0, sizeof(bgRecPush), &bgRecPush);
 
 		// Dispatch background recording shader (one thread per sample in background profile)
-		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + 127) / 128;
+		uint32_t bgRecWorkgroups = (bgRecPush.samplesPerAscan + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
 		vkCmdDispatch(cmd, bgRecWorkgroups, 1, 1);
 
 		// Barrier after background recording (wait for writes to complete before subtraction or copy)
@@ -860,7 +1173,15 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 		// Copy recorded background profile from device to staging buffer for host readback
 		VkBufferCopy bgCopyRegion = {};
 		bgCopyRegion.size = static_cast<VkDeviceSize>(outputSignalLength * sizeof(float));
+
+		// Balanced label for background copy
+		char bgLabelName[128];
+		snprintf(bgLabelName, sizeof(bgLabelName),
+		         "Background copy dst=postProcBackgroundStaging src=postProcBackground size=%zu",
+		         (size_t)bgCopyRegion.size);
+		bool bgBegan = this->beginLabel(cmd, bgLabelName);
 		vkCmdCopyBuffer(cmd, this->postProcBackgroundBuffer, this->postProcBackgroundStagingBuffer, 1, &bgCopyRegion);
+		this->endLabel(cmd, bgBegan);
 
 		// Barrier after copy (ensure copy completes before host reads)
 		VkBufferMemoryBarrier bgCopyBarrier = {};
@@ -888,13 +1209,14 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 
 	// Apply subtraction if we have a valid profile OR if we just recorded one (same behavior as CUDA)
 	if (this->config.processingParams.background.enabled &&
-	    (this->hasValidBackgroundProfile || this->postProcessBackgroundRecordingRequested)) {
+	    (bgProfileValid || bgRecordingRequested)) {
 		// Bind background subtraction pipeline
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundSubtractionPipeline);
 
 		// Bind background subtraction descriptor set
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->backgroundSubtractionPipelineLayout,
 		                        0, 1, &this->backgroundSubtractionDescriptorSets[idx], 0, nullptr);
+		logBindDS("BackgroundSubtraction", cmd, this->backgroundSubtractionDescriptorSets[idx]);
 
 		// Push constants: backgroundWeight, backgroundOffset, samplesPerAscan, samplesPerBuffer
 		struct BackgroundSubtractionPushConstants {
@@ -942,64 +1264,183 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                     1, &d2hReleaseBarrier,
 	                     0, nullptr);
 
-	// D2H transfer is now handled by separate D2H command buffer (see recordD2hTransferCommandBuffers)
+	// D2H transfer is now handled dynamically in process() with recordD2hTransferCommandBuffer()
 
 	checkVulkanErrors(vkEndCommandBuffer(cmd));
 	}  // End of loop through all command buffers
 
-	// Record D2H transfer command buffers
-	this->recordD2hTransferCommandBuffers();
+	// D2H command buffers are now recorded dynamically in process() to support decoupled staging buffer pool
 
 	this->commandBuffersValid = true;
 }
 
-void VulkanBackend::Impl::recordD2hTransferCommandBuffers() {
-	int outputSignalLength = this->signalLength / 2;
-	size_t outputSize = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
+// ============================================
+// D2H Transfer Command Buffer Recording
+// ============================================
+
+// Dynamic D2H command buffer recording (supports decoupled staging buffer pool)
+// Records a single D2H transfer command buffer to copy from deviceProcessedBuffers[commandBufferIdx]
+// to stagingOutputBuffers[stagingBufferIdx]
+void VulkanBackend::Impl::recordD2hTransferCommandBuffer(int commandBufferIdx, int stagingBufferIdx, size_t outputSize) {
+	// Bounds check
+	size_t outputSignalLength = this->signalLength / 2;
+	size_t stagingCapacity = outputSignalLength * this->ascansPerBscan * this->bscansPerBuffer * sizeof(float);
+	if (outputSize > stagingCapacity) {
+		throw std::runtime_error("Output size exceeds staging buffer capacity");
+	}
+
+	// Verify 4-byte alignment (floats are always aligned, but verify anyway)
+	if (outputSize % 4 != 0) {
+		throw std::runtime_error("Output size not 4-byte aligned: " + std::to_string(outputSize));
+	}
+
+	VkCommandBuffer d2hCmd = this->d2hTransferCommandBuffers[commandBufferIdx];
+
+	// Reset command buffer before re-recording (required by Vulkan spec)
+	// SAFETY: This is safe because command buffer slot reuse gates ensure the GPU is done with
+	// the previous submission before we call this function (timeline semaphore signaled)
+	vkResetCommandBuffer(d2hCmd, 0);
 
 	VkCommandBufferBeginInfo beginInfo = {};
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	beginInfo.flags = 0;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;  // Re-recorded every time
 
-	for (int idx = 0; idx < this->numCommandBuffers; idx++) {
-		VkCommandBuffer d2hCmd = this->d2hTransferCommandBuffers[idx];
+	checkVulkanErrors(vkBeginCommandBuffer(d2hCmd, &beginInfo));
 
-		checkVulkanErrors(vkBeginCommandBuffer(d2hCmd, &beginInfo));
+	// Acquire barrier (for queue family ownership transfer) only if different queue families
+	// useSeparateTransferQueue means transfer queue is in a DIFFERENT family from compute
+	// useBidirectionalTransfer can be true even with same-family multi-queue (no ownership transfer needed)
+	if (this->useSeparateTransferQueue) {
+		VkBufferMemoryBarrier acquireBarrier = {};
+		acquireBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		acquireBarrier.srcAccessMask = 0;  // Acquire barrier
+		acquireBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		acquireBarrier.srcQueueFamilyIndex = this->queueFamilyIndex;  // From compute
+		acquireBarrier.dstQueueFamilyIndex = this->transferQueueFamilyIndex;  // To D2H queue
+		acquireBarrier.buffer = this->deviceProcessedBuffers[commandBufferIdx];
+		acquireBarrier.offset = 0;
+		acquireBarrier.size = VK_WHOLE_SIZE;
 
-		// Acquire barrier (for queue family ownership transfer) only if different queue families
-		// useSeparateTransferQueue means transfer queue is in a DIFFERENT family from compute
-		// useBidirectionalTransfer can be true even with same-family multi-queue (no ownership transfer needed)
-		if (this->useSeparateTransferQueue) {
-			VkBufferMemoryBarrier acquireBarrier = {};
-			acquireBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			acquireBarrier.srcAccessMask = 0;  // Acquire barrier
-			acquireBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			acquireBarrier.srcQueueFamilyIndex = this->queueFamilyIndex;  // From compute
-			acquireBarrier.dstQueueFamilyIndex = this->transferQueueFamilyIndex;  // To D2H queue
-			acquireBarrier.buffer = this->deviceProcessedBuffers[idx];
-			acquireBarrier.offset = 0;
-			acquireBarrier.size = VK_WHOLE_SIZE;
-
-			vkCmdPipelineBarrier(d2hCmd,
-			                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                     0,
-			                     0, nullptr,
-			                     1, &acquireBarrier,
-			                     0, nullptr);
-		}
-
-		// D2H copy: device processed buffer → staging output buffer
-		VkBufferCopy copyRegion = {};
-		copyRegion.srcOffset = 0;
-		copyRegion.dstOffset = 0;
-		copyRegion.size = outputSize;
-		vkCmdCopyBuffer(d2hCmd, this->deviceProcessedBuffers[idx], this->stagingOutputBuffers[idx], 1, &copyRegion);
-
-		checkVulkanErrors(vkEndCommandBuffer(d2hCmd));
+		vkCmdPipelineBarrier(d2hCmd,
+		                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0,
+		                     0, nullptr,
+		                     1, &acquireBarrier,
+		                     0, nullptr);
 	}
+
+	// D2H copy: device processed buffer → staging output buffer
+	// KEY CHANGE: stagingBufferIdx is now decoupled from commandBufferIdx
+	VkBufferCopy copyRegion = {};
+	copyRegion.srcOffset = 0;
+	copyRegion.dstOffset = 0;
+	copyRegion.size = outputSize;  // Dynamic size (validated above)
+
+	// Balanced label for D2H copy
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "D2H copy cmdIdx=%d staging=%d src=deviceProcessed[%d] size=%zu",
+	         commandBufferIdx, stagingBufferIdx, commandBufferIdx, (size_t)copyRegion.size);
+	bool began = this->beginLabel(d2hCmd, labelName);
+	vkCmdCopyBuffer(d2hCmd,
+	                this->deviceProcessedBuffers[commandBufferIdx],  // Source: per-CB device buffer
+	                this->stagingOutputBuffers[stagingBufferIdx],    // Dest: from free pool
+	                1, &copyRegion);
+	this->endLabel(d2hCmd, began);
+
+	checkVulkanErrors(vkEndCommandBuffer(d2hCmd));
 }
 
+// ============================================
+// Debug Utils Helpers
+// ============================================
+
+void VulkanBackend::Impl::initDebugUtils() {
+	// CRITICAL: Only load if extension was actually enabled
+	if (!this->debugUtilsEnabled)
+		return;
+
+	this->vkSetDebugUtilsObjectNameEXT_fn = (PFN_vkSetDebugUtilsObjectNameEXT)
+	    vkGetDeviceProcAddr(this->device, "vkSetDebugUtilsObjectNameEXT");
+	this->vkCmdBeginDebugUtilsLabelEXT_fn = (PFN_vkCmdBeginDebugUtilsLabelEXT)
+	    vkGetDeviceProcAddr(this->device, "vkCmdBeginDebugUtilsLabelEXT");
+	this->vkCmdEndDebugUtilsLabelEXT_fn = (PFN_vkCmdEndDebugUtilsLabelEXT)
+	    vkGetDeviceProcAddr(this->device, "vkCmdEndDebugUtilsLabelEXT");
+}
+
+void VulkanBackend::Impl::nameObject(VkObjectType type, uint64_t handle, const char* name) {
+	if (!this->debugUtilsEnabled || !this->vkSetDebugUtilsObjectNameEXT_fn || handle == 0 || !name)
+		return;
+
+	VkDebugUtilsObjectNameInfoEXT info{};
+	info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+	info.objectType = type;
+	info.objectHandle = handle;
+	info.pObjectName = name;
+
+	this->vkSetDebugUtilsObjectNameEXT_fn(this->device, &info);
+}
+
+// CRITICAL: Balanced labeling - track whether Begin was called
+bool VulkanBackend::Impl::beginLabel(VkCommandBuffer cmd, const char* text) {
+	if (!this->debugUtilsEnabled || !this->vkCmdBeginDebugUtilsLabelEXT_fn || !cmd || !text)
+		return false;
+
+	VkDebugUtilsLabelEXT label{};
+	label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+	label.pLabelName = text;
+
+	this->vkCmdBeginDebugUtilsLabelEXT_fn(cmd, &label);
+	return true;
+}
+
+void VulkanBackend::Impl::endLabel(VkCommandBuffer cmd, bool began) {
+	if (!began)
+		return;
+	if (!this->debugUtilsEnabled || !this->vkCmdEndDebugUtilsLabelEXT_fn || !cmd)
+		return;
+
+	this->vkCmdEndDebugUtilsLabelEXT_fn(cmd);
+}
+
+// ============================================
+// Diagnostic Helpers
+// ============================================
+
+void VulkanBackend::Impl::updateDescriptorSetsTagged(
+	const char* tag,
+	uint32_t writeCount,
+	const VkWriteDescriptorSet* writes)
+{
+#ifdef VULKAN_DEBUG
+	uint32_t seq = diagSeq.fetch_add(1);
+	std::cout << "[" << seq << "] [DS UPDATE] " << tag
+		<< " writeCount=" << writeCount;
+
+	for (uint32_t i = 0; i < writeCount; ++i)
+	{
+		std::cout << " set[" << i << "]="
+			<< std::hex << (uint64_t)writes[i].dstSet << std::dec;
+	}
+
+	std::cout << std::endl;
+#endif
+	vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
+}
+
+void VulkanBackend::Impl::logRecordPoint(const char* tag)
+{
+	uint32_t seq = diagSeq.fetch_add(1);
+	VKDBG_LOG("[" << seq << "] [RECORD] " << tag);
+}
+
+void VulkanBackend::Impl::logPoolOp(const char* op, VkDescriptorPool pool)
+{
+	uint32_t seq = diagSeq.fetch_add(1);
+	VKDBG_LOG("[" << seq << "] [POOL " << op << "] "
+		<< std::hex << (uint64_t)pool << std::dec);
+}
 
 // ============================================
 // Constructor / Destructor
@@ -1025,6 +1466,16 @@ void VulkanBackend::setNumInputBuffers(int count) {
 		throw std::invalid_argument("Number of input buffers must be at least 1");
 	}
 	this->impl->numInputBuffers = count;
+}
+
+void VulkanBackend::setNumOutputBuffers(int count) {
+	if (this->impl->vulkanInitialized) {
+		throw std::runtime_error("Cannot change number of output buffers after initialization");
+	}
+	if (count < 0) {
+		throw std::invalid_argument("Number of output buffers must be >= 0 (0 = auto)");
+	}
+	this->impl->numOutputBuffers = count;
 }
 
 void VulkanBackend::setNumCommandBuffers(int count) {
@@ -1097,7 +1548,111 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 	instanceCreateInfo.pApplicationInfo = &appInfo;
 
+	// Conditional validation layer and debug utils extension setup
+	std::vector<const char*> layers;
+	std::vector<const char*> exts;
+	VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
+	VkValidationFeaturesEXT validationFeatures{};
+	VkValidationFeatureEnableEXT enables[] = {
+		VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT
+	};
+	bool willEnableValidation = false;
+
+#ifdef VULKAN_DEBUG
+	// Enumerate available layers
+		uint32_t layerCount = 0;
+		vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+		std::vector<VkLayerProperties> availableLayers(layerCount);
+		vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+
+		// Check if validation layer is available
+		bool hasValidation = false;
+		for (const auto& layer : availableLayers) {
+			if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+				hasValidation = true;
+				break;
+			}
+		}
+
+		if (hasValidation) {
+			layers.push_back("VK_LAYER_KHRONOS_validation");
+		}
+
+		// Enumerate and check debug utils extension
+		uint32_t extCount = 0;
+		vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
+		std::vector<VkExtensionProperties> availableExts(extCount);
+		vkEnumerateInstanceExtensionProperties(nullptr, &extCount, availableExts.data());
+
+		bool hasDebugUtils = false;
+		for (const auto& ext : availableExts) {
+			if (strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+				hasDebugUtils = true;
+				break;
+			}
+		}
+
+		if (hasDebugUtils) {
+			exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		}
+
+		// Only set up debug structs if we have both validation layer and debug utils
+		willEnableValidation = hasValidation && hasDebugUtils;
+
+		if (willEnableValidation) {
+			// Setup debug messenger (will catch messages during vkCreateInstance too)
+			debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+			debugCreateInfo.messageSeverity =
+				VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+			debugCreateInfo.messageType =
+				VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+			debugCreateInfo.pfnUserCallback = debugCallback;
+
+			// Enable synchronization validation (critical for catching semaphore/queue bugs!)
+			validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+			validationFeatures.enabledValidationFeatureCount = 2;
+			validationFeatures.pEnabledValidationFeatures = enables;
+
+			// Chain pNext so we catch messages during vkCreateInstance
+			validationFeatures.pNext = &debugCreateInfo;
+			instanceCreateInfo.pNext = &validationFeatures;
+		} else {
+			instanceCreateInfo.pNext = nullptr;
+			if (!hasValidation) {
+				std::cerr << "WARNING: Vulkan validation layer not available - running without validation" << std::endl;
+			}
+			if (!hasDebugUtils) {
+				std::cerr << "WARNING: Vulkan debug utils extension not available" << std::endl;
+			}
+		}
+#else
+	instanceCreateInfo.pNext = nullptr;
+#endif
+
+	instanceCreateInfo.enabledLayerCount = static_cast<uint32_t>(layers.size());
+	instanceCreateInfo.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+	instanceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+	instanceCreateInfo.ppEnabledExtensionNames = exts.empty() ? nullptr : exts.data();
+
+	// Create instance
 	checkVulkanErrors(vkCreateInstance(&instanceCreateInfo, nullptr, &this->impl->instance));
+
+	// Create debug messenger if validation is enabled
+#ifdef VULKAN_DEBUG
+	if (willEnableValidation) {
+			VkResult messengerResult = CreateDebugUtilsMessengerEXT(this->impl->instance, &debugCreateInfo, nullptr, &this->impl->debugMessenger);
+			if (messengerResult == VK_SUCCESS) {
+				VKDBG_LOG("Vulkan validation layers + sync validation enabled");
+				this->impl->debugUtilsEnabled = true;  // Enable debug utils naming and labeling
+			} else {
+				VKDBG_LOG("Vulkan validation enabled (messenger creation failed)");
+			}
+		}
+#endif
 
 	// Select physical device
 	uint32_t deviceCount = 0;
@@ -1224,6 +1779,9 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 
 	checkVulkanErrors(vkCreateDevice(this->impl->physicalDevice, &deviceCreateInfo, nullptr, &this->impl->device));
 
+	// Initialize debug utils function pointers (if enabled)
+	this->impl->initDebugUtils();
+
 	// Get queues. strategy depends on whether we have a dedicated transfer family
 	if (this->impl->useSeparateTransferQueue) {
 		// Dedicated transfer family exists
@@ -1248,17 +1806,17 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 			if (computeFamilyQueueCount >= 3) {
 				// Use queue 2 for D2H transfers (full bidirectional)
 				vkGetDeviceQueue(this->impl->device, this->impl->queueFamilyIndex, 2, &this->impl->d2hTransferQueue);
-				std::cout << "[VulkanBackend] Bidirectional DMA: 3 queues from compute family (compute + H2D + D2H)" << std::endl;
+				VKDBG_LOG("[VulkanBackend] Bidirectional DMA: 3 queues from compute family (compute + H2D + D2H)");
 			} else {
 				// Only 2 queues - share queue 1 for both H2D and D2H
 				this->impl->d2hTransferQueue = this->impl->transferQueue;
-				std::cout << "[VulkanBackend] DMA: 2 queues from compute family (compute + transfers)" << std::endl;
+				VKDBG_LOG("[VulkanBackend] DMA: 2 queues from compute family (compute + transfers)");
 			}
 		} else {
 			// Only 1 queue - everything serialized (worst case)
 			this->impl->transferQueue = this->impl->computeQueue;
 			this->impl->d2hTransferQueue = this->impl->computeQueue;
-			std::cout << "[VulkanBackend] Warning: Only 1 queue available - all operations serialized" << std::endl;
+			VKDBG_LOG("[VulkanBackend] Warning: Only 1 queue available - all operations serialized");
 		}
 	}
 
@@ -1304,7 +1862,6 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 
 	// Initialize VkFFT library (BEFORE our own pipelines/descriptor pool)
 	memset(&this->impl->fftConfig, 0, sizeof(VkFFTConfiguration));
-	memset(&this->impl->fftApp, 0, sizeof(VkFFTApplication));
 
 	// Configure VkFFT for 1D IFFT
 	this->impl->fftConfig.FFTdim = 1;  // 1D FFT
@@ -1360,8 +1917,30 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	// Bandwidth boost optimization //todo: test if different value has impact on performance
 	this->impl->fftConfig.performBandwidthBoost = 0;
 
-	// Initialize VkFFT
-	checkVkFFTErrors(initializeVkFFT(&this->impl->fftApp, this->impl->fftConfig));
+	// Initialize VkFFT apps (one per command buffer slot to avoid descriptor invalidation)
+	this->impl->vkfftApps.resize(this->impl->numCommandBuffers);
+
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i)
+	{
+		// Use helper to get correct buffer (ensures consistency with recording)
+		VkBuffer* fftBuffer = this->impl->getFftDataBufferForSlot(i, this->impl->config);
+
+		// Create VkFFT config for this slot
+		VkFFTConfiguration fftCfg = this->impl->fftConfig;  // Copy base config
+		fftCfg.buffer = fftBuffer;  // Set per-slot buffer
+
+		// Zero-initialize the app structure before passing to VkFFT
+		memset(&this->impl->vkfftApps[i], 0, sizeof(VkFFTApplication));
+
+		checkVkFFTErrors(initializeVkFFT(&this->impl->vkfftApps[i], fftCfg));
+	}
+
+	// Store FFT key for selective invalidation in updateConfig()
+	this->impl->prevFftKey.signalLength = static_cast<uint32_t>(this->impl->signalLength);
+	this->impl->prevFftKey.numberBatches = static_cast<uint32_t>(
+		this->impl->ascansPerBscan * this->impl->bscansPerBuffer
+	);
+	this->impl->prevFftKey.dcRemovalEnabled = this->impl->config.processingParams.dcRemoval.enabled;
 
 	// Initialize curve buffers with identity values (required for universal shader)
 	// IMPORTANT: Must be done BEFORE createComputePipelines() so descriptor sets can reference these buffers
@@ -1400,20 +1979,28 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->freeBuffersQueue.push(&this->impl->hostInputBuffers[i]);
 	}
 
-	// Allocate output buffers (one per command buffer)
+	// Allocate output buffers (decoupled from command buffer slots)
 	// Output is truncated to half signal length after FFT
 	int outputSignalLength = this->impl->signalLength / 2;
 	size_t outputSamplesPerBuffer = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
 	size_t outputSize = outputSamplesPerBuffer * sizeof(float);  // Output is always float
-	this->impl->outputBuffers.resize(this->impl->numCommandBuffers);
 
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		this->impl->outputBuffers[i].setBackendIndex(i);
+	// Determine actual number of output buffers (like CUDA backend)
+	int actualNumOutputBuffers = (this->impl->numOutputBuffers > 0)
+		? this->impl->numOutputBuffers
+		: (this->impl->numCommandBuffers * 2);
+
+	this->impl->outputBuffers.resize(actualNumOutputBuffers);
+	this->impl->pendingInputBufferRelease.resize(actualNumOutputBuffers, nullptr);
+
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		this->impl->outputBuffers[i].setBackendIndex(i);  // i = stagingBufferIdx (NOT commandBufferIdx)
 		this->impl->outputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
-		this->impl->outputBuffers[i].setExternalMemory(this->impl->stagingOutputMapped[i], outputSize);
+		// Memory will be set dynamically in process() after acquiring staging buffer
 	}
 
 	// Pre-record all command buffers for maximum performance
+	this->impl->logRecordPoint("from_initialize");
 	this->recordCommandBuffers();
 
 	// Load recorded profiles from configuration (if backend was switched)
@@ -1438,83 +2025,163 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 }
 
 void VulkanBackend::cleanup() {
+	// Atomic exchange: returns OLD value and sets to true
+	// If OLD was true, cleanup already ran -> return immediately
+	// IMPORTANT: Guard BEFORE taking any mutex so second call returns immediately
+	if (this->impl->cleanupDone.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+
+	VKDBG_LOG("[CLEANUP] Starting cleanup...");
 	if (!this->impl->vulkanInitialized) {
 		return;
 	}
 
-	// Stop completion thread
+	// Signal shutdown and wake ALL blocked threads
+	VKDBG_LOG("[CLEANUP] Setting shuttingDown flag, pendingWorkCount=" << this->impl->pendingWorkCount.load());
+	this->impl->shuttingDown.store(true, std::memory_order_release);
+	this->impl->completionThreadRunning.store(false, std::memory_order_release);  // Prevent new waits
+	this->impl->freeQueueCV.notify_all();      // Wake threads in getNextAvailableInputBuffer()
+	this->impl->freeStagingOutputCV.notify_all();  // Wake staging buffer waits (Issue 5 fix)
+	this->impl->pendingWorkCV.notify_all();    // Wake completion thread
+
+	// Join completion thread FIRST (ensures no more Vulkan calls from completion thread - Issue 5 fix)
+	VKDBG_LOG("[CLEANUP] Stopping completion thread...");
 	if (this->impl->completionThread.joinable()) {
-		this->impl->completionThreadRunning = false;
-		this->impl->pendingWorkCV.notify_all();  // Wake up thread
-		this->impl->completionThread.join();
+		this->impl->pendingWorkCV.notify_all();  // Final wake
+		this->impl->completionThread.join();     // Won't hang (timeout-based wait)
 	}
 
-	// Wait for all operations to complete
-	vkDeviceWaitIdle(this->impl->device);
+	// Drain pending work and destroy resources
+	VKDBG_LOG("[CLEANUP] Draining pending work and destroying resources...");
+	{
+		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
 
-	// Destroy VkFFT
-	deleteVkFFT(&this->impl->fftApp);
+		// Wait for GPU to finish (now protected by submitMutex - Issue 5 fix)
+		VkResult waitResult = vkDeviceWaitIdle(this->impl->device);
+		if (waitResult != VK_SUCCESS) {
+			std::cerr << "[CLEANUP] vkDeviceWaitIdle failed with error " << waitResult;
+			if (waitResult == VK_ERROR_DEVICE_LOST) {
+				std::cerr << " (VK_ERROR_DEVICE_LOST - GPU crashed)";
+			}
+			std::cerr << " - continuing with cleanup..." << std::endl;
+			std::cerr.flush();
+		}
 
-	// Note: Do NOT call glslang_finalize_process() here
-	// glslang is process-wide and should persist for the application lifetime
-	// It will be finalized when the process exits
+		// Drain pending work queue
+		// After vkDeviceWaitIdle(), GPU work is complete. We can now safely:
+		// 1. Return input buffers to free queue (no longer needed by GPU)
+		// 2. Cancel work deterministically (completion thread already stopped)
+		{
+			std::lock_guard<std::mutex> workLock(this->impl->pendingWorkMutex);
+			while (!this->impl->pendingWorkQueue.empty()) {
+				VulkanBackend::Impl::PendingWork work = this->impl->pendingWorkQueue.front();
+				this->impl->pendingWorkQueue.pop();
 
-	// Destroy pipelines and shaders
-	this->destroyComputePipelines();
+				// Return input buffer to free queue (cancel work)
+				// Note: Don't fire callback during shutdown. output may be incomplete/invalid
+				if (work.inputBuffer) {
+					std::lock_guard<std::mutex> freeLock(this->impl->freeQueueMutex);
+					this->impl->freeBuffersQueue.push(work.inputBuffer);
+					this->impl->freeQueueCV.notify_one();
+				}
 
-	// Free command buffers and destroy fences
-	this->destroyCommandBuffersAndFences();
+				// Decrement pending work counter
+				this->impl->pendingWorkCount.fetch_sub(1, std::memory_order_release);
+			}
+		}
 
-	// Release buffers
-	this->releaseDeviceBuffers();
+		// Optional diagnostic: Check pendingWorkCount drained
+		if (this->impl->pendingWorkCount.load(std::memory_order_acquire) != 0) {
+			std::cerr << "WARNING: Cleanup completed with pendingWorkCount = "
+			          << this->impl->pendingWorkCount.load() << std::endl;
+			std::cerr.flush();
+		}
 
-	// Release host buffers
-	for (auto& buffer : this->impl->hostInputBuffers) {
-		buffer.releaseMemory();
-	}
-	this->impl->hostInputBuffers.clear();
+		// Destroy resources while still holding submitMutex
+		// This prevents any thread from entering process() and touching Vulkan handles during destruction
+		VKDBG_LOG("[CLEANUP] Destroying Vulkan resources...");
 
-	for (auto& buffer : this->impl->outputBuffers) {
-		buffer.releaseMemory();
-	}
-	this->impl->outputBuffers.clear();
+		// Destroy VkFFT apps (one per command buffer slot)
+		for (size_t i = 0; i < this->impl->vkfftApps.size(); ++i)
+		{
+			deleteVkFFT(&this->impl->vkfftApps[i]);
+		}
+		this->impl->vkfftApps.clear();
 
-	// Clear queue
-	while (!this->impl->freeBuffersQueue.empty()) {
-		this->impl->freeBuffersQueue.pop();
-	}
+		// Note: Do NOT call glslang_finalize_process() here
+		// glslang is process-wide and should persist for the application lifetime
+		// It will be finalized when the process exits
 
-	// Destroy compute command pool
-	if (this->impl->commandPool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(this->impl->device, this->impl->commandPool, nullptr);
-		this->impl->commandPool = VK_NULL_HANDLE;
-	}
+		// Destroy pipelines and shaders
+		this->destroyComputePipelines();
 
-	// Destroy transfer command pool
-	if (this->impl->transferCommandPool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(this->impl->device, this->impl->transferCommandPool, nullptr);
-		this->impl->transferCommandPool = VK_NULL_HANDLE;
-	}
+		// Free command buffers and destroy fences
+		this->destroyCommandBuffersAndFences();
 
-	// Destroy D2H transfer command pool
-	if (this->impl->d2hTransferCommandPool != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(this->impl->device, this->impl->d2hTransferCommandPool, nullptr);
-		this->impl->d2hTransferCommandPool = VK_NULL_HANDLE;
-	}
+		// Release buffers
+		this->releaseDeviceBuffers();
 
-	// Destroy device
-	if (this->impl->device != VK_NULL_HANDLE) {
-		vkDestroyDevice(this->impl->device, nullptr);
-		this->impl->device = VK_NULL_HANDLE;
-	}
+		// Release host buffers
+		for (auto& buffer : this->impl->hostInputBuffers) {
+			buffer.releaseMemory();
+		}
+		this->impl->hostInputBuffers.clear();
 
-	// Destroy instance
-	if (this->impl->instance != VK_NULL_HANDLE) {
-		vkDestroyInstance(this->impl->instance, nullptr);
-		this->impl->instance = VK_NULL_HANDLE;
-	}
+		for (auto& buffer : this->impl->outputBuffers) {
+			buffer.releaseMemory();
+		}
+		this->impl->outputBuffers.clear();
 
-	this->impl->vulkanInitialized = false;
+		// Clear queue
+		while (!this->impl->freeBuffersQueue.empty()) {
+			this->impl->freeBuffersQueue.pop();
+		}
+
+		// Destroy compute command pool
+		if (this->impl->commandPool != VK_NULL_HANDLE) {
+			vkDestroyCommandPool(this->impl->device, this->impl->commandPool, nullptr);
+			this->impl->commandPool = VK_NULL_HANDLE;
+		}
+
+		// Destroy transfer command pool
+		if (this->impl->transferCommandPool != VK_NULL_HANDLE) {
+			vkDestroyCommandPool(this->impl->device, this->impl->transferCommandPool, nullptr);
+			this->impl->transferCommandPool = VK_NULL_HANDLE;
+		}
+
+		// Destroy D2H transfer command pool
+		if (this->impl->d2hTransferCommandPool != VK_NULL_HANDLE) {
+			vkDestroyCommandPool(this->impl->device, this->impl->d2hTransferCommandPool, nullptr);
+			this->impl->d2hTransferCommandPool = VK_NULL_HANDLE;
+		}
+
+		// Destroy device
+		if (this->impl->device != VK_NULL_HANDLE) {
+			vkDestroyDevice(this->impl->device, nullptr);
+			this->impl->device = VK_NULL_HANDLE;
+		}
+
+		// Destroy debug messenger (only if debug mode enabled)
+#ifdef VULKAN_DEBUG
+		if (this->impl->debugMessenger != VK_NULL_HANDLE) {
+				DestroyDebugUtilsMessengerEXT(this->impl->instance, this->impl->debugMessenger, nullptr);
+				this->impl->debugMessenger = VK_NULL_HANDLE;
+			}
+#endif
+
+		// Destroy instance
+		if (this->impl->instance != VK_NULL_HANDLE) {
+			vkDestroyInstance(this->impl->instance, nullptr);
+			this->impl->instance = VK_NULL_HANDLE;
+		}
+
+		// Set vulkanInitialized to false while still holding lock (part of lifetime domain - Round 5)
+		this->impl->vulkanInitialized = false;
+
+	}  // submitMutex released here - all resources destroyed
+
+	VKDBG_LOG("[CLEANUP] Cleanup complete.");
 }
 
 // ============================================
@@ -1530,10 +2197,30 @@ void VulkanBackend::process(IOBuffer& input) {
 		throw std::runtime_error("Backend not initialized");
 	}
 
+	// Early check (before acquiring expensive lock)
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		throw std::runtime_error("Backend is shutting down");
+	}
+
+	// ============================================
+	// CRITICAL: Acquire submitMutex BEFORE accessing ANY Vulkan handles
+	// This lock protects ALL Vulkan handle usage, not just submissions
+	// ============================================
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// CRITICAL: Re-check shuttingDown AND vulkanInitialized AFTER lock (prevents TOCTOU race)
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		throw std::runtime_error("Backend is shutting down");
+	}
+	if (!this->impl->vulkanInitialized) {
+		throw std::runtime_error("Backend was cleaned up during lock acquisition");
+	}
+
+	// Now safe to access Vulkan handles - cleanup() holds submitMutex during destruction
+
 	// Get the backend index that was set during buffer initialization
 	// Each input buffer has a fixed relationship to a command buffer
-	int idx = input.getBackendIndex(); 
-
+	int idx = input.getBackendIndex();
 
 	VkCommandBuffer cmd = this->impl->commandBuffers[idx];
 	VkFence fence = this->impl->fences[idx];
@@ -1542,19 +2229,52 @@ void VulkanBackend::process(IOBuffer& input) {
 	// is done in getNextAvailableInputBuffer() before user writes to buffer.
 	// User's data is already in staging buffer - no memcpy needed.
 
-	// Get output buffer for this command buffer
+	// ============================================
+	// Acquire Free Staging Output Buffer
+	// ============================================
+	// Wait for a free staging buffer from the decoupled pool (like CUDA backend)
+	// Use RAII guard to ensure buffer is returned on exception
+	VulkanBackend::Impl::StagingLease stagingLease(this->impl.get());
+	int stagingBufferIdx;
+	{
+		std::unique_lock<std::mutex> lock(this->impl->freeStagingOutputMutex);
+		this->impl->freeStagingOutputCV.wait(lock, [this]() {
+			return this->impl->shuttingDown.load(std::memory_order_acquire) ||
+			       !this->impl->freeStagingOutputQueue.empty();
+		});
+
+		if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+			throw std::runtime_error("Backend shutting down");
+		}
+
+		stagingBufferIdx = this->impl->freeStagingOutputQueue.front();
+		this->impl->freeStagingOutputQueue.pop();
+
+		// Mark as in-use (double-acquire guard)
+		if (this->impl->stagingInUse[stagingBufferIdx].exchange(true, std::memory_order_acq_rel)) {
+			throw std::runtime_error("Double-acquire of staging buffer " + std::to_string(stagingBufferIdx));
+		}
+
+		// Activate RAII guard
+		stagingLease.acquire(stagingBufferIdx);
+	}
+
+	// Get output buffer and configure it to point to acquired staging memory
 	// Note: Don't set bufferId here - it would race with consumer threads reading it
 	// The completion thread restores bufferId from work.bufferId before callback
-	IOBuffer* outputBuf = &this->impl->outputBuffers[idx];
+	IOBuffer* outputBuf = &this->impl->outputBuffers[stagingBufferIdx];
+	int outputSignalLength = this->impl->signalLength / 2;
+	size_t outputSize = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer * sizeof(float);
+	outputBuf->setBackendIndex(stagingBufferIdx);  // Ensure index matches staging buffer
+	outputBuf->setExternalMemory(this->impl->stagingOutputMapped[stagingBufferIdx], outputSize);
 
 	// Record all command buffers if needed (first call, after config change, or after bg capture)
-	if (!this->impl->commandBuffersValid ||
-	    this->impl->needRerecordAfterBgCapture.exchange(false, std::memory_order_acq_rel)) {
+	// Re-recording and submission are both protected by submitMutex
+	bool needRerecord = this->impl->needRerecordAfterBgCapture.exchange(false, std::memory_order_acq_rel);
+	if (!this->impl->commandBuffersValid || needRerecord) {
 		this->impl->recordAllCommandBuffers();
 		cmd = this->impl->commandBuffers[idx];  // Restore cmd to current frame buffer
 	}
-
-	int outputSignalLength = this->impl->signalLength / 2;
 
 	// ============================================
 	// Submit Transfer and Compute Command Buffers
@@ -1564,14 +2284,63 @@ void VulkanBackend::process(IOBuffer& input) {
 	VkCommandBuffer transferCmd = this->impl->transferCommandBuffers[idx];
 	VkSemaphore transferCompleteSemaphore = this->impl->transferToComputeSemaphores[idx];
 
-	VkSubmitInfo transferSubmit = {};
+	// Diagnostic: Check if we're about to submit H2D before previous slot completed
+	uint64_t slotWaitValue = this->impl->lastTimelineValuePerCB[idx];
+#ifdef VULKAN_DEBUG
+	uint64_t currentTimelineValue = 0;
+	vkGetSemaphoreCounterValue(this->impl->device, this->impl->outputOrderingSemaphore, &currentTimelineValue);
+
+	VKDBG_LOG("[H2D DIAGNOSTIC] idx=" << idx
+	          << " slotWaitValue=" << slotWaitValue
+	          << " currentTimeline=" << currentTimelineValue
+	          << " needWait=" << (slotWaitValue > 0)
+	          << " SAFE=" << (currentTimelineValue >= slotWaitValue || slotWaitValue == 0));
+#endif
+
+	// Wait on previous "slot complete" value for this idx (recorded when D2H for this idx was submitted)
+	bool needSlotWait = (slotWaitValue > 0);
+
+	VKDBG_LOG("[H2D DEBUG] idx=" << idx
+	          << " slotWaitValue=" << slotWaitValue
+	          << " needWait=" << needSlotWait);
+
+	VkTimelineSemaphoreSubmitInfo h2dTimelineInfo{};
+	VkSubmitInfo transferSubmit{};
 	transferSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+	VkSemaphore h2dWaitSemaphores[1] = { this->impl->outputOrderingSemaphore };
+	VkPipelineStageFlags h2dWaitStages[1] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
+	uint64_t h2dWaitValues[1] = { slotWaitValue };
+
+	if (needSlotWait) {
+		h2dTimelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+		h2dTimelineInfo.waitSemaphoreValueCount = 1;
+		h2dTimelineInfo.pWaitSemaphoreValues = h2dWaitValues;
+		h2dTimelineInfo.signalSemaphoreValueCount = 0;
+		h2dTimelineInfo.pSignalSemaphoreValues = nullptr;
+
+		transferSubmit.pNext = &h2dTimelineInfo;
+		transferSubmit.waitSemaphoreCount = 1;
+		transferSubmit.pWaitSemaphores = h2dWaitSemaphores;
+		transferSubmit.pWaitDstStageMask = h2dWaitStages;
+	} else {
+		transferSubmit.pNext = nullptr;
+		transferSubmit.waitSemaphoreCount = 0;
+		transferSubmit.pWaitSemaphores = nullptr;
+		transferSubmit.pWaitDstStageMask = nullptr;
+	}
+
 	transferSubmit.commandBufferCount = 1;
 	transferSubmit.pCommandBuffers = &transferCmd;
+
 	transferSubmit.signalSemaphoreCount = 1;
 	transferSubmit.pSignalSemaphores = &transferCompleteSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->transferQueue, 1, &transferSubmit, VK_NULL_HANDLE));
+	VKDBG_LOG("[H2D SUBMIT] idx=" << idx
+	          << " cmd=" << transferCmd
+	          << " src=stagingInput[" << idx << "]=" << this->impl->stagingInputBuffers[idx]
+	          << " dst=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]);
 
 	// Submit compute command buffer. signals computeToD2hSemaphore when done
 	// Compute only waits on H2D transfer
@@ -1592,59 +2361,107 @@ void VulkanBackend::process(IOBuffer& input) {
 	computeSubmit.pSignalSemaphores = &computeToD2hSemaphore;
 
 	checkVulkanErrors(vkQueueSubmit(this->impl->computeQueue, 1, &computeSubmit, VK_NULL_HANDLE));
+	VKDBG_LOG("[COMPUTE SUBMIT] idx=" << idx
+	          << " cmd=" << cmd
+	          << " signalValue=" << signalValue
+	          << " src=deviceInput[" << idx << "]=" << this->impl->deviceInputBuffers[idx]
+	          << " dst=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]);
+
+	// ============================================
+	// Record D2H Transfer Command Buffer Dynamically
+	// ============================================
+	// Record the D2H command buffer to copy from deviceProcessed[idx] to stagingOutput[stagingBufferIdx]
+	// This is safe because command buffer slot reuse gates ensure GPU is done with previous submission
+	this->impl->recordD2hTransferCommandBuffer(idx, stagingBufferIdx, outputSize);
+	VkCommandBuffer d2hCmd = this->impl->d2hTransferCommandBuffers[idx];
 
 	// Submit D2H transfer command buffer. signals timeline semaphore for ordered completion
 	// D2H waits on: compute complete
 	// D2H signals: timeline semaphore (for completion thread ordering)
-	VkCommandBuffer d2hCmd = this->impl->d2hTransferCommandBuffers[idx];
 
-	uint64_t d2hWaitValues[1] = {0};         // Binary semaphore (ignored)
+	// Determine if we need to wait for previous write to this staging buffer
+	uint64_t stagingReuseWaitValue = this->impl->stagingLastWriteValue[stagingBufferIdx];  // Use stagingBufferIdx, not idx
+	bool needStagingWait = (stagingReuseWaitValue > 0);
+	VKDBG_LOG("[D2H DEBUG] cmdIdx=" << idx << " stagingIdx=" << stagingBufferIdx << " signal=" << signalValue << " waitValue=" << stagingReuseWaitValue << " needWait=" << needStagingWait);
+
+	// Setup wait values: [binary_semaphore_value, timeline_wait_value (if needed)]
+	uint64_t d2hWaitValues[2] = {0, stagingReuseWaitValue};
 	uint64_t d2hSignalValues[1] = {signalValue};  // Timeline semaphore signal value
+
+	// Setup wait semaphores: [computeToD2hSemaphore, outputOrderingSemaphore (if needed)]
+	VkSemaphore d2hWaitSemaphores[2] = {
+		computeToD2hSemaphore,
+		this->impl->outputOrderingSemaphore
+	};
+
+	// Setup wait stages
+	VkPipelineStageFlags d2hWaitStages[2] = {
+		VK_PIPELINE_STAGE_TRANSFER_BIT,  // For compute→D2H dependency
+		VK_PIPELINE_STAGE_TRANSFER_BIT   // For staging buffer reuse protection
+	};
 
 	VkTimelineSemaphoreSubmitInfo d2hTimelineInfo = {};
 	d2hTimelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
 	d2hTimelineInfo.pNext = nullptr;
-	d2hTimelineInfo.waitSemaphoreValueCount = 1;
+	d2hTimelineInfo.waitSemaphoreValueCount = needStagingWait ? 2 : 1;
 	d2hTimelineInfo.pWaitSemaphoreValues = d2hWaitValues;
 	d2hTimelineInfo.signalSemaphoreValueCount = 1;
 	d2hTimelineInfo.pSignalSemaphoreValues = d2hSignalValues;
 
-	VkPipelineStageFlags d2hWaitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-
 	VkSubmitInfo d2hSubmit = {};
 	d2hSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	d2hSubmit.pNext = &d2hTimelineInfo;
-	d2hSubmit.waitSemaphoreCount = 1;
-	d2hSubmit.pWaitSemaphores = &computeToD2hSemaphore;
-	d2hSubmit.pWaitDstStageMask = &d2hWaitStage;
+	d2hSubmit.waitSemaphoreCount = needStagingWait ? 2 : 1;
+	d2hSubmit.pWaitSemaphores = d2hWaitSemaphores;
+	d2hSubmit.pWaitDstStageMask = d2hWaitStages;
 	d2hSubmit.commandBufferCount = 1;
 	d2hSubmit.pCommandBuffers = &d2hCmd;
 	d2hSubmit.signalSemaphoreCount = 1;
 	d2hSubmit.pSignalSemaphores = &this->impl->outputOrderingSemaphore;
 
-	checkVulkanErrors(vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence));
+	VkResult submitResult = vkQueueSubmit(this->impl->d2hTransferQueue, 1, &d2hSubmit, fence);
+	VKDBG_LOG("[D2H SUBMIT] cmdIdx=" << idx
+	          << " stagingIdx=" << stagingBufferIdx
+	          << " cmd=" << d2hCmd
+	          << " signalValue=" << signalValue
+	          << " waitValue=" << stagingReuseWaitValue
+	          << " needWait=" << needStagingWait
+	          << " src=deviceProcessed[" << idx << "]=" << this->impl->deviceProcessedBuffers[idx]
+	          << " dst=stagingOutput[" << stagingBufferIdx << "]=" << this->impl->stagingOutputBuffers[stagingBufferIdx]);
+	if (submitResult == VK_ERROR_DEVICE_LOST) {
+		std::cerr << "!!! VK_ERROR_DEVICE_LOST on vkQueueSubmit - GPU crashed (likely shader OOB) !!!" << std::endl;
+	}
+	checkVulkanErrors(submitResult);
 
 	this->impl->nextOutputSignalValue++;
 
+	// Update per-buffer reuse guard: this staging buffer was last written at signalValue
+	this->impl->stagingLastWriteValue[stagingBufferIdx] = signalValue;  // Use stagingBufferIdx, not idx
+
 	// Queue work for async completion (completion thread will wait on timeline semaphore and invoke callback)
 	// This enables true async overlap: process() returns immediately, allowing next frame to start
-	size_t outputSize = outputSignalLength * this->impl->ascansPerBscan * this->impl->bscansPerBuffer * sizeof(float);
 	{
 		std::lock_guard<std::mutex> lock(this->impl->pendingWorkMutex);
 		this->impl->pendingWorkQueue.push({
 			fence,
-			idx,
+			idx,                   // Command buffer index (for fence/timeline tracking)
 			outputBuf,
 			&input,                // Zero-copy: return input buffer to free queue after callback
 			outputSize,
 			outputSignalLength,
 			signalValue,           // Timeline semaphore value for this frame
-			input.getBufferId()    // Save buffer ID (output buffer is shared between frames using same CB)
+			input.getBufferId(),   // Save buffer ID (output buffer is shared between frames)
+			stagingBufferIdx       // NEW: track which staging buffer this work uses (decoupled from commandBufferIdx)
 		});
+		// Increment pending work counter AFTER successful enqueue (inside lock to avoid race)
+		this->impl->pendingWorkCount.fetch_add(1, std::memory_order_release);
 	}
 	this->impl->pendingWorkCV.notify_one();  // Wake completion thread
 
-	// Track which timeline value was used by this CB (for staging buffer protection)
+	// Disarm RAII guard - work is now tracked in pendingWorkQueue
+	stagingLease.release_to_pending();
+
+	// Track which timeline value was used by this CB (for slot reuse protection)
 	this->impl->lastTimelineValuePerCB[idx] = signalValue;
 }
 
@@ -1653,15 +2470,104 @@ void VulkanBackend::process(IOBuffer& input) {
 // ============================================
 
 void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
+	// === STEP 1: Detect which changes invalidate VkFFT apps ===
+	VulkanBackend::Impl::FftKey newKey{};
+	newKey.signalLength = static_cast<uint32_t>(config.dataParams.signalLength);
+	newKey.numberBatches = static_cast<uint32_t>(
+		config.dataParams.ascansPerBscan * config.dataParams.bscansPerBuffer
+	);
+	newKey.dcRemovalEnabled = config.processingParams.dcRemoval.enabled;
+
+	bool fftParamsChanged = (newKey != this->impl->prevFftKey);
+
+	// === STEP 2: Update impl->config ===
 	this->impl->config = config;
 
-	// Invalidate command buffers to force re-recording with new configuration
-	// Next process() call will re-record all command buffers
-	//todo: this can be improved to only re-record when relevant parameters change
+	// === STEP 3: Not needed - VkFFT config is constant at runtime ===
+
+	// === STEP 4: Rebuild VkFFT apps ONLY if FFT parameters changed ===
+	if (fftParamsChanged)  // Removed !vkfftApps.empty() check - always rebuild if params changed
+	{
+		// GPU-safe teardown: Wait for GPU to finish using current VkFFT apps
+		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+		// Wait for all in-flight command buffers using fences
+		if (!this->impl->fences.empty()) {
+			VkResult waitResult = vkWaitForFences(
+				this->impl->device,
+				static_cast<uint32_t>(this->impl->fences.size()),
+				this->impl->fences.data(),
+				VK_TRUE,  // Wait for all fences
+				UINT64_MAX  // No timeout
+			);
+			if (waitResult != VK_SUCCESS) {
+				std::cerr << "[updateConfig] WARNING: vkWaitForFences failed with code " << waitResult << std::endl;
+				// Continue with cleanup - resources must be destroyed
+			}
+		}
+
+		// Destroy all VkFFT apps (safe after waiting for fences)
+		for (size_t i = 0; i < this->impl->vkfftApps.size(); ++i)
+		{
+			deleteVkFFT(&this->impl->vkfftApps[i]);
+		}
+		this->impl->vkfftApps.clear();
+
+		// Re-create with new buffer selection using UPDATED config
+		this->impl->vkfftApps.resize(this->impl->numCommandBuffers);
+
+		int initializedCount = 0;  // Track for cleanup robustness
+
+		for (int i = 0; i < this->impl->numCommandBuffers; ++i)
+		{
+			// Use helper to ensure consistent buffer selection (same logic as recording)
+			VkBuffer* fftBuffer = this->impl->getFftDataBufferForSlot(i, this->impl->config);
+
+			// Copy impl->fftConfig and override buffer per-slot
+			VkFFTConfiguration fftCfg = this->impl->fftConfig;
+			fftCfg.buffer = fftBuffer;  // Per-slot buffer from helper
+			fftCfg.size[0] = newKey.signalLength;  // Update FFT size
+			fftCfg.numberBatches = newKey.numberBatches;  // Update batch count
+
+			// Zero-initialize before passing to VkFFT
+			memset(&this->impl->vkfftApps[i], 0, sizeof(VkFFTApplication));
+
+			try {
+				checkVkFFTErrors(initializeVkFFT(&this->impl->vkfftApps[i], fftCfg));
+				initializedCount++;
+			} catch (...) {
+				// Cleanup robustness: If initializeVkFFT() fails midway,
+				// destroy already-initialized apps before re-throwing
+				for (int j = 0; j < initializedCount; ++j) {
+					deleteVkFFT(&this->impl->vkfftApps[j]);
+				}
+				this->impl->vkfftApps.clear();
+				throw;
+			}
+		}
+
+		// Update prevFftKey ONLY after successful rebuild
+		this->impl->prevFftKey = newKey;
+	}
+
+	// === STEP 5: Mark command buffers invalid ===
+	// Command buffers always need re-recording on config change
 	this->impl->commandBuffersValid = false;
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
+	}
+
 	// Create buffer if it doesn't exist
 	if (this->impl->resampleCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength)) {
 		VkDeviceSize bufferSize = length * sizeof(float);
@@ -1674,6 +2580,10 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 	if (this->impl->resampleCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
+
+	// Ensure no in-flight work is using the curve buffer we're about to update
+	// Curve updates are rare (user interaction, not per-frame), so vkDeviceWaitIdle is acceptable
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
 
 	// Create staging buffer for upload
 	VkBuffer stagingBuffer;
@@ -1709,7 +2619,15 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for resample curve upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Resample curve upload dst=resampleCurveBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->resampleCurveBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -1729,6 +2647,18 @@ void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
 }
 
 void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
+	}
+
 	// Create buffer if it doesn't exist
 	if (this->impl->dispersionCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength * 2)) {
 		VkDeviceSize bufferSize = length * sizeof(float);
@@ -1741,6 +2671,10 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 	if (this->impl->dispersionCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength * 2)) {
 		return;
 	}
+
+	// Ensure no in-flight work is using the curve buffer we're about to update
+	// Curve updates are rare (user interaction, not per-frame), so vkDeviceWaitIdle is acceptable
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
 
 	// Create staging buffer for upload (complex data: 2 floats per element)
 	VkBuffer stagingBuffer;
@@ -1776,7 +2710,15 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for dispersion curve upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Dispersion curve upload dst=dispersionCurveBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->dispersionCurveBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -1796,6 +2738,18 @@ void VulkanBackend::updateDispersionCurve(const float* curve, size_t length) {
 }
 
 void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
+	}
+
 	// Create buffer if it doesn't exist
 	if (this->impl->windowCurveBuffer == VK_NULL_HANDLE && length == static_cast<size_t>(this->impl->signalLength)) {
 		VkDeviceSize bufferSize = length * sizeof(float);
@@ -1808,6 +2762,10 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 	if (this->impl->windowCurveBuffer == VK_NULL_HANDLE || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
+
+	// Ensure no in-flight work is using the curve buffer we're about to update
+	// Curve updates are rare (user interaction, not per-frame), so vkDeviceWaitIdle is acceptable
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
 
 	// Create staging buffer for upload
 	VkBuffer stagingBuffer;
@@ -1843,7 +2801,15 @@ void VulkanBackend::updateWindowCurve(const float* curve, size_t length) {
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for window curve upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Window curve upload dst=windowCurveBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->windowCurveBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -1879,9 +2845,14 @@ IOBuffer& VulkanBackend::getNextAvailableInputBuffer() {
 	{
 		std::unique_lock<std::mutex> lock(this->impl->freeQueueMutex);
 
-		// Block until a buffer is available
-		while (this->impl->freeBuffersQueue.empty()) {
-			this->impl->freeQueueCV.wait(lock);
+		// Block until a buffer is available OR shutdown is signaled
+		this->impl->freeQueueCV.wait(lock, [this] {
+			return !this->impl->freeBuffersQueue.empty() || this->impl->shuttingDown.load(std::memory_order_acquire);
+		});
+
+		// After waking, check if we woke due to shutdown
+		if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+			throw std::runtime_error("Backend is shutting down");
 		}
 
 		buffer = this->impl->freeBuffersQueue.front();
@@ -1895,7 +2866,20 @@ IOBuffer& VulkanBackend::getNextAvailableInputBuffer() {
 
 	// Wait for this CB to be available before writing to its input buffers
 	// This ensures we don't overwrite input buffers while GPU is reading them
-	checkVulkanErrors(vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, UINT64_MAX));
+	// Use bounded wait to prevent indefinite hang if GPU wedged
+	VkResult result = VK_TIMEOUT;
+	while (result == VK_TIMEOUT) {
+		if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+			throw std::runtime_error("Backend shutting down");
+		}
+
+		// Wait with 100ms timeout instead of UINT64_MAX
+		result = vkWaitForFences(this->impl->device, 1, &fence, VK_TRUE, 100'000'000ULL);
+	}
+
+	if (result != VK_SUCCESS) {
+		checkVulkanErrors(result);
+	}
 
 	checkVulkanErrors(vkResetFences(this->impl->device, 1, &fence));
 
@@ -1910,16 +2894,65 @@ int VulkanBackend::getNumInputBuffers() const {
 	return this->impl->numCommandBuffers;
 }
 
+int VulkanBackend::getOutputBufferCount() const {
+	return static_cast<int>(this->impl->outputBuffers.size());
+}
+
+void VulkanBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	if (!buffer) return;
+
+	// Get staging buffer index (decoupled from command buffer index)
+	int stagingBufferIdx = buffer->getBackendIndex();
+	if (stagingBufferIdx < 0 || stagingBufferIdx >= this->impl->numStagingBuffers) {
+		return;
+	}
+
+	// ============================================
+	// Return Staging Buffer to Free Queue
+	// ============================================
+	// NEW POLICY: Input buffers are released in completion thread, NOT here
+	// This function ONLY returns the staging buffer to the free pool
+	{
+		std::lock_guard<std::mutex> lock(this->impl->freeStagingOutputMutex);
+
+		// Safety: check if already released (double-free guard)
+		if (!this->impl->stagingInUse[stagingBufferIdx].load(std::memory_order_acquire)) {
+			std::cerr << "WARNING: Double release of staging buffer " << stagingBufferIdx << std::endl;
+			return;
+		}
+
+		// Mark as not in use and return to free queue
+		this->impl->stagingInUse[stagingBufferIdx].store(false, std::memory_order_release);
+		this->impl->freeStagingOutputQueue.push(stagingBufferIdx);
+	}
+	this->impl->freeStagingOutputCV.notify_one();
+}
+
 // ============================================
 // Profile Management
 // ============================================
 
 void VulkanBackend::requestPostProcessBackgroundRecording() {
-	this->impl->postProcessBackgroundRecordingRequested = true;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
+		this->impl->postProcessBackgroundRecordingRequested = true;
+	}
 	this->impl->commandBuffersValid = false;  // Force re-record on next process()
 }
 
 void VulkanBackend::setPostProcessBackgroundProfile(const float* background, size_t length) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
+	}
+
 	if (!background || length == 0) {
 		throw std::invalid_argument("Invalid background profile pointer or size");
 	}
@@ -1930,8 +2963,11 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 		throw std::invalid_argument("Invalid background profile size. Expected " + std::to_string(expectedLength) + " floats but got " + std::to_string(length));
 	}
 
-	// Store profile locally
-	this->impl->recordedPostProcessBackground.assign(background, background + length);
+	// Store profile locally (mutex-protected to avoid data races)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
+		this->impl->recordedPostProcessBackground.assign(background, background + length);
+	}
 
 	// Upload to GPU
 	if (this->impl->postProcBackgroundBuffer == VK_NULL_HANDLE) {
@@ -1972,7 +3008,15 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for background profile upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Background profile upload dst=postProcBackgroundBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->postProcBackgroundBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -1990,27 +3034,52 @@ void VulkanBackend::setPostProcessBackgroundProfile(const float* background, siz
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
 
-	// Mark background profile as valid
-	this->impl->hasValidBackgroundProfile = true;
+	// Mark background profile as valid (mutex-protected)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
+		this->impl->hasValidBackgroundProfile = true;
+	}
 
 	// Re-record command buffers to include background subtraction
 	// First, wait for all in-flight work to complete
 	vkDeviceWaitIdle(this->impl->device);
 
 	// Re-record all command buffers with background subtraction enabled
+	this->impl->logRecordPoint("from_setPostProcessBackgroundProfile");
 	this->recordCommandBuffers();
 }
 
 const std::vector<float>& VulkanBackend::getPostProcessBackgroundProfile() const {
+	// Note: Returning reference requires caller holds no concurrent modifications
+	// This is safe in current usage (only called when processing is stopped)
+	// Future: Consider returning by value if called during processing
+	std::lock_guard<std::mutex> lock(this->impl->backgroundProfileMutex);
 	return this->impl->recordedPostProcessBackground;
 }
 
 void VulkanBackend::requestFixedPatternNoiseDetermination() {
-	this->impl->fixedPatternNoiseDetermined = false;
-	this->impl->commandBuffersValid = false;  // Force re-record to include FPN determination shader
+	{
+		std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
+		this->impl->fpnRecordingRequested = true;
+		this->impl->fixedPatternNoiseDetermined = false;  // Mark as not determined yet
+	}
+	// Invalidate command buffers to include FPN determination dispatch
+	this->impl->commandBuffersValid = false;
 }
 
 void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) {
+	// Acquire submitMutex to protect Vulkan handle access (command pool, queue submission)
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+
+	// Allow during initialize(): only require the Vulkan objects we actually use
+	if (this->impl->shuttingDown.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	if (this->impl->device == VK_NULL_HANDLE || this->impl->computeQueue == VK_NULL_HANDLE || this->impl->commandPool == VK_NULL_HANDLE) {
+		throw std::runtime_error("Vulkan device/queue/commandPool not ready");
+	}
+
 	if (!profileInterleaved || complexPairs == 0) {
 		throw std::invalid_argument("Invalid fixed pattern noise profile pointer or size");
 	}
@@ -2063,7 +3132,15 @@ void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved,
 
 	VkBufferCopy copyRegion = {};
 	copyRegion.size = bufferSize;
+
+	// Balanced label for mean A-line upload
+	char labelName[128];
+	snprintf(labelName, sizeof(labelName),
+	         "Mean A-line upload dst=meanALineBuffer src=staging size=%zu",
+	         (size_t)copyRegion.size);
+	bool began = this->impl->beginLabel(cmdBuffer, labelName);
 	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, this->impl->meanALineBuffer, 1, &copyRegion);
+	this->impl->endLabel(cmdBuffer, began);
 
 	vkEndCommandBuffer(cmdBuffer);
 
@@ -2081,182 +3158,20 @@ void VulkanBackend::setFixedPatternNoiseProfile(const float* profileInterleaved,
 	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
 	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
 
-	// Mark FPN as determined
-	this->impl->fixedPatternNoiseDetermined = true;
+	// Mark FPN as determined (mutex-protected)
+	{
+		std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
+		this->impl->fixedPatternNoiseDetermined = true;
+	}
 }
 
 const std::vector<float>& VulkanBackend::getFixedPatternNoiseProfile() const {
+	// Note: Returning reference requires caller holds no concurrent modifications
+	// This is safe in current usage (only called when processing is stopped)
+	std::lock_guard<std::mutex> lock(this->impl->fixedPatternNoiseMutex);
 	return this->impl->recordedFixedPatternNoise;
 }
 
-// ============================================
-// Individual Operations (Stubs for now)
-// ============================================
-
-std::vector<float> VulkanBackend::convertInput(
-	const void* input,
-	IOBuffer::DataType inputType,
-	int bitDepth,
-	int samples,
-	bool applyBitshift
-) {
-	// TODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::rollingAverageBackgroundRemoval(
-	const float* input,
-	int windowSize,
-	int lineWidth,
-	int numLines
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::kLinearization(
-	const float* input,
-	const float* resampleCurve,
-	InterpolationMethod method,
-	int lineWidth,
-	int samples
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::windowing(
-	const float* input,
-	const float* windowCurve,
-	int lineWidth,
-	int samples
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::dispersionCompensation(
-	const float* input,
-	const float* phaseComplex,
-	int lineWidth,
-	int samples
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::kLinearizationAndWindowing(
-	const float* input,
-	const float* resampleCurve,
-	const float* windowCurve,
-	InterpolationMethod method,
-	int lineWidth,
-	int samples
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::kLinearizationAndWindowingAndDispersion(
-	const float* input,
-	const float* resampleCurve,
-	const float* windowCurve,
-	const float* phaseComplex,
-	InterpolationMethod method,
-	int lineWidth,
-	int samples
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::dispersionCompensationAndWindowing(
-	const float* input,
-	const float* phaseComplex,
-	const float* windowCurve,
-	int lineWidth,
-	int samples
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::fft(const float* input, int lineWidth, int samples) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::ifft(const float* input, int lineWidth, int samples) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::getMinimumVarianceMean(
-	const float* input,
-	int width,
-	int height,
-	int segments
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::fixedPatternNoiseRemoval(
-	const float* input,
-	const float* meanALine,
-	int lineWidth,
-	int numLines
-) {
-	// TTODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::postProcessTruncate(
-	const float* input,
-	bool logScaling,
-	float grayscaleMax,
-	float grayscaleMin,
-	float addend,
-	float multiplicator,
-	int lineWidth,
-	int samples
-) {
-	//todo: remove
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::bscanFlip(
-	const float* input,
-	int lineWidth,
-	int linesPerBscan,
-	int numBscans
-) {
-	// TODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::sinusoidalScanCorrection(
-	const float* input,
-	const float* resampleCurve,
-	int lineWidth,
-	int linesPerBscan,
-	int numBscans
-) {
-	// TODO: remove from all backends
-	return std::vector<float>();
-}
-
-std::vector<float> VulkanBackend::postProcessBackgroundSubtraction(
-	const float* input,
-	const float* backgroundLine,
-	float weight,
-	float offset,
-	int lineWidth,
-	int samples
-) {
-	// TODO: remove from all backends
-	return std::vector<float>();
-}
 
 // ============================================
 // Helper Methods
@@ -2314,6 +3229,11 @@ void createBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDeviceSize
 }
 
 void VulkanBackend::allocateDeviceBuffers() {
+	// Get physical device properties for non-coherent memory alignment
+	VkPhysicalDeviceProperties props{};
+	vkGetPhysicalDeviceProperties(this->impl->physicalDevice, &props);
+	this->impl->nonCoherentAtomSize = props.limits.nonCoherentAtomSize;
+
 	size_t inputSize = this->impl->samplesPerBuffer * this->impl->bytesPerSample;
 	size_t complexSize = this->impl->samplesPerBuffer * sizeof(float) * 2;  // Complex float (2 floats per sample)
 	// Output size is truncated to half signal length after FFT
@@ -2346,30 +3266,71 @@ void VulkanBackend::allocateDeviceBuffers() {
 		vkMapMemory(this->impl->device, this->impl->stagingInputMemory[i], 0, inputSize, 0, &this->impl->stagingInputMapped[i]);
 	}
 
-	// Allocate staging output buffers
-	this->impl->stagingOutputBuffers.resize(this->impl->numCommandBuffers);
-	this->impl->stagingOutputMemory.resize(this->impl->numCommandBuffers);
-	this->impl->stagingOutputMapped.resize(this->impl->numCommandBuffers);
+	// Allocate staging output buffers (decoupled pool, larger than command buffer count)
+	// Determine actual number of output buffers (like CUDA backend)
+	int actualNumOutputBuffers = (this->impl->numOutputBuffers > 0)
+		? this->impl->numOutputBuffers
+		: (this->impl->numCommandBuffers * 2);
 
-	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
-		// Try to allocate with cached memory for fast CPU reads (60x faster than uncached!)
+	this->impl->stagingOutputBuffers.resize(actualNumOutputBuffers);
+	this->impl->stagingOutputMemory.resize(actualNumOutputBuffers);
+	this->impl->stagingOutputMapped.resize(actualNumOutputBuffers);
+	this->impl->stagingLastWriteValue.resize(actualNumOutputBuffers, 0);  // Initialize to 0 (no previous write)
+	this->impl->stagingOutputAllocSize.resize(actualNumOutputBuffers);  // Track allocation size for alignment capping
+
+	// Initialize stagingInUse atomic bools (unique_ptr array because atomics can't go in vector)
+	this->impl->numStagingBuffers = actualNumOutputBuffers;
+	this->impl->stagingInUse.reset(new std::atomic<bool>[actualNumOutputBuffers]);
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		this->impl->stagingInUse[i].store(false, std::memory_order_relaxed);
+	}
+
+	// Track whether we successfully allocated with coherent memory (for flexible platform support)
+	bool allocatedCoherent = true;
+
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		// Try to allocate with cached + coherent memory for fast CPU reads (60x faster than uncached!)
 		// HOST_CACHED + HOST_COHERENT = best of both worlds: fast reads + automatic sync
-		// Fallback to non-cached if cached memory is not available on this platform
+		// Fallback to non-coherent if coherent memory is not available on this platform
+		bool bufferIsCoherent = false;
 		try {
 			createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
 			             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
 			             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+			bufferIsCoherent = true;
 		} catch (const std::runtime_error&) {
-			// HOST_CACHED not available - fall back to non-cached (slower reads but still functional)
-			createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
-			             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-			             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+			// HOST_CACHED not available - try non-cached coherent
+			try {
+				createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+				             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+				bufferIsCoherent = true;
+			} catch (const std::runtime_error&) {
+				// HOST_COHERENT not available - fall back to non-coherent (requires manual invalidation)
+				createBuffer(this->impl->device, this->impl->physicalDevice, outputSize,
+				             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+				             this->impl->stagingOutputBuffers[i], this->impl->stagingOutputMemory[i]);
+				bufferIsCoherent = false;
+				allocatedCoherent = false;
+			}
 		}
 
 		// Map staging buffer memory
 		vkMapMemory(this->impl->device, this->impl->stagingOutputMemory[i], 0, outputSize, 0, &this->impl->stagingOutputMapped[i]);
+
+		// Store allocation size for alignment capping
+		this->impl->stagingOutputAllocSize[i] = outputSize;
+	}
+
+	// Track coherency status for completion thread (determines if vkInvalidateMappedMemoryRanges needed)
+	this->impl->stagingOutputIsCoherent = allocatedCoherent;
+
+	// Initialize free staging output buffer queue
+	for (int i = 0; i < actualNumOutputBuffers; ++i) {
+		this->impl->freeStagingOutputQueue.push(i);
 	}
 
 	// Allocate device-local buffers (for computation)
@@ -2434,7 +3395,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 	// So size = (signalLength / 2) * 2 * sizeof(float) = signalLength * sizeof(float) = curveSize
 	size_t meanALineSize = curveSize;
 	createBuffer(this->impl->device, this->impl->physicalDevice, meanALineSize,
-	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 	             this->impl->meanALineBuffer, this->impl->meanALineMemory);
 
@@ -2454,6 +3415,15 @@ void VulkanBackend::allocateDeviceBuffers() {
 	// Map staging buffer for persistent access
 	vkMapMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory, 0, backgroundSize, 0, &this->impl->postProcBackgroundStagingMapped);
 
+	// FPN staging buffer for host readback (complex float, same size as meanALineBuffer)
+	createBuffer(this->impl->device, this->impl->physicalDevice, meanALineSize,
+	             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             this->impl->meanALineStagingBuffer, this->impl->meanALineStagingMemory);
+
+	// Map FPN staging buffer for persistent access
+	vkMapMemory(this->impl->device, this->impl->meanALineStagingMemory, 0, meanALineSize, 0, &this->impl->meanALineStagingMapped);
+
 	// Initialize background buffer to zeros (so background subtraction works even without recording)
 	VkCommandBufferAllocateInfo allocInfo = {};
 	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -2470,6 +3440,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 
 	vkBeginCommandBuffer(initCmdBuffer, &beginInfo);
 	vkCmdFillBuffer(initCmdBuffer, this->impl->postProcBackgroundBuffer, 0, VK_WHOLE_SIZE, 0);  // Fill with zeros
+	vkCmdFillBuffer(initCmdBuffer, this->impl->meanALineBuffer, 0, VK_WHOLE_SIZE, 0);  // Zero-fill meanALineBuffer so pre-determination subtraction has no effect
 	vkEndCommandBuffer(initCmdBuffer);
 
 	// Submit and wait for initialization
@@ -2480,6 +3451,31 @@ void VulkanBackend::allocateDeviceBuffers() {
 
 	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
 	vkQueueWaitIdle(this->impl->computeQueue);
+
+	// Name buffers for debug identification
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		char name[64];
+
+		// Staging output buffers (D2H destination)
+		snprintf(name, sizeof(name), "stagingOutput[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->stagingOutputBuffers[i], name);
+
+		// Device processed buffers (compute output, D2H source)
+		snprintf(name, sizeof(name), "deviceProcessed[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->deviceProcessedBuffers[i], name);
+
+		// Staging input buffers (H2D source)
+		snprintf(name, sizeof(name), "stagingInput[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->stagingInputBuffers[i], name);
+
+		// Device input buffers (H2D destination, compute source)
+		snprintf(name, sizeof(name), "deviceInput[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_BUFFER,
+		                       (uint64_t)this->impl->deviceInputBuffers[i], name);
+	}
 
 	// Cleanup
 	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &initCmdBuffer);
@@ -2598,6 +3594,20 @@ void VulkanBackend::releaseDeviceBuffers() {
 	if (this->impl->postProcBackgroundStagingMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(this->impl->device, this->impl->postProcBackgroundStagingMemory, nullptr);
 	}
+
+	// Unmap and cleanup staging buffer for FPN profile
+	if (this->impl->meanALineStagingMapped != nullptr) {
+		vkUnmapMemory(this->impl->device, this->impl->meanALineStagingMemory);
+		this->impl->meanALineStagingMapped = nullptr;
+	}
+	if (this->impl->meanALineStagingBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->meanALineStagingBuffer, nullptr);
+		this->impl->meanALineStagingBuffer = VK_NULL_HANDLE;
+	}
+	if (this->impl->meanALineStagingMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->meanALineStagingMemory, nullptr);
+		this->impl->meanALineStagingMemory = VK_NULL_HANDLE;
+	}
 }
 
 void VulkanBackend::createCommandBuffersAndFences() {
@@ -2684,6 +3694,28 @@ void VulkanBackend::createCommandBuffersAndFences() {
 
 	// Initialize per-CB timeline tracking (0 means no previous frame used this CB)
 	this->impl->lastTimelineValuePerCB.resize(this->impl->numCommandBuffers, 0);
+
+	// Name command buffers and semaphores for debug identification
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		char name[64];
+
+		snprintf(name, sizeof(name), "transferCmd[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER,
+		                       (uint64_t)this->impl->transferCommandBuffers[i], name);
+
+		snprintf(name, sizeof(name), "computeCmd[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER,
+		                       (uint64_t)this->impl->commandBuffers[i], name);
+
+		snprintf(name, sizeof(name), "d2hCmd[%d]", i);
+		this->impl->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER,
+		                       (uint64_t)this->impl->d2hTransferCommandBuffers[i], name);
+	}
+
+	// Name semaphores
+	this->impl->nameObject(VK_OBJECT_TYPE_SEMAPHORE,
+	                       (uint64_t)this->impl->outputOrderingSemaphore,
+	                       "outputOrderingTimeline");
 }
 
 void VulkanBackend::destroyCommandBuffersAndFences() {
@@ -2773,6 +3805,7 @@ std::string loadShaderSource(const std::string& filepath) {
 		"tests/" + filepath,                           // From build dir to test dir (Linux)
 		"examples/Release/" + filepath,                // From build dir to examples dir (Windows)
 		"examples/" + filepath,                        // From build dir to examples dir (Linux)
+		"../../src/backends/vulkan/shaders/" + filepath.substr(filepath.find_last_of('/') + 1),  // From python test dir to shaders
 		"src/backends/vulkan/shaders/" + filepath.substr(filepath.find_last_of('/') + 1)  // Source tree fallback
 	};
 
@@ -2927,6 +3960,7 @@ void VulkanBackend::createComputePipelines() {
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Allow individual descriptor sets to be freed
 
 	checkVulkanErrors(vkCreateDescriptorPool(this->impl->device, &poolInfo, nullptr, &this->impl->descriptorPool));
+	this->impl->logPoolOp("CREATE", this->impl->descriptorPool);
 
 	// ============================================
 	// Allocate Descriptor Sets (one per command buffer)
@@ -2978,7 +4012,7 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[1].descriptorCount = 1;
 		descriptorWrites[1].pBufferInfo = &outputBufferInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("InputConversion", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 	}
 
 	// ============================================
@@ -3124,7 +4158,7 @@ void VulkanBackend::createComputePipelines() {
 		dcRemovalDescriptorWrites[1].descriptorCount = 1;
 		dcRemovalDescriptorWrites[1].pBufferInfo = &dcRemovalOutputBufferInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(dcRemovalDescriptorWrites.size()), dcRemovalDescriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("DCRemoval", static_cast<uint32_t>(dcRemovalDescriptorWrites.size()), dcRemovalDescriptorWrites.data());
 	}
 
 	// ============================================
@@ -3568,7 +4602,7 @@ void VulkanBackend::createComputePipelines() {
 		descriptorWrites[6].descriptorCount = 1;
 		descriptorWrites[6].pBufferInfo = &outputInfoB;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("UniversalPreFFT", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 	}
 
 	// ============================================
@@ -3750,7 +4784,7 @@ void VulkanBackend::createComputePipelines() {
 			descriptorWrites[2].descriptorCount = 1;
 			descriptorWrites[2].pBufferInfo = &outputInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("UniversalPostFFT_variant0", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 		}
 
 		// --- Variant 1: Input from deviceIntermediateBuffers[i] ---
@@ -3789,7 +4823,7 @@ void VulkanBackend::createComputePipelines() {
 			descriptorWrites[2].descriptorCount = 1;
 			descriptorWrites[2].pBufferInfo = &outputInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("UniversalPostFFT_variant1", static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data());
 		}
 	}
 
@@ -3859,7 +4893,7 @@ void VulkanBackend::createComputePipelines() {
 			fpnDescriptorWrites[1].descriptorCount = 1;
 			fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("FPNDetermination_variant0", static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data());
 		}
 
 		// --- Variant 1: Input from deviceIntermediateBuffers[i] ---
@@ -3889,7 +4923,7 @@ void VulkanBackend::createComputePipelines() {
 			fpnDescriptorWrites[1].descriptorCount = 1;
 			fpnDescriptorWrites[1].pBufferInfo = &meanALineInfo;
 
-			vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data(), 0, nullptr);
+			this->impl->updateDescriptorSetsTagged("FPNDetermination_variant1", static_cast<uint32_t>(fpnDescriptorWrites.size()), fpnDescriptorWrites.data());
 		}
 	}
 
@@ -3940,7 +4974,7 @@ void VulkanBackend::createComputePipelines() {
 		bgDescriptorWrites[1].descriptorCount = 1;
 		bgDescriptorWrites[1].pBufferInfo = &backgroundInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(bgDescriptorWrites.size()), bgDescriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("BackgroundSubtraction", static_cast<uint32_t>(bgDescriptorWrites.size()), bgDescriptorWrites.data());
 	}
 
 	// ============================================
@@ -3990,7 +5024,7 @@ void VulkanBackend::createComputePipelines() {
 		bgRecDescriptorWrites[1].descriptorCount = 1;
 		bgRecDescriptorWrites[1].pBufferInfo = &backgroundInfo;
 
-		vkUpdateDescriptorSets(this->impl->device, static_cast<uint32_t>(bgRecDescriptorWrites.size()), bgRecDescriptorWrites.data(), 0, nullptr);
+		this->impl->updateDescriptorSetsTagged("BackgroundRecording", static_cast<uint32_t>(bgRecDescriptorWrites.size()), bgRecDescriptorWrites.data());
 	}
 
 	// ============================================
@@ -4026,6 +5060,7 @@ void VulkanBackend::destroyComputePipelines() {
 
 	// Destroy descriptor pool
 	if (this->impl->descriptorPool != VK_NULL_HANDLE) {
+		this->impl->logPoolOp("DESTROY", this->impl->descriptorPool);
 		vkDestroyDescriptorPool(this->impl->device, this->impl->descriptorPool, nullptr);
 		this->impl->descriptorPool = VK_NULL_HANDLE;
 	}

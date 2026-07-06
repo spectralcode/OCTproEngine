@@ -134,6 +134,9 @@ struct OpenClBackend::Impl {
 	std::mutex freeQueueMutex;
 	std::condition_variable freeQueueCV;
 
+	// Output buffer management
+	int numOutputBuffers = 0;  // 0 = auto (numCommandQueues * 2)
+
 	//	Device buffers
 	std::vector<cl_mem> d_inputBuffers;
 
@@ -225,6 +228,16 @@ void OpenClBackend::setNumInputBuffers(int count) {
 		throw std::invalid_argument("Number of input buffers must be at least 1");
 	}
 	this->impl->numInputBuffers = count;
+}
+
+void OpenClBackend::setNumOutputBuffers(int count) {
+	if (this->impl->openclInitialized) {
+		throw std::runtime_error("Cannot change number of output buffers after initialization");
+	}
+	if (count < 0) {
+		throw std::invalid_argument("Number of output buffers must be >= 0 (0 = auto)");
+	}
+	this->impl->numOutputBuffers = count;
 }
 
 void OpenClBackend::setNumCommandQueues(int numQueues) {
@@ -892,12 +905,7 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 				if (this->impl->callback) {
 					this->impl->callback(*bufferToDeliver);
 				}
-				//	Release output buffer back to pool
-				{
-					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-					this->impl->availableOutputBuffers++;
-				}
-				this->impl->outputSemaphoreCV.notify_one();
+				// NOTE: Do NOT release here. OutputBufferManager handles release via releaseOutputBuffer()
 			}
 		}
 
@@ -918,12 +926,7 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 				if (this->impl->callback) {
 					this->impl->callback(*bufferToDeliver);
 				}
-				//	Release output buffer back to pool
-				{
-					std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-					this->impl->availableOutputBuffers++;
-				}
-				this->impl->outputSemaphoreCV.notify_one();
+				// NOTE: Do NOT release here - OutputBufferManager handles release via releaseOutputBuffer()
 			}
 		}
 	});
@@ -1562,6 +1565,19 @@ int OpenClBackend::getNumInputBuffers() const {
 	return this->impl->numInputBuffers;
 }
 
+int OpenClBackend::getOutputBufferCount() const {
+	return static_cast<int>(this->impl->hostOutputBuffers.size());
+}
+
+void OpenClBackend::releaseOutputBuffer(IOBuffer* buffer) {
+	(void)buffer;
+	{
+		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
+		this->impl->availableOutputBuffers++;
+	}
+	this->impl->outputSemaphoreCV.notify_one();
+}
+
 void OpenClBackend::requestPostProcessBackgroundRecording() {
 	this->impl->postProcessBackgroundRecordingRequested = true;
 }
@@ -1602,71 +1618,6 @@ void OpenClBackend::setFixedPatternNoiseProfile(const float* profileInterleaved,
 
 const std::vector<float>& OpenClBackend::getFixedPatternNoiseProfile() const {
 	return this->impl->recordedFixedPatternNoise;
-}
-
-//	Individual test methods. not needed, will be removed from all backends in future
-std::vector<float> OpenClBackend::convertInput(const void* input, IOBuffer::DataType inputType, int bitDepth, int samples, bool applyBitshift) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::rollingAverageBackgroundRemoval(const float* input, int windowSize, int lineWidth, int numLines) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::kLinearization(const float* input, const float* resampleCurve, InterpolationMethod method, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::windowing(const float* input, const float* windowCurve, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::dispersionCompensation(const float* input, const float* phaseComplex, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::kLinearizationAndWindowing(const float* input, const float* resampleCurve, const float* windowCurve, InterpolationMethod method, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::kLinearizationAndWindowingAndDispersion(const float* input, const float* resampleCurve, const float* windowCurve, const float* phaseComplex, InterpolationMethod method, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::dispersionCompensationAndWindowing(const float* input, const float* phaseComplex, const float* windowCurve, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::fft(const float* input, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::ifft(const float* input, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::getMinimumVarianceMean(const float* input, int width, int height, int segments) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::fixedPatternNoiseRemoval(const float* input, const float* meanALine, int lineWidth, int numLines) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::postProcessTruncate(const float* input, bool logScaling, float grayscaleMax, float grayscaleMin, float addend, float multiplicator, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::bscanFlip(const float* input, int lineWidth, int linesPerBscan, int numBscans) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::sinusoidalScanCorrection(const float* input, const float* resampleCurve, int lineWidth, int linesPerBscan, int numBscans) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
-}
-
-std::vector<float> OpenClBackend::postProcessBackgroundSubtraction(const float* input, const float* backgroundLine, float weight, float offset, int lineWidth, int samples) {
-	throw std::runtime_error("Individual test methods not implemented for OpenCL backend");
 }
 
 void CL_CALLBACK OpenClBackend::returnBufferCallback(cl_event event, cl_int status, void* userData) {

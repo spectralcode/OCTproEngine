@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <map>
+#include <mutex>
 
 const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
 
@@ -21,12 +22,15 @@ public:
 
 	std::vector<BufferRecord> recordedBuffers;
 	std::map<uint64_t, int> idMatchCount;  // Tracks how many times each ID appears
+	std::mutex recordMutex;  // raw and processed callbacks arrive on different worker threads
 
 	void recordBuffer(const ope::IOBuffer& buffer, bool isRaw) {
 		BufferRecord record;
 		record.bufferId = buffer.getBufferId();
 		record.isRaw = isRaw;
 		record.dataSize = buffer.getSizeInBytes();
+
+		std::lock_guard<std::mutex> lock(recordMutex);
 		recordedBuffers.push_back(record);
 
 		// Track ID appearances
@@ -87,6 +91,10 @@ void testBufferIdPropagation() {
 
 	// Wait for processing to complete
 	std::this_thread::sleep_for(std::chrono::milliseconds(1750));
+
+	// Detach before reading the results: this joins the callback worker threads,
+	// so the reads below are properly synchronized with the callback writes
+	recorder.detach();
 
 	// Verify results
 	std::cout << "  Recorded " << recorder.recordedBuffers.size() << " buffers" << std::endl;
@@ -191,13 +199,15 @@ void testProcessorToolAttachment() {
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-	size_t initialRecordCount = tool.recordedBuffers.size();
-	TEST_ASSERT(initialRecordCount > 0, "Tool should have recorded some buffers while attached");
-
-	// Detach
+	// Detach BEFORE taking the baseline count: detach joins the callback workers,
+	// which makes the count final (an in-flight callback could otherwise record
+	// between the snapshot and the detach and fail the equality check below)
 	tool.detach();
 	TEST_ASSERT(!tool.isAttached(), "Tool should not be attached after detach");
 	TEST_ASSERT(tool.getProcessor() == nullptr, "Processor should be nullptr after detach");
+
+	size_t initialRecordCount = tool.recordedBuffers.size();
+	TEST_ASSERT(initialRecordCount > 0, "Tool should have recorded some buffers while attached");
 
 	// Process more data. should not be recorded now!
 	auto& inputBuffer2 = processor.getNextAvailableInputBuffer();

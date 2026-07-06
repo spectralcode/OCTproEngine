@@ -276,6 +276,11 @@ void Recorder::startRecording(bool waitForVolumeStart) {
 	this->waitingForVolumeStartRaw = waitForVolumeStart;
 	this->waitingForVolumeStartProcessed = waitForVolumeStart;
 
+	// ID fence: callbacks stay registered between recordings (cheap restarts),
+	// so frames published before this call may still sit in the callback queues.
+	// Recording only accepts buffers processed from this point on.
+	this->recordStartId.store(this->processor->getNextBufferId());
+
 	this->status = Status::RECORDING;
 }
 
@@ -327,10 +332,14 @@ void Recorder::abortRecording() {
 	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Wait for any in-flight callbacks
 
-	this->rawData.clear();
-	this->processedData.clear();
-	this->rawBufferIds.clear();
-	this->processedBufferIds.clear();
+	// Discarding follows the same storage policy as normal completion:
+	// automatic allocation frees the buffers, manual allocation keeps them
+	// sized for reuse. Deliberately no clear() on the vectors: a cleared
+	// vector reports size 0 while startRecording() would skip reallocation,
+	// so the next recording's summary would lose its buffer IDs.
+	if (!this->manualAllocation) {
+		this->freeBuffersInternal();
+	}
 
 	this->rawBuffersRecorded = 0;
 	this->processedBuffersRecorded = 0;
@@ -412,19 +421,6 @@ void Recorder::configureCallbacks() {
 	this->registerCallbacksForCurrentMode();
 }
 
-void Recorder::cleanupCallbacks() {
-	if (this->processor) {
-		if (this->rawCallbackId >= 0) {
-			this->processor->removeInputCallback(this->rawCallbackId);
-			this->rawCallbackId = -1;
-		}
-		if (this->processedCallbackId >= 0) {
-			this->processor->removeOutputCallback(this->processedCallbackId);
-			this->processedCallbackId = -1;
-		}
-	}
-}
-
 void Recorder::registerCallbacksForCurrentMode() {
 	this->cleanupCallbacks();
 
@@ -447,6 +443,10 @@ void Recorder::collectRawBuffer(const IOBuffer& buffer) {
 	uint64_t bufferId = buffer.getBufferId();
 	const void* dataPtr = buffer.getDataPointer();
 	size_t dataSize = buffer.getSizeInBytes();
+
+	if (bufferId < this->recordStartId.load()) {
+		return; // stale frame from before startRecording(), see recordStartId
+	}
 
 	if (this->waitingForVolumeStartRaw) {
 		if (bufferId % this->buffersPerVolume != 0) {
@@ -496,10 +496,14 @@ void Recorder::collectRawBuffer(const IOBuffer& buffer) {
 
 void Recorder::collectProcessedBuffer(const IOBuffer& buffer) {
 	if (this->status.load() != Status::RECORDING) return;
-	
+
 	uint64_t bufferId = buffer.getBufferId();
 	const void* dataPtr = buffer.getDataPointer();
-	
+
+	if (bufferId < this->recordStartId.load()) {
+		return; // stale frame from before startRecording(), see recordStartId
+	}
+
 	if (this->waitingForVolumeStartProcessed) {
 		if (bufferId % this->buffersPerVolume != 0) {
 			return;
@@ -509,6 +513,17 @@ void Recorder::collectProcessedBuffer(const IOBuffer& buffer) {
 
 	if (this->mode == Mode::BOTH) {
 		uint64_t targetId = this->firstRawBufferId.load();
+		// The raw side may not have claimed its first buffer yet: input callbacks
+		// run asynchronously, so a processed buffer can overtake the raw callback.
+		// Wait for the raw side instead of wrongly skipping this frame (safe here:
+		// this runs on a callback worker thread, not inside process())
+		while (targetId == UINT64_MAX && this->status.load() == Status::RECORDING) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			targetId = this->firstRawBufferId.load();
+		}
+		if (targetId == UINT64_MAX) {
+			return; // recording stopped before any raw buffer arrived
+		}
 		if (bufferId < targetId) {
 			// here we assume that raw buffers always arrive before processed buffers
 			// (in other words: processed buffers lag behind raw buffers)

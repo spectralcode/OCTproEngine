@@ -8,10 +8,10 @@ set(CORE_SOURCES
 	core/processor.cpp
 	core/processorconfiguration.cpp
 	core/backendconfig.cpp
-	core/callback_manager.cpp
+	core/buffer_manager.cpp
 	core/processortool.cpp
-	core/cudautils.cpp
 )
+
 
 set(TOOLS_SOURCES)
 if(BUILD_TOOLS)
@@ -22,10 +22,12 @@ set(CPU_SOURCES
 	backends/cpu/cpu_backend.cpp
 )
 
+
 set(CUDA_SOURCES
 	backends/cuda/cuda_backend.cu
 	backends/cuda/cuda_kernels.cu
 )
+
 
 # ========================================
 # OpenCL Kernel Embedding
@@ -49,9 +51,11 @@ set(OPENCL_SOURCES
 	backends/opencl/opencl_kernels_source.cpp
 )
 
+
 set(VULKAN_SOURCES
 	backends/vulkan/vulkan_backend.cpp
 )
+
 
 # ========================================
 # Build Library
@@ -81,6 +85,7 @@ add_library(octproengine SHARED
 	${TOOLS_SOURCES}
 	${BACKEND_SOURCES}
 )
+
 
 # Link libraries
 set(LINK_LIBRARIES)
@@ -161,10 +166,12 @@ set_target_properties(octproengine PROPERTIES
 	SOVERSION 1
 )
 
+
 # Define BUILD_OPE_LIBRARY when building the DLL (enables dllexport)
 target_compile_definitions(octproengine PRIVATE
 	BUILD_OPE_LIBRARY
 )
+
 
 # Define backend availability macros
 if(BUILD_CUDA)
@@ -250,6 +257,7 @@ install(TARGETS octproengine
 	ARCHIVE DESTINATION lib
 	RUNTIME DESTINATION bin
 )
+
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/
 	DESTINATION include/octproengine

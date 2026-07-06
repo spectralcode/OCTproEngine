@@ -8,7 +8,7 @@
 #include <chrono>
 #include <cstring>
 
-const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+const ope::Backend TEST_BACKEND = ope::Backend::VULKAN;
 
 // Simple test: Count A-scans with non-zero data in processed output
 void testProgressiveDataContent() {
@@ -48,8 +48,8 @@ void testProgressiveDataContent() {
 
 	// Add callback that counts A-scans with significant signal
 	const float SIGNAL_THRESHOLD = 0.1f;  // Threshold to distinguish signal from background
-	
-	processor.setOutputCallback([&](const ope::IOBuffer& buf) {
+
+	processor.addOutputCallback([&](const ope::IOBuffer& buf) {
 		uint64_t bufferId = buf.getBufferId();
 
 		const float* data = static_cast<const float*>(buf.getDataPointer());

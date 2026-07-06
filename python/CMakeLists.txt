@@ -42,16 +42,22 @@ if(NOT pybind11_FOUND)
 endif()
 
 # Create Python module with unique name
-pybind11_add_module(octproengine_python 
+pybind11_add_module(octproengine_python
 	octproengine_bindings.cpp
+	bindings/bindings_enums.cpp
+	bindings/bindings_backend.cpp
+	bindings/bindings_config.cpp
+	bindings/bindings_processor.cpp
+	bindings/bindings_recorder.cpp
 )
 
 # Link against the main C++ library
 target_link_libraries(octproengine_python PRIVATE octproengine)
 
 # Include directories
-target_include_directories(octproengine_python PRIVATE 
+target_include_directories(octproengine_python PRIVATE
 	${CMAKE_SOURCE_DIR}/include
+	${CMAKE_CURRENT_SOURCE_DIR}
 	${Python3_INCLUDE_DIRS}
 )
 

@@ -79,13 +79,25 @@ See [Jetson Build Instructions](documentation/BUILDING_JETSON.md) for NVIDIA Jet
 
 ### C++ Tests
 
+Functional tests (run from the repository root):
+
+```bash
+ctest --test-dir build -C Release -LE perf
+```
+
+Individual tests can also be run directly from `build/tests/Release/`.
+
+### C++ Performance Benchmark
+
+The benchmark prints its result table to the console and saves it as CSV, so run it directly:
+
 ```bash
 cd build/tests/Release
 
-test_backend_output_comparison
 test_performance_benchmark
-test_curve_functionality
 ```
+
+Performance tests carry the ctest label `perf`, which is what excludes them from the functional test run above.
 
 ### Python Tests
 
@@ -123,12 +135,12 @@ int main() {
     
     // Initialize
     processor.initialize();
-    
+
     // Set callback
-    processor.setOutputCallback([](const ope::IOBuffer& output) {
+    processor.addOutputCallback([](const ope::IOBuffer& output) {
         std::cout << "Processed " << output.getSizeInBytes() << " bytes" << std::endl;
     });
-    
+
     // Get buffer, fill with data, process
     ope::IOBuffer& buffer = processor.getNextAvailableInputBuffer();
     // ... fill buffer with your OCT data ...

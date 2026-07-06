@@ -99,7 +99,7 @@ int main() {
 	std::condition_variable cv;
 	bool outputReceived = false;
 
-	processor.setOutputCallback([&](const IOBuffer& output) {
+	processor.addOutputCallback([&](const IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(mtx);
 		outputReceived = true;
 		cv.notify_one();
