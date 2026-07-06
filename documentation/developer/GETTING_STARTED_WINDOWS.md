@@ -35,7 +35,7 @@ cd %USERPROFILE%\Documents
 Then clone the repo with:
 
 ```bat
-git clone --branch feature-consumer-queues https://github.com/spectralcode/OCTproEngine.git
+git clone https://github.com/spectralcode/OCTproEngine.git
 ```
 
 Then navigate into the project folder:
@@ -43,8 +43,6 @@ Then navigate into the project folder:
 ```bat
 cd OCTproEngine
 ```
-
-Note: This guide currently applies to the `feature-consumer-queues` branch, so the clone command above checks out that branch directly.
 
 ## 4. Build the project
 
