@@ -199,18 +199,15 @@ void testProcessorToolAttachment() {
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-	size_t initialRecordCount;
-	{
-		// Callbacks are still registered here, take the lock for a consistent read
-		std::lock_guard<std::mutex> lock(tool.recordMutex);
-		initialRecordCount = tool.recordedBuffers.size();
-	}
-	TEST_ASSERT(initialRecordCount > 0, "Tool should have recorded some buffers while attached");
-
-	// Detach
+	// Detach BEFORE taking the baseline count: detach joins the callback workers,
+	// which makes the count final (an in-flight callback could otherwise record
+	// between the snapshot and the detach and fail the equality check below)
 	tool.detach();
 	TEST_ASSERT(!tool.isAttached(), "Tool should not be attached after detach");
 	TEST_ASSERT(tool.getProcessor() == nullptr, "Processor should be nullptr after detach");
+
+	size_t initialRecordCount = tool.recordedBuffers.size();
+	TEST_ASSERT(initialRecordCount > 0, "Tool should have recorded some buffers while attached");
 
 	// Process more data. should not be recorded now!
 	auto& inputBuffer2 = processor.getNextAvailableInputBuffer();
