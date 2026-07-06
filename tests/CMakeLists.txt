@@ -54,6 +54,8 @@ add_ope_test(test_zerocopy_runtime test_zerocopy_runtime.cpp)
 add_ope_test(test_zerocopy_performance test_zerocopy_performance.cpp)
 add_ope_test(test_buffer_ordering_content test_buffer_ordering_content.cpp)
 add_ope_test(test_input_consumer test_input_consumer.cpp)
+add_ope_test(test_processor_teardown test_processor_teardown.cpp)
+set_tests_properties(test_processor_teardown PROPERTIES TIMEOUT 300)
 add_ope_test(test_consumer_performance_impact test_consumer_performance_impact.cpp)
 
 # Pure performance benchmarks: run with "ctest -L perf", excluded from the
