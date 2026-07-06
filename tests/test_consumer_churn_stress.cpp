@@ -70,8 +70,8 @@ int main() {
 
 	// Long-hold consumer: holds every 50th buffer for a few ms before releasing
 	// while the producer keeps cycling the pool. Covers the pattern of a slow
-	// consumer that keeps its reference during processing (previously exercised
-	// by test_drop_policy_performance's copy -> sleep -> release loop).
+	// real-world consumer that keeps its buffer reference while working on the
+	// data (get -> copy/process -> release).
 	ConsumerConfig holdCfg;
 	holdCfg.dropPolicy = DropPolicy::BLOCK;
 	holdCfg.maxQueueSize = 1;
