@@ -133,6 +133,15 @@ if(BUILD_VULKAN)
 
 	# Add glslang include directory for VkFFT
 	target_include_directories(octproengine PRIVATE ${GLSLANG_INCLUDE_DIRS})
+
+	# Delay-load the Vulkan loader on Windows (MSVC): vulkan-1.dll ships with
+	# GPU drivers and may be absent, and a hard import would then prevent the
+	# whole library from loading. Every Vulkan entry path checks for a usable
+	# loader first, so the delayed import is never resolved on such machines.
+	if(MSVC)
+		target_link_options(octproengine PRIVATE "/DELAYLOAD:vulkan-1.dll")
+		target_link_libraries(octproengine PRIVATE delayimp)
+	endif()
 endif()
 
 target_link_libraries(octproengine PUBLIC ${LINK_LIBRARIES})
