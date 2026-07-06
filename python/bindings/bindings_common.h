@@ -6,6 +6,8 @@
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 
+#include <memory>
+
 #include "processor.h"
 #include "processorconfiguration.h"
 #include "backendconfig.h"
@@ -153,6 +155,18 @@ public:
 
 	ProcessorWrapper(ope::Backend backend) : processor(backend) {}
 
+	~ProcessorWrapper() {
+		// Tear down the callback workers with the GIL released: python destroys
+		// this object while holding the GIL, but joining a callback worker
+		// requires the worker to finish (callback execution and the callback
+		// holder's GIL-taking deleter both need the GIL) - joining with the GIL
+		// held deadlocks. After this body the members (including the keepalive
+		// maps) destruct with the GIL held again, which is what they need.
+		py::gil_scoped_release release;
+		processor.clearOutputCallbacks();
+		processor.clearInputCallbacks();
+	}
+
 	void set_callback(py::function cb, py::object error_cb = py::none()) {
 		callback = cb;
 		if (!error_cb.is_none()) {
@@ -192,8 +206,17 @@ public:
 	}
 
 	ope::Processor::CallbackId add_output_callback(py::function cb) {
+		// Hold the Python callback through a shared_ptr whose deleter takes the
+		// GIL: the closure below is copied into a callback worker thread, and the
+		// last copy can be destroyed on that thread when it exits - destroying a
+		// py::function without holding the GIL crashes the interpreter
+		auto cbHolder = std::shared_ptr<py::function>(new py::function(cb), [](py::function* f) {
+			py::gil_scoped_acquire acquire;
+			delete f;
+		});
+
 		// Create C++ wrapper callback that handles GIL
-		auto wrappedCallback = [this, cb](const ope::IOBuffer& buffer) {
+		auto wrappedCallback = [this, cbHolder](const ope::IOBuffer& buffer) {
 			// Capture buffer ID immediately before buffer can be recycled
 			uint64_t bufferId = buffer.getBufferId();
 
@@ -207,7 +230,7 @@ public:
 				py::array output_array = buffer_to_numpy(buffer_ref, &processor.getConfig());
 
 				// Call Python callback with captured buffer ID
-				cb(output_array, bufferId);
+				(*cbHolder)(output_array, bufferId);
 
 			} catch (const py::error_already_set& e) {
 				// Python exception
@@ -266,8 +289,15 @@ public:
 
 	// Input callback methods (for raw data before processing)
 	ope::Processor::CallbackId add_input_callback(py::function cb) {
+		// Hold the Python callback through a shared_ptr whose deleter takes the
+		// GIL, see add_output_callback for the rationale
+		auto cbHolder = std::shared_ptr<py::function>(new py::function(cb), [](py::function* f) {
+			py::gil_scoped_acquire acquire;
+			delete f;
+		});
+
 		// Create C++ wrapper callback that handles GIL
-		auto wrappedCallback = [this, cb](const ope::IOBuffer& buffer) {
+		auto wrappedCallback = [this, cbHolder](const ope::IOBuffer& buffer) {
 			// Capture buffer ID immediately before buffer can be recycled
 			uint64_t bufferId = buffer.getBufferId();
 
@@ -280,7 +310,7 @@ public:
 				py::array input_array = buffer_to_numpy(buffer_ref, &processor.getConfig());
 
 				// Call Python callback with captured buffer ID
-				cb(input_array, bufferId);
+				(*cbHolder)(input_array, bufferId);
 
 			} catch (const py::error_already_set& e) {
 				// Python exception
