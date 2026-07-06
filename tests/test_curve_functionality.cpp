@@ -135,10 +135,8 @@ struct ProcessingResult {
 bool processData(ope::Processor& processor, const std::vector<uint16_t>& testData, ProcessingResult& result) {
 	result.reset();
 
-	// The callback must be removed after the capture: addOutputCallback()
-	// accumulates, so a leftover callback would overwrite this result again
-	// on every later frame and before/after comparisons would compare a
-	// frame with itself
+	// Registered only for this capture and removed again below, so results of
+	// different processData() calls stay independent
 	ope::Processor::CallbackId callbackId = processor.addOutputCallback([&result](const ope::IOBuffer& output) {
 		std::lock_guard<std::mutex> lock(result.mutex);
 
