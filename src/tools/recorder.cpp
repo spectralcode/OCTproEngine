@@ -332,15 +332,14 @@ void Recorder::abortRecording() {
 	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Wait for any in-flight callbacks
 
-	this->rawData.clear();
-	this->processedData.clear();
-	this->rawBufferIds.clear();
-	this->processedBufferIds.clear();
-
-	// The storage was just cleared, so the next recording must allocate again.
-	// Without this, startRecording() would skip allocateBuffers() and the
-	// collectors would write into the emptied vectors.
-	this->buffersAllocated = false;
+	// Discarding follows the same storage policy as normal completion:
+	// automatic allocation frees the buffers, manual allocation keeps them
+	// sized for reuse. Deliberately no clear() on the vectors: a cleared
+	// vector reports size 0 while startRecording() would skip reallocation,
+	// so the next recording's summary would lose its buffer IDs.
+	if (!this->manualAllocation) {
+		this->freeBuffersInternal();
+	}
 
 	this->rawBuffersRecorded = 0;
 	this->processedBuffersRecorded = 0;

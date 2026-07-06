@@ -159,39 +159,49 @@ def test_restart_cycles():
 
 
 def test_abort_then_record():
-	"""abortRecording() discards cleanly and the next recording is complete"""
+	"""abortRecording() discards cleanly and the next recording is complete,
+	in both allocation modes (abort frees auto storage, keeps manual storage)"""
 	print("\nTesting abort followed by a clean recording...")
 
 	frames = 32
-	proc = make_processor()
-	try:
-		rec = ope.Recorder()
-		rec.attach_to_processor(proc)
-		rec.set_mode(ope.RecorderMode.BOTH)
-		rec.set_buffer_count(frames)
-		rec.set_use_timestamp(False)
-		rec.set_output_base_name("modes_abort")
-
+	for manual in (False, True):
+		label = "manual" if manual else "auto"
+		proc = make_processor()
 		try:
-			rec.start_recording()
-			pump(proc, 8)  # far fewer than requested
-			rec.abort_recording()
-			assert not rec.is_recording(), "still recording after abort"
+			rec = ope.Recorder()
+			rec.attach_to_processor(proc)
+			rec.set_mode(ope.RecorderMode.BOTH)
+			rec.set_manual_allocation(manual)
+			rec.set_buffer_count(frames)
+			rec.set_use_timestamp(False)
+			rec.set_output_base_name("modes_abort")
+			if manual:
+				rec.allocate_buffers()
 
-			rec.set_output_base_name("modes_after_abort")
-			rec.start_recording()
-			pump(proc, frames + 2)
-			assert rec.wait_for_completion(15000), f"after abort: {rec.get_last_error()}"
-			summary = rec.get_last_recording_summary()
-			assert summary.raw_recorded == frames and summary.processed_recorded == frames, \
-				f"after abort: raw {summary.raw_recorded} processed {summary.processed_recorded}"
-			assert_sequential_pairs(summary, frames, both_mode=True)
+			try:
+				rec.start_recording()
+				pump(proc, 8)  # far fewer than requested
+				rec.abort_recording()
+				assert not rec.is_recording(), f"{label}: still recording after abort"
+				if manual:
+					assert rec.is_allocated(), f"{label}: manual storage should survive the abort"
+				else:
+					assert not rec.is_allocated(), f"{label}: auto storage should be freed on abort"
+
+				rec.set_output_base_name("modes_after_abort")
+				rec.start_recording()
+				pump(proc, frames + 2)
+				assert rec.wait_for_completion(15000), f"{label} after abort: {rec.get_last_error()}"
+				summary = rec.get_last_recording_summary()
+				assert summary.raw_recorded == frames and summary.processed_recorded == frames, \
+					f"{label} after abort: raw {summary.raw_recorded} processed {summary.processed_recorded}"
+				assert_sequential_pairs(summary, frames, both_mode=True)
+			finally:
+				delete_test_files("modes_abort_raw.raw", "modes_abort.raw",
+				                  "modes_after_abort_raw.raw", "modes_after_abort.raw")
 		finally:
-			delete_test_files("modes_abort_raw.raw", "modes_abort.raw",
-			                  "modes_after_abort_raw.raw", "modes_after_abort.raw")
-	finally:
-		proc.stop()
-	print("  [OK] recording after abort is complete and paired")
+			proc.stop()
+		print(f"  [OK] {label} allocation: recording after abort is complete and paired")
 
 
 if __name__ == "__main__":
