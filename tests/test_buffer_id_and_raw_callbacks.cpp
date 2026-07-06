@@ -92,6 +92,10 @@ void testBufferIdPropagation() {
 	// Wait for processing to complete
 	std::this_thread::sleep_for(std::chrono::milliseconds(1750));
 
+	// Detach before reading the results: this joins the callback worker threads,
+	// so the reads below are properly synchronized with the callback writes
+	recorder.detach();
+
 	// Verify results
 	std::cout << "  Recorded " << recorder.recordedBuffers.size() << " buffers" << std::endl;
 
@@ -195,7 +199,12 @@ void testProcessorToolAttachment() {
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-	size_t initialRecordCount = tool.recordedBuffers.size();
+	size_t initialRecordCount;
+	{
+		// Callbacks are still registered here, take the lock for a consistent read
+		std::lock_guard<std::mutex> lock(tool.recordMutex);
+		initialRecordCount = tool.recordedBuffers.size();
+	}
 	TEST_ASSERT(initialRecordCount > 0, "Tool should have recorded some buffers while attached");
 
 	// Detach

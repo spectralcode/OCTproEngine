@@ -53,7 +53,8 @@ public:
 	 * @brief Set callback for buffer release
 	 * Called when refCount reaches 0
 	 * - For output buffers: Returns buffer to backend pool
-	 * - For input buffers: Triggers backend processing
+	 * - For input buffers: no callback is installed; producer-side reuse is
+	 *   gated via waitUntilReleased() instead
 	 */
 	void setReleaseCallback(ReleaseCallback callback);
 

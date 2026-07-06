@@ -110,7 +110,6 @@ PerformanceResult runPerformanceTest(
 
 	// Add input consumers (DROP_OLDEST)
 	std::vector<ope::ConsumerId> inputConsumers;
-	inputConsumers.reserve(numInputConsumers); // threads index this vector, no reallocation allowed
 	std::vector<std::atomic<int>> inputReceivedCounts(numInputConsumers);
 	std::atomic<bool> doneInput{false};
 	std::vector<std::thread> inputThreads;
@@ -121,22 +120,25 @@ PerformanceResult runPerformanceTest(
 		ope::ConsumerConfig consumerConfig;
 		consumerConfig.dropPolicy = ope::DropPolicy::DROP_OLDEST;
 		consumerConfig.maxQueueSize = 2;
-		inputConsumers.push_back(processor.addInputConsumer(consumerConfig));
+		// Capture the ID by value: the vector is only for cleanup on the main
+		// thread, threads must not access a container the main thread mutates
+		ope::ConsumerId inputConsumerId = processor.addInputConsumer(consumerConfig);
+		inputConsumers.push_back(inputConsumerId);
 
-		inputThreads.emplace_back([&, c]() {
+		inputThreads.emplace_back([&, c, inputConsumerId]() {
 			while (!doneInput.load()) {
-				ope::IOBuffer* input = processor.getNextInputBuffer(inputConsumers[c]);
+				ope::IOBuffer* input = processor.getNextInputBuffer(inputConsumerId);
 				if (!input) break;
 
 				// Copy data (simulates real consumer work)
 				//std::memcpy(inputCopyBuffers[c].data(), input->getDataPointer(), inputSize * sizeof(uint16_t));
-				processor.releaseInputBuffer(inputConsumers[c], input);
+				processor.releaseInputBuffer(inputConsumerId, input);
 
 				// Simulate slow consumer if requested
 				if (slowConsumers) {
 					std::this_thread::sleep_for(std::chrono::microseconds(CONSUMER_DELAY_US));
 				}
-				
+
 				inputReceivedCounts[c]++;
 			}
 		});
@@ -144,7 +146,6 @@ PerformanceResult runPerformanceTest(
 
 	// Add output consumers (DROP_OLDEST)
 	std::vector<ope::ConsumerId> outputConsumers;
-	outputConsumers.reserve(numOutputConsumers); // threads index this vector, no reallocation allowed
 	std::vector<std::atomic<int>> outputReceivedCounts(numOutputConsumers);
 	std::atomic<bool> doneOutput{false};
 	std::vector<std::thread> outputThreads;
@@ -155,23 +156,26 @@ PerformanceResult runPerformanceTest(
 		ope::ConsumerConfig consumerConfig;
 		consumerConfig.dropPolicy = ope::DropPolicy::DROP_OLDEST;
 		consumerConfig.maxQueueSize = 2;
-		outputConsumers.push_back(processor.addConsumer(consumerConfig));
+		// Capture the ID by value: the vector is only for cleanup on the main
+		// thread, threads must not access a container the main thread mutates
+		ope::ConsumerId outputConsumerId = processor.addConsumer(consumerConfig);
+		outputConsumers.push_back(outputConsumerId);
 
-		outputThreads.emplace_back([&, c]() {
+		outputThreads.emplace_back([&, c, outputConsumerId]() {
 			while (!doneOutput.load()) {
-				ope::IOBuffer* output = processor.getNextOutputBuffer(outputConsumers[c]);
+				ope::IOBuffer* output = processor.getNextOutputBuffer(outputConsumerId);
 				if (!output) break;
 
 				// Copy data (simulates real consumer work)
 				//std::memcpy(outputCopyBuffers[c].data(), output->getDataPointer(), outputBufferSize);
-				processor.releaseOutputBuffer(outputConsumers[c], output);
+				processor.releaseOutputBuffer(outputConsumerId, output);
 
 				// Simulate slow consumer if requested
 				if (slowConsumers) {
 					std::this_thread::sleep_for(std::chrono::microseconds(CONSUMER_DELAY_US));
 				}
 
-				
+
 				outputReceivedCounts[c]++;
 			}
 		});

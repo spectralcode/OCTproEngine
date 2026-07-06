@@ -130,7 +130,6 @@ bool test_multiple_input_consumers() {
 	const int NUM_CONSUMERS = 2;
 	const int TEST_FRAMES = 50;  // Reduced to avoid overwhelming the system
 	std::vector<ope::ConsumerId> consumers;
-	consumers.reserve(NUM_CONSUMERS); // threads index this vector, no reallocation allowed
 	std::vector<std::atomic<int>> receivedCounts(NUM_CONSUMERS);
 	std::atomic<bool> stopThreads{false};
 	std::vector<std::thread> threads;
@@ -140,11 +139,14 @@ bool test_multiple_input_consumers() {
 		ope::ConsumerConfig config;
 		config.dropPolicy = ope::DropPolicy::DROP_OLDEST;  // Use DROP_OLDEST to avoid blocking
 		config.maxQueueSize = 5;
-		consumers.push_back(processor.addInputConsumer(config));
+		// Capture the ID by value: the vector is only for cleanup on the main
+		// thread, threads must not access a container the main thread mutates
+		ope::ConsumerId consumerId = processor.addInputConsumer(config);
+		consumers.push_back(consumerId);
 
-		threads.emplace_back([&, c]() {
+		threads.emplace_back([&, c, consumerId]() {
 			while (!stopThreads.load()) {
-				ope::IOBuffer* inputBuf = processor.getNextInputBuffer(consumers[c]);
+				ope::IOBuffer* inputBuf = processor.getNextInputBuffer(consumerId);
 				if (!inputBuf) break;
 
 				// Read data (simulates display or recording)
@@ -152,7 +154,7 @@ bool test_multiple_input_consumers() {
 				volatile uint16_t dummy = data[0];  // Read first sample
 
 				receivedCounts[c]++;
-				processor.releaseInputBuffer(consumers[c], inputBuf);
+				processor.releaseInputBuffer(consumerId, inputBuf);
 			}
 		});
 	}
@@ -296,7 +298,6 @@ bool test_input_data_integrity() {
 
 	const int NUM_CONSUMERS = 3;
 	std::vector<ope::ConsumerId> consumers;
-	consumers.reserve(NUM_CONSUMERS); // threads index this vector, no reallocation allowed
 	std::vector<std::vector<uint16_t>> receivedData(NUM_CONSUMERS);
 	std::atomic<bool> stopThreads{false};
 	std::vector<std::thread> threads;
@@ -308,22 +309,25 @@ bool test_input_data_integrity() {
 		ope::ConsumerConfig config;
 		config.dropPolicy = ope::DropPolicy::BLOCK;
 		config.maxQueueSize = 10;
-		consumers.push_back(processor.addInputConsumer(config));
+		// Capture the ID by value: the vector is only for cleanup on the main
+		// thread, threads must not access a container the main thread mutates
+		ope::ConsumerId consumerId = processor.addInputConsumer(config);
+		consumers.push_back(consumerId);
 
-		threads.emplace_back([&, c]() {
+		threads.emplace_back([&, c, consumerId]() {
 			// Read only first frame for comparison
-			ope::IOBuffer* inputBuf = processor.getNextInputBuffer(consumers[c]);
+			ope::IOBuffer* inputBuf = processor.getNextInputBuffer(consumerId);
 			if (inputBuf) {
 				const uint16_t* data = static_cast<const uint16_t*>(inputBuf->getDataPointer());
 				receivedData[c].assign(data, data + expectedSize);
-				processor.releaseInputBuffer(consumers[c], inputBuf);
+				processor.releaseInputBuffer(consumerId, inputBuf);
 			}
 
 			// Drain remaining frames
 			while (!stopThreads.load()) {
-				ope::IOBuffer* buf = processor.getNextInputBuffer(consumers[c]);
+				ope::IOBuffer* buf = processor.getNextInputBuffer(consumerId);
 				if (!buf) break;
-				processor.releaseInputBuffer(consumers[c], buf);
+				processor.releaseInputBuffer(consumerId, buf);
 			}
 		});
 	}
