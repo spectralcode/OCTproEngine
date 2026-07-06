@@ -1,3 +1,15 @@
+# Performance Tests
+
+All performance tests carry the ctest label `perf` (which excludes them from the
+functional test run, `ctest --test-dir build -C Release -LE perf`). They print their
+results to the console, so run them directly from `build/tests/Release/`:
+
+- **test_performance_benchmark** - cross-backend throughput over a signal-length/A-scan grid, also saves the results as CSV
+- **test_consumer_performance_impact** - impact of input/output consumers and drop policies on the processing rate
+- **test_zerocopy_performance** - CUDA zero-copy vs pinned memory transfer (mainly relevant on Jetson)
+
+---
+
 # Performance Benchmark 
 2025-11-30  
 

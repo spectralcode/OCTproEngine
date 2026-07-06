@@ -79,20 +79,25 @@ See [Jetson Build Instructions](documentation/BUILDING_JETSON.md) for NVIDIA Jet
 
 ### C++ Tests
 
-Functional tests (from the build directory):
+Functional tests (run from the repository root):
 
 ```bash
-cd build
-ctest -C Release -LE perf
-```
-
-Performance benchmarks:
-
-```bash
-ctest -C Release -L perf
+ctest --test-dir build -C Release -LE perf
 ```
 
 Individual tests can also be run directly from `build/tests/Release/`.
+
+### C++ Performance Benchmark
+
+The benchmark prints its result table to the console and saves it as CSV, so run it directly:
+
+```bash
+cd build/tests/Release
+
+test_performance_benchmark
+```
+
+Performance tests carry the ctest label `perf`, which is what excludes them from the functional test run above.
 
 ### Python Tests
 
