@@ -1,5 +1,8 @@
 #include "cpu_backend.h"
 #include "cpu_kernels.h"
+#define POCKETFFT_CACHE_SIZE 8
+#define POCKETFFT_NO_MULTITHREADING
+#include "pocketfft_hdronly.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -52,10 +55,10 @@ struct CpuBackend::Impl {
 	std::thread processingThread;
 	std::atomic<bool> stopProcessing;
 	
-	// FFTW plans and buffers
-	fftwf_complex* fftIn;
-	fftwf_complex* fftOut;
-	fftwf_plan fftPlan;
+	// Reuse the transform metadata and PocketFFT's cached plans across A-scans.
+	pocketfft::shape_t fftShape;
+	const pocketfft::shape_t fftAxes{0};
+	const pocketfft::stride_t fftStride{sizeof(std::complex<float>)};
 
 	// Storage for per-buffer IFFT outputs when post-processing requires whole-buffer context
 	std::vector<std::vector<std::complex<float>>> allIfftOutputs;
@@ -102,14 +105,16 @@ struct CpuBackend::Impl {
 	std::vector<std::complex<float>> ifftOutput;
 	std::vector<float> processedAscan;
 
+	void computeIFFT() {
+		pocketfft::c2c(fftShape, fftStride, fftStride, fftAxes, pocketfft::BACKWARD,
+			linearizedSpectrum.data(), ifftOutput.data(), 1.0f, 1);
+	}
+
 	// Compute Fixed-pattern noise helper
 	void computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans);
 	
 	Impl() 
 		: currentOutputBuffer(0)
-		, fftIn(nullptr)
-		, fftOut(nullptr)
-		, fftPlan(nullptr)
 		, stopProcessing(false)
 		, numInputBuffers(2)  // default: 2 buffers (ping-pong)
 		, postProcessBackgroundRecordingRequested(false)
@@ -120,16 +125,6 @@ struct CpuBackend::Impl {
 		if (this->processingThread.joinable()) {
 			this->workQueueCV.notify_one();
 			this->processingThread.join();
-		}
-		
-		if (this->fftPlan) {
-			fftwf_destroy_plan(this->fftPlan);
-		}
-		if (this->fftIn) {
-			fftwf_free(this->fftIn);
-		}
-		if (this->fftOut) {
-			fftwf_free(this->fftOut);
 		}
 	}
 
@@ -320,13 +315,7 @@ struct CpuBackend::Impl {
 			}
 			
 			// 6. IFFT
-			cpu_kernels::computeIFFT<float>(
-				this->linearizedSpectrum,
-				this->ifftOutput,
-				this->fftPlan,
-				this->fftIn,
-				this->fftOut
-			);
+			this->computeIFFT();
 
 			// 6.5 Post-FFT frame correction: divide by sqrt of the pre-subtraction spectral average
 			if (frameCorrectionActive) {
@@ -609,26 +598,7 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	
 	int signalLength = config.dataParams.signalLength;
 	
-	// Allocate FFTW buffers
-	this->impl->fftIn = fftwf_alloc_complex(signalLength);
-	this->impl->fftOut = fftwf_alloc_complex(signalLength);
-	
-	if (!this->impl->fftIn || !this->impl->fftOut) {
-		throw std::runtime_error("Failed to allocate FFTW buffers");
-	}
-	
-	// Create FFTW plan for IFFT
-	this->impl->fftPlan = fftwf_plan_dft_1d(
-		signalLength,
-		this->impl->fftIn,
-		this->impl->fftOut,
-		FFTW_BACKWARD,
-		FFTW_ESTIMATE
-	);
-	
-	if (!this->impl->fftPlan) {
-		throw std::runtime_error("Failed to create FFTW plan");
-	}
+	this->impl->fftShape = {static_cast<size_t>(signalLength)};
 	
 	// Allocate output buffers
 	size_t outputSize = (config.dataParams.samplesPerBuffer() / 2) * sizeof(float);
@@ -666,6 +636,11 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->ifftOutput.resize(signalLength);
 	this->impl->processedAscan.resize(signalLength / 2);
 
+	// Warm the plan cache before starting the worker. The inverse is unnormalized.
+	std::fill(this->impl->linearizedSpectrum.begin(), this->impl->linearizedSpectrum.end(),
+		std::complex<float>(0.0f, 0.0f));
+	this->impl->computeIFFT();
+
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
 		this->impl->postProcessBackgroundProfile = config.getBackgroundProfile();
@@ -695,20 +670,6 @@ void CpuBackend::cleanup() {
 	
 	if (this->impl->processingThread.joinable()) {
 		this->impl->processingThread.join();
-	}
-	
-	// Release FFTW resources
-	if (this->impl->fftPlan) {
-		fftwf_destroy_plan(this->impl->fftPlan);
-		this->impl->fftPlan = nullptr;
-	}
-	if (this->impl->fftIn) {
-		fftwf_free(this->impl->fftIn);
-		this->impl->fftIn = nullptr;
-	}
-	if (this->impl->fftOut) {
-		fftwf_free(this->impl->fftOut);
-		this->impl->fftOut = nullptr;
 	}
 	
 	// Release output buffers

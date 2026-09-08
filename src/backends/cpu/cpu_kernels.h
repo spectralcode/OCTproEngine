@@ -58,15 +58,6 @@ void applyWindow(
 );
 
 template <typename T>
-void computeIFFT(
-	const std::vector<std::complex<T>>& input,
-	std::vector<std::complex<T>>& output,
-	void* fftPlan,
-	void* fftIn,
-	void* fftOut
-);
-
-template <typename T>
 void logScaleAndTruncate(
 	const std::vector<std::complex<T>>& input,
 	std::vector<T>& output,

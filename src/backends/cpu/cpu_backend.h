@@ -2,7 +2,6 @@
 #define OPE_CPU_BACKEND_H
 
 #include "../backend_interface.h"
-#include "fftw3.h"
 #include <memory>
 #include <vector>
 #include <complex>

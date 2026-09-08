@@ -13,13 +13,13 @@ function(copy_required_dlls_to_dir TARGET_NAME DEST_DIR)
 		COMMENT "Copying octproengine.dll"
 	)
 
-	# Copy FFTW DLL if building with CPU backend
-	if(BUILD_CPU AND FFTW3_DLL)
+	# Include the bundled CPU FFT license with redistributed binaries.
+	if(BUILD_CPU)
 		add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${FFTW3_DLL}"
-				${DEST_DIR}
-			COMMENT "Copying FFTW DLL"
+				"${CMAKE_SOURCE_DIR}/thirdparty/pocketfft/LICENSE.md"
+				"${DEST_DIR}/LICENSE-pocketfft.txt"
+			COMMENT "Copying PocketFFT license"
 		)
 	endif()
 
@@ -94,13 +94,13 @@ function(copy_required_dlls TARGET_NAME)
 		COMMENT "Copying octproengine.dll to ${TARGET_NAME} directory"
 	)
 
-	# Copy FFTW DLL if building with CPU backend
-	if(BUILD_CPU AND FFTW3_DLL)
+	# Include the bundled CPU FFT license with redistributed binaries.
+	if(BUILD_CPU)
 		add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				"${FFTW3_DLL}"
-				$<TARGET_FILE_DIR:${TARGET_NAME}>
-			COMMENT "Copying FFTW DLL to ${TARGET_NAME} directory"
+				"${CMAKE_SOURCE_DIR}/thirdparty/pocketfft/LICENSE.md"
+				"$<TARGET_FILE_DIR:${TARGET_NAME}>/LICENSE-pocketfft.txt"
+			COMMENT "Copying PocketFFT license to ${TARGET_NAME} directory"
 		)
 	endif()
 

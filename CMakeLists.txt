@@ -21,7 +21,6 @@ option(BUILD_PYTHON "Build Python bindings" OFF)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TOOLS "Build optional ProcessorTools (Recorder, etc.)" ON)
-option(FFTW3_AUTO_DOWNLOAD "Automatically download FFTW3 to thirdparty/fftw if not found (Windows only)" ON)
 option(VKFFT_AUTO_DOWNLOAD "Automatically download VkFFT to thirdparty/vkfft if not found" ON)
 
 # C++ standard
@@ -54,13 +53,6 @@ endif()
 
 if(NOT BUILD_CUDA)
 	message(STATUS "Building without CUDA backend")
-endif()
-
-# Find FFTW3 (only needed for CPU backend)
-if(BUILD_CPU)
-	find_package(FFTW3 REQUIRED)
-else()
-	message(STATUS "Building without CPU backend - FFTW3 not required")
 endif()
 
 # Find OpenCL and VkFFT (only needed for OpenCL backend)

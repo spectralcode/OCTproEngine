@@ -88,43 +88,7 @@ REM Create build directory
 if not exist "build" mkdir build
 cd build
 
-REM Check if FFTW already exists
-if exist "..\thirdparty\fftw\libfftw3f-3.dll" (
-	echo FFTW3 found in thirdparty folder
-	set FFTW_DOWNLOAD_FLAG=
-	goto :viewer_option_start
-)
-
-REM Ask user if they want to download FFTW
-echo.
-echo ========================================
-echo FFTW3 not found
-echo ========================================
-echo.
-echo FFTW3 is required to build the CPU backend build this project.
-echo.
-echo Option 1: Auto-download FFTW3 from https://fftw.org
-echo           Download size: ~2 MB
-echo           Location: thirdparty/fftw/
-echo.
-echo Option 2: Download manually later and place in thirdparty/fftw/
-echo.
-set /p "DOWNLOAD_CHOICE=Do you want to auto-download FFTW3 now? (Y/N): "
-
-if /i "%DOWNLOAD_CHOICE%"=="Y" (
-	set FFTW_DOWNLOAD_FLAG=-DFFTW3_AUTO_DOWNLOAD=ON
-	echo.
-	echo Auto-download enabled
-	echo.
-) else (
-	set FFTW_DOWNLOAD_FLAG=-DFFTW3_AUTO_DOWNLOAD=OFF
-	echo.
-	echo Auto-download disabled. Please download FFTW3 manually.
-	echo.
-)
-
 REM Ask if OCTproViewer should be built
-:viewer_option_start
 echo.
 echo ========================================
 echo OCTproViewer (ImGui app)
@@ -146,9 +110,9 @@ echo.
 
 :configure
 
-REM Configure (FFTW will auto-download to thirdparty/fftw if user said yes)
+REM Configure (the CPU backend uses bundled PocketFFT)
 echo Configuring CMake...
-cmake .. %FFTW_DOWNLOAD_FLAG% -DBUILD_PYTHON=%BUILD_PYTHON% -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DBUILD_OCT_VIEWER=%BUILD_OCT_VIEWER% -DCMAKE_BUILD_TYPE=Release
+cmake .. -DBUILD_PYTHON=%BUILD_PYTHON% -DBUILD_CUDA=ON -DBUILD_OPENCL=ON -DBUILD_OCT_VIEWER=%BUILD_OCT_VIEWER% -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 (
 	echo.
 	echo ERROR: CMake configuration failed!

@@ -18,7 +18,7 @@ Optional:
 
 Notes:
 - On the Microsoft page above, use the `Build Tools` bootstrapper, or install Visual Studio 2022 with `Desktop development with C++`.
-- FFTW3 is needed for the CPU backend, but on Windows the build script can download it for you.
+- The CPU backend uses bundled PocketFFT; no separate FFT library installation is needed.
 - OpenCL is often already available through your GPU driver, so no separate OpenCL install is needed in many cases.
 - If CUDA, OpenCL, or Vulkan are missing, CMake will disable those backends automatically.
 
@@ -54,7 +54,6 @@ build_windows.bat
 
 Recommended answers:
 - `Build Python bindings?` -> `Y` if you want to run the Python example
-- `Auto-download FFTW3?` -> `Y` if asked
 - `Build OCTproViewer?` -> `Y` if you want the ImGui app
 
 When it works, the script prints `Build completed successfully!`.

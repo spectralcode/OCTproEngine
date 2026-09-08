@@ -16,7 +16,6 @@
 #include <numeric>
 #include <cstring>
 #include <limits>
-#include "fftw3.h"
 
 namespace ope {
 namespace cpu_kernels {
@@ -231,70 +230,6 @@ void applyWindow(
 {
 	for (size_t i = 0; i < data.size(); ++i) {
 		data[i] *= windowFunction[i];
-	}
-}
-
-// Specialization for float using fftwf
-template <>
-inline void computeIFFT<float>(
-	const std::vector<std::complex<float>>& input,
-	std::vector<std::complex<float>>& output,
-	void* fftPlan,
-	void* fftIn,
-	void* fftOut)
-{
-	fftwf_plan plan = static_cast<fftwf_plan>(fftPlan);
-	fftwf_complex* in = static_cast<fftwf_complex*>(fftIn);
-	fftwf_complex* out = static_cast<fftwf_complex*>(fftOut);
-	
-	size_t samplesPerSpectrum = input.size();
-	
-	// Copy input data to FFTW input array
-	for (size_t i = 0; i < samplesPerSpectrum; ++i) {
-		in[i][0] = input[i].real();
-		in[i][1] = input[i].imag();
-	}
-
-	// Execute the IFFT
-	fftwf_execute(plan);
-
-	// Normalize and copy output data
-	output.resize(samplesPerSpectrum);
-	float normFactor = static_cast<float>(1) / static_cast<float>(samplesPerSpectrum);
-	for (size_t i = 0; i < samplesPerSpectrum; ++i) {
-		output[i] = std::complex<float>(out[i][0], out[i][1]);// * normFactor;
-	}
-}
-
-// Specialization for double using fftw
-template <>
-inline void computeIFFT<double>(
-	const std::vector<std::complex<double>>& input,
-	std::vector<std::complex<double>>& output,
-	void* fftPlan,
-	void* fftIn,
-	void* fftOut)
-{
-	fftw_plan plan = static_cast<fftw_plan>(fftPlan);
-	fftw_complex* in = static_cast<fftw_complex*>(fftIn);
-	fftw_complex* out = static_cast<fftw_complex*>(fftOut);
-	
-	size_t samplesPerSpectrum = input.size();
-	
-	// Copy input data to FFTW input array
-	for (size_t i = 0; i < samplesPerSpectrum; ++i) {
-		in[i][0] = input[i].real();
-		in[i][1] = input[i].imag();
-	}
-
-	// Execute the IFFT
-	fftw_execute(plan);
-
-	// Normalize and copy output data
-	output.resize(samplesPerSpectrum);
-	double normFactor = static_cast<double>(1) / static_cast<double>(samplesPerSpectrum);
-	for (size_t i = 0; i < samplesPerSpectrum; ++i) {
-		output[i] = std::complex<double>(out[i][0], out[i][1]);// * normFactor;
 	}
 }
 

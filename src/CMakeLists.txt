@@ -91,7 +91,14 @@ add_library(octproengine SHARED
 set(LINK_LIBRARIES)
 
 if(BUILD_CPU)
-	list(APPEND LINK_LIBRARIES FFTW3::fftw3f)
+	target_include_directories(octproengine PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty/pocketfft)
+	add_custom_command(TARGET octproengine POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"${CMAKE_SOURCE_DIR}/thirdparty/pocketfft/LICENSE.md"
+			"$<TARGET_FILE_DIR:octproengine>/LICENSE-pocketfft.txt"
+	)
+	install(FILES ${CMAKE_SOURCE_DIR}/thirdparty/pocketfft/LICENSE.md
+		DESTINATION share/licenses/octproengine RENAME LICENSE-pocketfft.txt)
 endif()
 
 if(BUILD_CUDA)

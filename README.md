@@ -9,7 +9,7 @@ Preliminary results: [Performance Benchmark](documentation/developer/PERFORMANCE
 
 - **CMake** ≥ 3.18
 - **CUDA Toolkit** ≥ 11.0 (optional, for CUDA backend)
-- **FFTW3** (optional, for CPU backend)
+- **PocketFFT** (bundled, for CPU backend)
 - **OpenCL** (optional, for OpenCL backend)
 	- VkFFT
 - **Vulkan SDK** (optional, for Vulkan backend)
@@ -62,7 +62,7 @@ Here is a list of all available build options:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `BUILD_CUDA` | `ON` | Build with CUDA backend support |
-| `BUILD_CPU` | `ON` | Build with CPU backend (requires FFTW3) |
+| `BUILD_CPU` | `ON` | Build with CPU backend (uses bundled PocketFFT) |
 | `BUILD_OPENCL` | `ON` | Build with OpenCL backend (requires VkFFT) |
 | `BUILD_VULKAN` | `ON` | Build with Vulkan backend (requires Vulkan SDK, VkFFT) |
 | `BUILD_PYTHON` | `OFF` | Build Python bindings (requires pybind11, NumPy) |
@@ -70,7 +70,6 @@ Here is a list of all available build options:
 | `BUILD_EXAMPLES` | `ON` | Build example applications |
 | `BUILD_TOOLS` | `ON` | Build optional ProcessorTools (Recorder, etc.) |
 | `BUILD_OCT_VIEWER` | `OFF` | Build interactive OCTproViewer with ImGui (auto-downloads GLFW & ImGui) |
-| `FFTW3_AUTO_DOWNLOAD` | `ON` | Auto-download FFTW3 if not found (Windows only) |
 | `VKFFT_AUTO_DOWNLOAD` | `ON` | Auto-download VkFFT if not found |
 
 **Note:** At least one backend (`BUILD_CUDA`, `BUILD_CPU`, `BUILD_OPENCL`, or `BUILD_VULKAN`) must be enabled.

@@ -13,8 +13,8 @@ Python examples live in [python/examples/](../python/examples/).
 ## Building
 
 ```bash
-# Configure with examples enabled and FFTW auto-download enabled
-cmake .. -DBUILD_EXAMPLES=ON -DBUILD_OCT_VIEWER=ON -DCMAKE_BUILD_TYPE=Release -DFFTW3_AUTO_DOWNLOAD=ON
+# Configure with examples enabled (PocketFFT is bundled)
+cmake .. -DBUILD_EXAMPLES=ON -DBUILD_OCT_VIEWER=ON -DCMAKE_BUILD_TYPE=Release
 
 # Build all
 cmake --build . --config Release

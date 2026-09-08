@@ -42,7 +42,8 @@ python/tests/*.csv
 /*.csv
 
 # Third-party components
-thirdparty/
+thirdparty/*
+!thirdparty/pocketfft/
 
 # OS junk
 Thumbs.db
