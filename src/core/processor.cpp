@@ -127,10 +127,7 @@ public:
 
 					// Apply CPU settings from config
 					const auto* cpuConfig = static_cast<const CpuConfig*>(this->backendConfig.get());
-					// todo: think if it makes sense to add these settings to backend interface
-					// could be used to configure CPU FFT multi-threading, SIMD optimizations, etc.
-					// cpuBackend->setNumThreads(cpuConfig->numThreads);
-					// cpuBackend->setEnableSimd(cpuConfig->enableSimd);
+					cpuBackend->setNumThreads(cpuConfig->numThreads);
 
 					this->backend = std::move(cpuBackend);
 				}

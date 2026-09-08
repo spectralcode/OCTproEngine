@@ -110,7 +110,7 @@ public:
 // CPU backend configuration
 class OPE_API CpuConfig : public BackendConfig {
 public:
-	int numThreads; //todo: currently not used, but could be fun to play around with CPU FFT threading, SIMD optimizations, etc.
+	int numThreads; // PocketFFT thread limit: 0 = auto, 1 = single-threaded
 	bool enableSimd; //todo: only as a reminder here. use it or remove it!
 
 	CpuConfig() : numThreads(0), enableSimd(true) {}  // 0 = auto-detect

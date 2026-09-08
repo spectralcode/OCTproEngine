@@ -10,6 +10,35 @@ results to the console, so run them directly from `build/tests/Release/`:
 
 ---
 
+# CPU FFT: FFTW to PocketFFT
+
+2026-09-08
+
+Replaced FFTW with bundled PocketFFT, then optimized the CPU pipeline with batched
+IFFTs, automatic FFT threading, and removal of temporary row copies.
+The default is `CpuConfig.numThreads = 0`
+(automatic); `1` selects single-threaded FFT execution.
+
+Median full-pipeline **B-scans/s** on Ryzen 5 5600X, Windows, MSVC 19.41 Release:
+
+| Samples/A-scan × A-scans/B-scan | FFTW | Initial PocketFFT | Improved PocketFFT |
+|---|---:|---:|---:|
+| 512 × 256 | 874.5 | 671.9 | 980.4 |
+| 1024 × 512 | 214.6 | 161.7 | 242.5 |
+| 2048 × 512 | 107.0 | 78.0 | 122.5 |
+| 2048 × 1024 | 52.9 | 40.2 | 60.0 |
+
+Synthetic UINT16 input, one B-scan per buffer, cubic resampling, Hann window,
+dispersion compensation and log scaling; DC removal, FPN and line-field corrections
+disabled. Input/output copies included; initialization and benchmark warm-up excluded.
+
+Historical measurements from separate runs: four trials for FFTW/initial PocketFFT,
+three for improved PocketFFT. FFTW and initial PocketFFT used single-threaded FFT
+execution; improved PocketFFT uses automatic threading. These compare complete
+implementations, not equal-thread FFT-library performance.
+
+---
+
 # Performance Benchmark 
 2025-11-30  
 

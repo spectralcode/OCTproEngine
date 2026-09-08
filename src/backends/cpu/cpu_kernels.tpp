@@ -84,10 +84,9 @@ template <typename T>
 void kLinearizationLinear(
 	const std::vector<std::complex<T>>& inputSpectrum,
 	const std::vector<T>& resampleCurve,
-	std::vector<std::complex<T>>& outputSpectrum)
+	std::complex<T>* outputSpectrum)
 {
 	size_t width = resampleCurve.size();
-	outputSpectrum.resize(width);
 
 	size_t inputSize = inputSpectrum.size();
 
@@ -113,10 +112,9 @@ template <typename T>
 void kLinearizationCubic(
 	const std::vector<std::complex<T>>& inputSpectrum,
 	const std::vector<T>& resampleCurve,
-	std::vector<std::complex<T>>& outputSpectrum)
+	std::complex<T>* outputSpectrum)
 {
 	size_t width = resampleCurve.size();
-	outputSpectrum.resize(width);
 
 	size_t inputSize = inputSpectrum.size();
 
@@ -164,10 +162,9 @@ template <typename T>
 void kLinearizationLanczos(
 	const std::vector<std::complex<T>>& inputSpectrum,
 	const std::vector<T>& resampleCurve,
-	std::vector<std::complex<T>>& outputSpectrum)
+	std::complex<T>* outputSpectrum)
 {
 	size_t width = resampleCurve.size();
-	outputSpectrum.resize(width);
 
 	size_t inputSize = inputSpectrum.size();
 	const int a = 8; // Lanczos kernel size
@@ -196,11 +193,10 @@ void kLinearizationLanczos(
 
 template <typename T>
 void dispersionCompensation(
-	std::vector<std::complex<T>>& data,
+	std::complex<T>* data,
+	size_t dataSize,
 	const std::vector<std::complex<T>>& phaseComplex)
 {
-	size_t dataSize = data.size();
-
 	if (phaseComplex.empty() || phaseComplex.size() != dataSize) {
 		// Cannot apply dispersion compensation without valid phase data
 		return;
@@ -225,17 +221,19 @@ void dispersionCompensation(
 
 template <typename T>
 void applyWindow(
-	std::vector<std::complex<T>>& data,
+	std::complex<T>* data,
+	size_t dataSize,
 	const std::vector<T>& windowFunction)
 {
-	for (size_t i = 0; i < data.size(); ++i) {
+	for (size_t i = 0; i < dataSize; ++i) {
 		data[i] *= windowFunction[i];
 	}
 }
 
 template <typename T>
 void logScaleAndTruncate(
-	const std::vector<std::complex<T>>& input,
+	const std::complex<T>* input,
+	size_t inputSize,
 	std::vector<T>& output,
 	T coeff,
 	T minVal,
@@ -243,7 +241,7 @@ void logScaleAndTruncate(
 	T addend,
 	bool autoComputeMinMax)
 {
-	size_t size = input.size()/2; // the output size is half of input size because we only use first half of each a-scan to remove mirror artifact
+	size_t size = inputSize/2; // the output size is half of input size because we only use first half of each a-scan to remove mirror artifact
 	output.resize(size);
 
 	T outputAscanLength = static_cast<T>(size);
@@ -277,14 +275,15 @@ void logScaleAndTruncate(
 
 template <typename T>
 void linearScaleAndTruncate(
-	const std::vector<std::complex<T>>& input,
+	const std::complex<T>* input,
+	size_t inputSize,
 	std::vector<T>& output,
 	T coeff,
 	T minVal,
 	T maxVal,
 	T addend)
 {
-	size_t size = input.size()/2; // the output size is half of input size because we only use first half of each a-scan to remove mirror artifact
+	size_t size = inputSize/2; // the output size is half of input size because we only use first half of each a-scan to remove mirror artifact
 	output.resize(size);
 
 	T outputAscanLength = static_cast<T>(size);
@@ -488,7 +487,8 @@ void smoothBackgroundFrame(
 // spectral average. Same formula as the CUDA kernel normalizeAscansBySqrtSpectralAverages.
 template <typename T>
 void normalizeBySqrtSpectralAverage(
-	std::vector<std::complex<T>>& data,
+	std::complex<T>* data,
+	size_t dataSize,
 	T average,
 	T normalizationScale
 )
@@ -496,8 +496,8 @@ void normalizeBySqrtSpectralAverage(
 	T rootAverage = std::sqrt(average);
 	if (rootAverage > static_cast<T>(1)) {
 		T factor = normalizationScale / rootAverage;
-		for (auto& sample : data) {
-			sample *= factor;
+		for (size_t i = 0; i < dataSize; ++i) {
+			data[i] *= factor;
 		}
 	}
 }

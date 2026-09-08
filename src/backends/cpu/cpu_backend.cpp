@@ -1,7 +1,6 @@
 #include "cpu_backend.h"
 #include "cpu_kernels.h"
 #define POCKETFFT_CACHE_SIZE 8
-#define POCKETFFT_NO_MULTITHREADING
 #include "pocketfft_hdronly.h"
 #include <algorithm>
 #include <atomic>
@@ -55,10 +54,12 @@ struct CpuBackend::Impl {
 	std::thread processingThread;
 	std::atomic<bool> stopProcessing;
 	
-	// Reuse the transform metadata and PocketFFT's cached plans across A-scans.
+	// Reuse the transform metadata and workspace for one batched IFFT per B-scan.
 	pocketfft::shape_t fftShape;
-	const pocketfft::shape_t fftAxes{0};
-	const pocketfft::stride_t fftStride{sizeof(std::complex<float>)};
+	const pocketfft::shape_t fftAxes{1};
+	pocketfft::stride_t fftStride;
+	std::vector<std::complex<float>> fftBscan;
+	int fftThreads = 0;
 
 	// Storage for per-buffer IFFT outputs when post-processing requires whole-buffer context
 	std::vector<std::vector<std::complex<float>>> allIfftOutputs;
@@ -101,19 +102,17 @@ struct CpuBackend::Impl {
 
 	// Temporary buffers for per-A-scan processing
 	std::vector<std::complex<float>> spectrum;
-	std::vector<std::complex<float>> linearizedSpectrum;
-	std::vector<std::complex<float>> ifftOutput;
 	std::vector<float> processedAscan;
 
 	void computeIFFT() {
 		pocketfft::c2c(fftShape, fftStride, fftStride, fftAxes, pocketfft::BACKWARD,
-			linearizedSpectrum.data(), ifftOutput.data(), 1.0f, 1);
+			fftBscan.data(), fftBscan.data(), 1.0f, fftThreads);
 	}
 
 	// Compute Fixed-pattern noise helper
 	void computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans);
 	
-	Impl() 
+	Impl()
 		: currentOutputBuffer(0)
 		, stopProcessing(false)
 		, numInputBuffers(2)  // default: 2 buffers (ping-pong)
@@ -254,107 +253,117 @@ struct CpuBackend::Impl {
 			this->allIfftOutputs.resize(totalAscans);
 		}
 
-		// Process each A-scan
-		for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
-			const void* ascanStart = static_cast<const uint8_t*>(inputData) +
-			                         (ascanIdx * signalLength * (config.dataParams.getBitDepth() / 8));
-			
-			// 1. Convert input data
-			cpu_kernels::convertInputData<float>(
-				ascanStart,
-				signalLength,
-				config.dataParams.getBitDepth(),
-				this->spectrum
-			);
-			
-			// 1.5 Background frame subtraction (line-field OCT, before DC removal to match OCTproZ order)
-			if (applyBackgroundFrame) {
-				const float* backgroundRow = activeBackgroundFrame.data() +
-				                             (ascanIdx % ascansPerBscan) * signalLength;
-				cpu_kernels::backgroundFrameSubtraction<float>(
-					this->spectrum,
-					backgroundRow,
-					config.processingParams.backgroundFrame.normalize,
-					frameNormalizationScale
-				);
-			}
+		// Preprocess, transform, and postprocess one B-scan at a time.
+		for (int bscanIdx = 0; bscanIdx < bscansPerBuffer; ++bscanIdx) {
+			const int firstAscan = bscanIdx * ascansPerBscan;
+			for (int row = 0; row < ascansPerBscan; ++row) {
+				const int ascanIdx = firstAscan + row;
+				const void* ascanStart = static_cast<const uint8_t*>(inputData) +
+				                         (ascanIdx * signalLength * (config.dataParams.getBitDepth() / 8));
 
-			// 2. Background removal (if enabled)
-			if (config.processingParams.dcRemoval.enabled) {
-				cpu_kernels::rollingAverageDCRemoval<float>(
-					this->spectrum,
-					config.processingParams.dcRemoval.windowSize
+				// 1. Convert input data
+				cpu_kernels::convertInputData<float>(
+					ascanStart,
+					signalLength,
+					config.dataParams.getBitDepth(),
+					this->spectrum
 				);
-			}
 
-			// 3. K-linearization (if enabled)
-			if (config.processingParams.resampling.enabled) {
-				switch (config.processingParams.resampling.method) {
-					case InterpolationMethod::LINEAR:
-						cpu_kernels::kLinearizationLinear<float>(this->spectrum, this->resampleCurve, this->linearizedSpectrum);
-						break;
-					case InterpolationMethod::CUBIC:
-						cpu_kernels::kLinearizationCubic<float>(this->spectrum, this->resampleCurve, this->linearizedSpectrum);
-						break;
-					case InterpolationMethod::LANCZOS:
-						cpu_kernels::kLinearizationLanczos<float>(this->spectrum, this->resampleCurve, this->linearizedSpectrum);
-						break;
+				// 1.5 Background frame subtraction (line-field OCT, before DC removal to match OCTproZ order)
+				if (applyBackgroundFrame) {
+					const float* backgroundRow = activeBackgroundFrame.data() +
+					                             (ascanIdx % ascansPerBscan) * signalLength;
+					cpu_kernels::backgroundFrameSubtraction<float>(
+						this->spectrum,
+						backgroundRow,
+						config.processingParams.backgroundFrame.normalize,
+						frameNormalizationScale
+					);
 				}
-			} else {
-				this->linearizedSpectrum = this->spectrum;
-			}
+
+				// 2. Background removal (if enabled)
+				if (config.processingParams.dcRemoval.enabled) {
+					cpu_kernels::rollingAverageDCRemoval<float>(
+						this->spectrum,
+						config.processingParams.dcRemoval.windowSize
+					);
+				}
+
+				// 3. K-linearization (if enabled)
+				auto* fftRow = this->fftBscan.data() + static_cast<size_t>(row) * signalLength;
+				if (config.processingParams.resampling.enabled) {
+					switch (config.processingParams.resampling.method) {
+						case InterpolationMethod::LINEAR:
+							cpu_kernels::kLinearizationLinear<float>(this->spectrum, this->resampleCurve, fftRow);
+							break;
+						case InterpolationMethod::CUBIC:
+							cpu_kernels::kLinearizationCubic<float>(this->spectrum, this->resampleCurve, fftRow);
+							break;
+						case InterpolationMethod::LANCZOS:
+							cpu_kernels::kLinearizationLanczos<float>(this->spectrum, this->resampleCurve, fftRow);
+							break;
+					}
+				} else {
+					std::copy(this->spectrum.begin(), this->spectrum.end(), fftRow);
+				}
 			
-			// 4. Windowing (if enabled)
-			if (config.processingParams.windowing.enabled) {
-				cpu_kernels::applyWindow<float>(this->linearizedSpectrum, this->windowCurve);
+				// 4. Windowing (if enabled)
+				if (config.processingParams.windowing.enabled) {
+					cpu_kernels::applyWindow<float>(fftRow, signalLength, this->windowCurve);
+				}
+
+				// 5. Dispersion compensation (if enabled)
+				if (config.processingParams.dispersion.enabled) {
+					cpu_kernels::dispersionCompensation<float>(fftRow, signalLength, this->dispersionPhaseComplex);
+				}
 			}
 
-			// 5. Dispersion compensation (if enabled)
-			if (config.processingParams.dispersion.enabled) {
-				cpu_kernels::dispersionCompensation<float>(this->linearizedSpectrum, this->dispersionPhaseComplex);
-			}
-			
-			// 6. IFFT
+			// 6. Independent IFFTs along the spectral axis, in one call.
 			this->computeIFFT();
 
-			// 6.5 Post-FFT frame correction: divide by sqrt of the pre-subtraction spectral average
-			if (frameCorrectionActive) {
-				cpu_kernels::normalizeBySqrtSpectralAverage<float>(
-					this->ifftOutput,
-					this->liveSpectralAverages[ascanIdx],
-					frameNormalizationScale
-				);
-			}
+			for (int row = 0; row < ascansPerBscan; ++row) {
+				const int ascanIdx = firstAscan + row;
+				auto* fftRow = this->fftBscan.data() + static_cast<size_t>(row) * signalLength;
 
-			if (needsFPN) {
-				// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
-				this->allIfftOutputs[ascanIdx] = this->ifftOutput;
-			} else {
-				// Process immediately to output (no storage, better performance)
-				// 8. Magnitude calculation, grayscale conversion, truncation
-				if (config.processingParams.intensity.logScale) {
-					cpu_kernels::logScaleAndTruncate<float>(
-						this->ifftOutput,
-						this->processedAscan,
-						config.processingParams.intensity.preScale,
-						config.processingParams.intensity.rangeMin,
-						config.processingParams.intensity.rangeMax,
-						config.processingParams.intensity.postOffset,
-						(config.processingParams.intensity.rangeMin == config.processingParams.intensity.rangeMax)
-					);
-				} else {
-					cpu_kernels::linearScaleAndTruncate<float>(
-						this->ifftOutput,
-						this->processedAscan,
-						config.processingParams.intensity.preScale,
-						config.processingParams.intensity.rangeMin,
-						config.processingParams.intensity.rangeMax,
-						config.processingParams.intensity.postOffset
+				// 6.5 Post-FFT frame correction: divide by sqrt of the pre-subtraction spectral average
+				if (frameCorrectionActive) {
+					cpu_kernels::normalizeBySqrtSpectralAverage<float>(
+						fftRow, signalLength,
+						this->liveSpectralAverages[ascanIdx],
+						frameNormalizationScale
 					);
 				}
-				// Copy to output
-				int outputStartIdx = ascanIdx * outputSamplesPerAscan;
-				std::copy(this->processedAscan.begin(), this->processedAscan.begin() + outputSamplesPerAscan, outputPtr + outputStartIdx);
+
+				if (needsFPN) {
+					// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
+					this->allIfftOutputs[ascanIdx].assign(fftRow, fftRow + signalLength);
+				} else {
+					// Convert this row directly to output when FPN is disabled.
+					// 8. Magnitude calculation, grayscale conversion, truncation
+					if (config.processingParams.intensity.logScale) {
+						cpu_kernels::logScaleAndTruncate<float>(
+							fftRow, signalLength,
+							this->processedAscan,
+							config.processingParams.intensity.preScale,
+							config.processingParams.intensity.rangeMin,
+							config.processingParams.intensity.rangeMax,
+							config.processingParams.intensity.postOffset,
+							(config.processingParams.intensity.rangeMin == config.processingParams.intensity.rangeMax)
+						);
+					} else {
+						cpu_kernels::linearScaleAndTruncate<float>(
+							fftRow, signalLength,
+							this->processedAscan,
+							config.processingParams.intensity.preScale,
+							config.processingParams.intensity.rangeMin,
+							config.processingParams.intensity.rangeMax,
+							config.processingParams.intensity.postOffset
+						);
+					}
+					// Copy to output
+					int outputStartIdx = ascanIdx * outputSamplesPerAscan;
+					std::copy(this->processedAscan.begin(), this->processedAscan.begin() + outputSamplesPerAscan, outputPtr + outputStartIdx);
+				}
 			}
 		}
 
@@ -373,7 +382,7 @@ struct CpuBackend::Impl {
 				// 8. Magnitude calculation, grayscale conversion, truncation
 				if (config.processingParams.intensity.logScale) {
 					cpu_kernels::logScaleAndTruncate<float>(
-						ifftOutputRef,
+						ifftOutputRef.data(), ifftOutputRef.size(),
 						this->processedAscan,
 						config.processingParams.intensity.preScale,
 						config.processingParams.intensity.rangeMin,
@@ -383,7 +392,7 @@ struct CpuBackend::Impl {
 					);
 				} else {
 					cpu_kernels::linearScaleAndTruncate<float>(
-						ifftOutputRef,
+						ifftOutputRef.data(), ifftOutputRef.size(),
 						this->processedAscan,
 						config.processingParams.intensity.preScale,
 						config.processingParams.intensity.rangeMin,
@@ -593,12 +602,25 @@ CpuBackend::~CpuBackend() {
 	this->cleanup();
 }
 
+void CpuBackend::setNumThreads(int numThreads) {
+	if (this->impl->processingThread.joinable()) {
+		throw std::runtime_error("Cannot change FFT thread count after initialization");
+	}
+	if (numThreads < 0) {
+		throw std::invalid_argument("CPU FFT thread count must be non-negative");
+	}
+	this->impl->fftThreads = numThreads;
+}
+
 void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->config = config;
 	
 	int signalLength = config.dataParams.signalLength;
 	
-	this->impl->fftShape = {static_cast<size_t>(signalLength)};
+	this->impl->fftShape = {static_cast<size_t>(config.dataParams.ascansPerBscan),
+		static_cast<size_t>(signalLength)};
+	this->impl->fftStride = {static_cast<ptrdiff_t>(signalLength * sizeof(std::complex<float>)),
+		sizeof(std::complex<float>)};
 	
 	// Allocate output buffers
 	size_t outputSize = (config.dataParams.samplesPerBuffer() / 2) * sizeof(float);
@@ -632,14 +654,9 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 
 	// Pre-allocate temporary processing buffers
 	this->impl->spectrum.resize(signalLength);
-	this->impl->linearizedSpectrum.resize(signalLength);
-	this->impl->ifftOutput.resize(signalLength);
 	this->impl->processedAscan.resize(signalLength / 2);
-
-	// Warm the plan cache before starting the worker. The inverse is unnormalized.
-	std::fill(this->impl->linearizedSpectrum.begin(), this->impl->linearizedSpectrum.end(),
+	this->impl->fftBscan.assign(this->impl->fftShape[0] * this->impl->fftShape[1],
 		std::complex<float>(0.0f, 0.0f));
-	this->impl->computeIFFT();
 
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
@@ -708,8 +725,7 @@ void CpuBackend::cleanup() {
 	this->impl->backgroundFrameRecordingInProgress = false;
 	this->impl->smoothedFrameDirty = true;
 	std::vector<std::complex<float>>().swap(this->impl->spectrum);
-	std::vector<std::complex<float>>().swap(this->impl->linearizedSpectrum);
-	std::vector<std::complex<float>>().swap(this->impl->ifftOutput);
+	std::vector<std::complex<float>>().swap(this->impl->fftBscan);
 	std::vector<float>().swap(this->impl->processedAscan);
 }
 

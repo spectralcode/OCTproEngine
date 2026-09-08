@@ -69,7 +69,7 @@ void register_backend_config(py::module& m) {
 	py::class_<ope::CpuConfig, ope::BackendConfig>(m, "CpuConfig")
 		.def(py::init<>())
 		.def_readwrite("num_threads", &ope::CpuConfig::numThreads,
-			"Number of threads (0 = auto-detect, default: 0)")
+			"PocketFFT thread limit (0 = auto-detect, 1 = single-threaded, default: 0)")
 		.def_readwrite("enable_simd", &ope::CpuConfig::enableSimd,
 			"Enable SIMD optimizations (default: True)")
 		.def("__repr__", [](const ope::CpuConfig& config) {

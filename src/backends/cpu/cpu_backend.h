@@ -17,6 +17,8 @@ class CpuBackend : public ProcessingBackend {
 public:
 	CpuBackend();
 	~CpuBackend() override;
+
+	void setNumThreads(int numThreads); // Before initialize()
 	
 	void initialize(const ProcessorConfiguration& config) override;
 	void cleanup() override;

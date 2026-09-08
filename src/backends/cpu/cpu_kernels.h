@@ -28,38 +28,41 @@ template <typename T>
 void kLinearizationLinear(
 	const std::vector<std::complex<T>>& inputSpectrum,
 	const std::vector<T>& resampleCurve,
-	std::vector<std::complex<T>>& outputSpectrum
+	std::complex<T>* outputSpectrum // caller provides resampleCurve.size() elements
 );
 
 template <typename T>
 void kLinearizationCubic(
 	const std::vector<std::complex<T>>& inputSpectrum,
 	const std::vector<T>& resampleCurve,
-	std::vector<std::complex<T>>& outputSpectrum
+	std::complex<T>* outputSpectrum
 );
 
 template <typename T>
 void kLinearizationLanczos(
 	const std::vector<std::complex<T>>& inputSpectrum,
 	const std::vector<T>& resampleCurve,
-	std::vector<std::complex<T>>& outputSpectrum
+	std::complex<T>* outputSpectrum
 );
 
 template <typename T>
 void dispersionCompensation(
-	std::vector<std::complex<T>>& data,
+	std::complex<T>* data,
+	size_t dataSize,
 	const std::vector<std::complex<T>>& phaseComplex
 );
 
 template <typename T>
 void applyWindow(
-	std::vector<std::complex<T>>& data,
+	std::complex<T>* data,
+	size_t dataSize,
 	const std::vector<T>& windowFunction
 );
 
 template <typename T>
 void logScaleAndTruncate(
-	const std::vector<std::complex<T>>& input,
+	const std::complex<T>* input,
+	size_t inputSize,
 	std::vector<T>& output,
 	T coeff,
 	T minVal,
@@ -70,7 +73,8 @@ void logScaleAndTruncate(
 
 template <typename T>
 void linearScaleAndTruncate(
-	const std::vector<std::complex<T>>& input,
+	const std::complex<T>* input,
+	size_t inputSize,
 	std::vector<T>& output,
 	T coeff,
 	T minVal,
@@ -116,7 +120,8 @@ void smoothBackgroundFrame(
 
 template <typename T>
 void normalizeBySqrtSpectralAverage(
-	std::vector<std::complex<T>>& data,
+	std::complex<T>* data,
+	size_t dataSize,
 	T average,
 	T normalizationScale
 );
