@@ -18,6 +18,9 @@ Replaced FFTW with bundled PocketFFT, then optimized the CPU pipeline with batch
 IFFTs, automatic FFT threading, and removal of temporary row copies.
 The default is `CpuConfig.numThreads = 0`
 (automatic); `1` selects single-threaded FFT execution.
+Initialization performs one FFT to prepare the initial plan and parallel execution
+resources. If acquisition latency is sensitive to CPU contention, benchmark a
+smaller `num_threads` limit, including `1`, on the target system.
 
 Median full-pipeline **B-scans/s** on Ryzen 5 5600X, Windows, MSVC 19.41 Release:
 

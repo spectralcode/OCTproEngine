@@ -105,8 +105,8 @@ struct CpuBackend::Impl {
 	std::vector<float> processedAscan;
 
 	void computeIFFT() {
-		pocketfft::c2c(fftShape, fftStride, fftStride, fftAxes, pocketfft::BACKWARD,
-			fftBscan.data(), fftBscan.data(), 1.0f, fftThreads);
+		pocketfft::c2c(this->fftShape, this->fftStride, this->fftStride, this->fftAxes, pocketfft::BACKWARD,
+			this->fftBscan.data(), this->fftBscan.data(), 1.0f, this->fftThreads);
 	}
 
 	// Compute Fixed-pattern noise helper
@@ -670,6 +670,9 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 		this->impl->smoothedFrameDirty = true;
 	}
 
+	// Prepare the initial FFT plan and parallel execution resources before starting the worker.
+	this->impl->computeIFFT();
+
 	// Start processing thread
 	this->impl->stopProcessing = false;
 	this->impl->processingThread = std::thread([this]() {
@@ -756,13 +759,25 @@ void CpuBackend::updateConfig(const ProcessorConfiguration& config) {
 }
 
 void CpuBackend::updateResamplingCurve(const float* curve, size_t length) {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
 	if (!curve && length > 0) {
 		throw std::runtime_error("Invalid resampling curve pointer");
+	}
+	// Empty or mismatched uploads preserve the current curve, as in the GPU backends.
+	if (this->impl->fftBscan.empty() || length != this->impl->fftShape[1]) {
+		return;
 	}
 	this->impl->resampleCurve.assign(curve, curve + length);
 }
 
 void CpuBackend::updateDispersionCurve(const float* curve, size_t length) {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	if (!curve && length > 0) {
+		throw std::runtime_error("Invalid dispersion curve pointer");
+	}
+	if (this->impl->fftBscan.empty() || length != this->impl->fftShape[1] * 2) {
+		return;
+	}
 	// Curve is interleaved real/imag
 	this->impl->dispersionPhaseComplex.resize(length/2);
 	for (size_t i = 0; i < length/2; ++i) {
@@ -774,8 +789,12 @@ void CpuBackend::updateDispersionCurve(const float* curve, size_t length) {
 }
 
 void CpuBackend::updateWindowCurve(const float* curve, size_t length) {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
 	if (!curve && length > 0) {
 		throw std::runtime_error("Invalid window curve pointer");
+	}
+	if (this->impl->fftBscan.empty() || length != this->impl->fftShape[1]) {
+		return;
 	}
 	this->impl->windowCurve.assign(curve, curve + length);
 }

@@ -1614,6 +1614,10 @@ int Processor::getNumBuffers() const {
 // ============================================
 
 void Processor::setBackendConfig(const BackendConfig& config) {
+	if (!config.isValid()) {
+		throw std::invalid_argument("Invalid backend configuration");
+	}
+
 	// Check if we need to switch backends
 	Backend newBackend = config.getBackendType();
 	if (this->impl->backendType != newBackend) {

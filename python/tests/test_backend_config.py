@@ -1,5 +1,6 @@
 import sys
 import os
+import threading
 import numpy as np
 import octproengine as ope
 
@@ -234,6 +235,87 @@ def test_save_load_configuration():
         return False
 
 
+def test_rejected_cpu_configuration():
+    """Reject invalid settings without replacing config or stopping a live backend."""
+    if not ope.BackendUtils.is_cpu_available():
+        print("SKIP: CPU configuration rejection (CPU unavailable)")
+        return
+
+    def capture(processor):
+        done, output = threading.Event(), []
+
+        def callback(values, _):
+            output.append(np.copy(values))
+            done.set()
+
+        callback_id = processor.add_output_callback(callback)
+        try:
+            buffer = processor.get_next_available_buffer()
+            buffer[:] = np.arange(buffer.size, dtype=np.uint16).reshape(buffer.shape) % 100
+            processor.process(buffer)
+            assert done.wait(10), "Processing timed out after rejected configuration"
+            assert np.isfinite(output[0]).all(), "Non-finite output"
+            return output[0]
+        finally:
+            processor.remove_output_callback(callback_id)
+
+    invalid = ope.CpuConfig()
+    invalid.num_threads = -1
+
+    def reject(processor):
+        backend = processor.get_backend()
+        before = ope.BackendUtils.serialize_config(processor.get_backend_config())
+        try:
+            processor.set_backend_config(invalid)
+        except (ValueError, RuntimeError):
+            pass
+        else:
+            raise AssertionError("Negative thread count was accepted")
+        assert processor.get_backend() == backend, "Rejected config changed the backend"
+        assert ope.BackendUtils.serialize_config(processor.get_backend_config()) == before, \
+            "Rejected config replaced the stored configuration"
+
+    processor = ope.Processor(ope.Backend.CPU)
+    valid = ope.CpuConfig()
+    valid.num_threads = 2
+    processor.set_backend_config(valid)
+    reject(processor)
+    path = "test_rejected_cpu_backend.ini"
+    try:
+        processor.save_backend_config_to_file(path)
+        restored = ope.Processor(ope.Backend.CPU)
+        restored.load_backend_config_from_file(path)
+        assert restored.get_backend_config().num_threads == 2
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    processor.set_input_parameters(64, 8, 1, ope.DataType.UINT16)
+    processor.initialize()
+    try:
+        before = capture(processor)
+        reject(processor)
+        np.testing.assert_array_equal(capture(processor), before)
+    finally:
+        processor.stop()
+
+    for backend, available in ((ope.Backend.CUDA, ope.BackendUtils.is_cuda_available),
+                               (ope.Backend.OPENCL, ope.BackendUtils.is_opencl_available),
+                               (ope.Backend.VULKAN, ope.BackendUtils.is_vulkan_available)):
+        if not available():
+            print(f"SKIP: invalid CPU switch from {backend} (unavailable)")
+            continue
+        processor = ope.Processor(backend)
+        processor.set_input_parameters(64, 8, 1, ope.DataType.UINT16)
+        processor.initialize()
+        try:
+            before = capture(processor)
+            reject(processor)
+            np.testing.assert_array_equal(capture(processor), before)
+        finally:
+            processor.stop()
+    print("PASS: rejected CPU configuration preserves stored settings and live backends")
+
+
 def main():
     """Run all backend configuration tests."""
     print("=" * 40)
@@ -252,6 +334,8 @@ def main():
 
     if not test_save_load_configuration():
         test_passed = False
+
+    test_rejected_cpu_configuration()
 
     # Summary
     print("=" * 40)
