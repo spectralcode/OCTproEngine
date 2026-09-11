@@ -2,6 +2,7 @@
 #include "../include/processorconfiguration.h"
 #include "../include/types.h"
 #include "../include/iobuffer.h"
+#include "test_utils.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <utility>
 
 
 const int SIGNAL_LENGTH = 2048;
@@ -221,6 +223,73 @@ void configureProcessor(ope::Processor& processor) {
 	}
 
 }
+
+#ifdef OPE_VULKAN_AVAILABLE
+void testVulkanInputTypes() {
+	std::cout << "Testing Vulkan UINT32 input and FLOAT32 rejection..." << std::endl;
+	const int signalLength = 64;
+	const int ascansPerBscan = 8;
+	const uint32_t amplitudes[ascansPerBscan] = {
+		0u, 1u, 65535u, 65536u, 0x7fffffffu, 0x80000000u, 0x90000000u, 0xffffffffu
+	};
+	std::vector<uint32_t> input(signalLength * ascansPerBscan, 0);
+	for (int a = 0; a < ascansPerBscan; ++a) {
+		input[a * signalLength] = amplitudes[a];
+	}
+	std::vector<float> cpuOutput;
+	for (ope::Backend backend : {ope::Backend::CPU, ope::Backend::VULKAN}) {
+		ProcessingResult result;
+		ope::Processor processor(backend);
+		processor.setInputParameters(signalLength, ascansPerBscan, 1, ope::DataType::UINT32);
+		processor.enableLogScaling(false);
+		processor.setGrayscaleRange(0.0f, 1.0f);
+		processor.setSignalMultiplicatorAndAddend(1.0f, 0.0f);
+		processor.initialize();
+		processor.addOutputCallback([&result](const ope::IOBuffer& output) {
+			std::lock_guard<std::mutex> lock(result.mutex);
+			const float* data = static_cast<const float*>(output.getDataPointer());
+			result.output.assign(data, data + output.getSizeInBytes() / sizeof(float));
+			result.received = true;
+			result.cv.notify_one();
+		});
+		auto& buffer = processor.getNextAvailableInputBuffer();
+		TEST_ASSERT(buffer.getSizeInBytes() == input.size() * sizeof(uint32_t),
+			"UINT32 input must allocate four bytes per sample");
+		std::memcpy(buffer.getDataPointer(), input.data(), buffer.getSizeInBytes());
+		processor.process(buffer);
+		result.waitForCompletion();
+		processor.cleanup();
+		TEST_ASSERT(result.received && result.output.size() == input.size() / 2,
+			"UINT32 processing must produce a complete output buffer");
+		for (size_t i = 0; i < result.output.size(); ++i) {
+			// An impulse of amplitude v produces magnitude v / (signalLength / 2).
+			float expected = static_cast<float>(amplitudes[i / (signalLength / 2)]) / (signalLength / 2);
+			float tolerance = 1.0e-5f * std::max(1.0f, expected);
+			TEST_ASSERT(std::isfinite(result.output[i]) && std::abs(result.output[i] - expected) <= tolerance,
+				"UINT32 output must match the unsigned impulse magnitude");
+			if (backend == ope::Backend::VULKAN) {
+				TEST_ASSERT(std::abs(result.output[i] - cpuOutput[i]) <= tolerance,
+					"Vulkan UINT32 output must match CPU output");
+			}
+		}
+		if (backend == ope::Backend::CPU) {
+			cpuOutput = std::move(result.output);
+		}
+	}
+	bool rejected = false;
+	ope::Processor processor(ope::Backend::VULKAN);
+	processor.setInputParameters(signalLength, ascansPerBscan, 1, ope::DataType::FLOAT32);
+	try {
+		processor.initialize();
+	} catch (const std::runtime_error& error) {
+		TEST_ASSERT(std::string(error.what()) == "Unsupported input data type",
+			"FLOAT32 must fail specifically because the input type is unsupported");
+		rejected = true;
+	}
+	TEST_ASSERT(rejected, "Vulkan must reject raw FLOAT32 input");
+	std::cout << "  UINT32 matches CPU and expected magnitudes; FLOAT32 rejected." << std::endl;
+}
+#endif
 
 // ============================================
 // Main Test
@@ -703,6 +772,12 @@ int main() {
 			TOLERANCE
 		);
 		allTestsPassed = allTestsPassed && cpuVulkanComparison.match && cudaVulkanComparison.match;
+		try {
+			testVulkanInputTypes();
+		} catch (const std::exception& error) {
+			std::cerr << "Vulkan input type regression failed: " << error.what() << std::endl;
+			return 1;
+		}
 	}
 #endif
 

@@ -1836,7 +1836,7 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		case IOBuffer::DataType::UINT16:
 			this->impl->bytesPerSample = 2;
 			break;
-		case IOBuffer::DataType::FLOAT32:
+		case IOBuffer::DataType::UINT32:
 			this->impl->bytesPerSample = 4;
 			break;
 		default:
