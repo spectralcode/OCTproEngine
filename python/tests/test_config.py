@@ -6,8 +6,55 @@ import sys
 import os
 import numpy as np
 import math
+from pathlib import Path
 
 import octproengine as ope
+
+
+def test_csv_exports():
+    path = Path("test_csv_exports_py.csv")
+    config = ope.ProcessorConfiguration()
+    config.dataParams.signalLength = 32
+    config.dataParams.ascansPerBscan = 4
+    curve = np.full(32, 1.23456789, dtype=np.float32)
+    background = curve[:16]
+    config.setResamplingLut(curve)
+    config.setWindowFunction(curve)
+    config.setDispersionPhase(curve)
+    config.setBackgroundProfile(background)
+    config.setFixedPatternNoiseProfile(curve)
+    exports = [
+        (config.saveResamplingLutToFile, config.loadResamplingLutFromFile, "index;value"),
+        (config.saveWindowFunctionToFile, config.loadWindowFunctionFromFile, "index;value"),
+        (config.saveDispersionPhaseToFile, config.loadDispersionPhaseFromFile, "index;value"),
+        (config.saveBackgroundProfileToFile, config.loadBackgroundProfileFromFile, "index;value"),
+        (config.saveFixedPatternNoiseProfileToFile, config.loadFixedPatternNoiseProfileFromFile, "index;real;imaginary"),
+    ]
+    try:
+        for save, load, header in exports:
+            assert save(str(path))
+            lines = path.read_text().splitlines()
+            assert lines[0].startswith("# ")
+            assert lines[1] == header
+            assert load(str(path))
+
+        processor = ope.Processor(ope.Backend.CPU)
+        processor.set_input_parameters(32, 4, 1, ope.DataType.UINT16)
+        processor.initialize()
+        processor.set_post_process_background_profile(background)
+        processor.set_fixed_pattern_noise_profile(curve)
+        for save, load, header in [
+            (processor.save_post_process_background_profile_to_file,
+             processor.load_post_process_background_profile_from_file, "index;value"),
+            (processor.save_fixed_pattern_noise_profile_to_file,
+             processor.load_fixed_pattern_noise_profile_from_file, "index;real;imaginary"),
+        ]:
+            save(str(path))
+            assert path.read_text().splitlines()[0] == header
+            load(str(path))
+    finally:
+        path.unlink(missing_ok=True)
+
 
 def create_test_curve(size, start_val, increment):
     """Helper to create test curves"""
@@ -642,6 +689,17 @@ def run_tests():
         print(f"  Result: FAIL - {str(e)}")
         all_tests_pass = False
     print()
+
+    # ============================================
+    # CSV export/import
+    # ============================================
+    test_number += 1
+    try:
+        test_csv_exports()
+        print(f"Test {test_number}: CSV exports: PASS")
+    except Exception as e:
+        print(f"Test {test_number}: CSV exports: FAIL - {e}")
+        all_tests_pass = False
 
     # ============================================
     # Summary

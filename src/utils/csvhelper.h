@@ -5,6 +5,10 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <cmath>
+#include <locale>
+#include <iomanip>
+#include <limits>
 
 namespace ope {
 
@@ -18,16 +22,17 @@ public:
 		std::ofstream file(filepath);
 		if (!file.is_open()) return false;
 
+		file.imbue(std::locale::classic());
+		file << std::setprecision(std::numeric_limits<float>::max_digits10);
 		if (!title.empty()) {
 			file << "# " << title << "\n";
 		}
-		//file << "# OCTproEngine\n";
-		//file << "# Size: " << data.size() << "\n";
-		file << "index,value\n";
+		file << "index;value\n";
 
 		for (size_t i = 0; i < data.size(); ++i) {
-			file << i << "," << data[i] << "\n";
+			file << i << ';' << data[i] << "\n";
 		}
+		file.close();
 		return file.good();
 	}
 
@@ -40,16 +45,17 @@ public:
 		std::ofstream file(filepath);
 		if (!file.is_open()) return false;
 
+		file.imbue(std::locale::classic());
+		file << std::setprecision(std::numeric_limits<float>::max_digits10);
 		if (!title.empty()) {
 			file << "# " << title << "\n";
 		}
-		file << "# OCTproEngine\n";
-		file << "# Complex pairs: " << data.size() / 2 << "\n";
-		file << "index,real,imaginary\n";
+		file << "index;real;imaginary\n";
 
 		for (size_t i = 0; i < data.size() / 2; ++i) {
-			file << i << "," << data[i*2] << "," << data[i*2+1] << "\n";
+			file << i << ';' << data[i*2] << ';' << data[i*2+1] << "\n";
 		}
+		file.close();
 		return file.good();
 	}
 
@@ -63,39 +69,44 @@ public:
 		bool isComplex = false;
 
 		// Detect format from header
-		while (std::getline(file, line)) {
-			if (line.find("index,real,imaginary") != std::string::npos) {
-				isComplex = true;
-				break;
-			} else if (line.find("index,value") != std::string::npos) {
-				isComplex = false;
-				break;
-			}
+		while (std::getline(file >> std::ws, line)) {
+			if (line.empty() || line[0] == '#') continue;
+			isComplex = line.find("index;real;imaginary") != std::string::npos ||
+				line.find("Sample Number;Real;Imag") != std::string::npos;
+			break;
 		}
 
 		// Read data
-		while (std::getline(file, line)) {
+		while (std::getline(file >> std::ws, line)) {
 			if (line.empty() || line[0] == '#') continue;
 
 			std::istringstream iss(line);
 			std::string index;
-			std::getline(iss, index, ',');  // Skip index
+			std::getline(iss, index, ';');  // Skip index
 
 			if (isComplex) {
 				std::string real, imag;
-				if (std::getline(iss, real, ',') && std::getline(iss, imag)) {
-					result.push_back(std::stof(real));
-					result.push_back(std::stof(imag));
-				}
+				float realValue, imagValue;
+				if (!std::getline(iss, real, ';') || !std::getline(iss, imag) ||
+					!parseNumber(real, realValue) || !parseNumber(imag, imagValue)) return {};
+				result.push_back(realValue);
+				result.push_back(imagValue);
 			} else {
 				std::string value;
-				if (std::getline(iss, value)) {
-					result.push_back(std::stof(value));
-				}
+				float number;
+				if (!std::getline(iss, value) || !parseNumber(value, number)) return {};
+				result.push_back(number);
 			}
 		}
-
+		if (file.bad()) return {};
 		return result;
+	}
+
+private:
+	static bool parseNumber(const std::string& field, float& value) {
+		std::istringstream stream(field);
+		stream.imbue(std::locale::classic());
+		return (stream >> value) && (stream >> std::ws).eof() && std::isfinite(value);
 	}
 };
 

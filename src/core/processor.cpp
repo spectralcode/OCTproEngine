@@ -13,6 +13,7 @@
 #include "../backends/vulkan/vulkan_backend.h"
 #endif
 #include "buffer_manager.h"
+#include "../utils/csvhelper.h"
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
@@ -1382,48 +1383,16 @@ void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) 
 		throw std::runtime_error("No fixed pattern noise profile to save");
 	}
 
-	const float* profile = profileVec.data();
-	size_t complexPairs = profileVec.size() / 2;
-	std::ofstream file(filepath);
-	if (!file.is_open()) throw std::runtime_error("Failed to open file for writing: " + filepath);
-	file << "Sample Number;Real;Imag\n";
-	for (size_t i = 0; i < complexPairs; ++i) {
-		file << i << ";" << profile[i*2] << ";" << profile[i*2+1] << "\n";
-	}
-	file.close();
-
-	if (!file.good()) {
-		throw std::runtime_error("Error writing to file: " + filepath);
+	if (!CSVHelper::saveComplex(filepath, profileVec)) {
+		throw std::runtime_error("Failed to save fixed pattern noise CSV: " + filepath);
 	}
 }
 
 void Processor::loadFixedPatternNoiseProfileFromFile(const std::string& filepath) {
-	std::ifstream file(filepath);
-	if (!file.is_open()) throw std::runtime_error("Failed to open file for reading: " + filepath);
-	std::string line;
-	if (!std::getline(file, line)) throw std::runtime_error("Empty file: " + filepath);
-	std::vector<float> profile;
-	int lineNumber = 1;
-	while (std::getline(file, line)) {
-		++lineNumber;
-		if (line.empty()) continue;
-		size_t p1 = line.find(';');
-		if (p1 == std::string::npos) throw std::runtime_error("Invalid format at line " + std::to_string(lineNumber));
-		size_t p2 = line.find(';', p1 + 1);
-		if (p2 == std::string::npos) throw std::runtime_error("Invalid format at line " + std::to_string(lineNumber));
-		std::string realStr = line.substr(p1 + 1, p2 - p1 - 1);
-		std::string imagStr = line.substr(p2 + 1);
-		try {
-			float real = std::stof(realStr);
-			float imag = std::stof(imagStr);
-			profile.push_back(real);
-			profile.push_back(imag);
-		} catch (...) {
-			throw std::runtime_error("Invalid number at line " + std::to_string(lineNumber));
-		}
+	const auto profile = CSVHelper::load(filepath);
+	if (profile.empty()) {
+		throw std::runtime_error("Failed to read a non-empty complex CSV profile: " + filepath);
 	}
-	file.close();
-	if (profile.empty()) throw std::runtime_error("No data found in file: " + filepath);
 
 	// Forward to backend if initialized
 	if (!this->impl->initialized) {
@@ -1502,7 +1471,7 @@ void Processor::setPostProcessBackgroundProfile(const float* data, size_t size) 
 	}
 }
 
-//todo: use csvhelper here!
+// CSV file handling is shared with ProcessorConfiguration.
 void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepath) const {
 	// Snapshot the live backend profile first (it may have been recorded since the
 	// configuration was last synced)
@@ -1514,67 +1483,17 @@ void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepa
 		throw std::runtime_error("No post-process background curve to save");
 	}
 
-	const float* curve = curveVec.data();
-	size_t size = curveVec.size();
-	std::ofstream file(filepath);
-	if (!file.is_open()) {
-		throw std::runtime_error("Failed to open file for writing: " + filepath);
-	}
-	file << "Sample Number;Sample Value\n";
-	for (size_t i = 0; i < size; ++i) {
-		file << i << ";" << curve[i] << "\n";
-	}
-	
-	file.close();
-	
-	if (!file.good()) {
-		throw std::runtime_error("Error writing to file: " + filepath);
+	if (!CSVHelper::save(filepath, curveVec)) {
+		throw std::runtime_error("Failed to save background CSV: " + filepath);
 	}
 }
 
 void Processor::loadPostProcessBackgroundProfileFromFile(const std::string& filepath) {
-	std::ifstream file(filepath);
-	if (!file.is_open()) {
-		throw std::runtime_error("Failed to open file for reading: " + filepath);
-	}
-	
-	std::vector<float> curve;
-	std::string line;
-	
-	if (!std::getline(file, line)) {
-		throw std::runtime_error("Empty file: " + filepath);
-	}
-	
-	int lineNumber = 1;
-	while (std::getline(file, line)) {
-		lineNumber++;
-		if (line.empty()) {
-			continue;
-		}
-		
-		size_t semicolonPos = line.find(';');
-		if (semicolonPos == std::string::npos) {
-			throw std::runtime_error("Invalid format at line " + std::to_string(lineNumber) + 
-			                        ": missing semicolon");
-		}
-		
-		std::string valueStr = line.substr(semicolonPos + 1);
-		
-		try {
-			float value = std::stof(valueStr);
-			curve.push_back(value);
-		} catch (const std::exception& e) {
-			throw std::runtime_error("Invalid number at line " + std::to_string(lineNumber) + 
-			                        ": " + valueStr);
-		}
-	}
-	
-	file.close();
-	
+	const auto curve = CSVHelper::load(filepath);
 	if (curve.empty()) {
-		throw std::runtime_error("No data found in file: " + filepath);
+		throw std::runtime_error("Failed to read a non-empty real CSV profile: " + filepath);
 	}
-	
+
 	this->setPostProcessBackgroundProfile(curve.data(), curve.size());
 }
 
