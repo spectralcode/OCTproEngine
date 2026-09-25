@@ -27,15 +27,14 @@ struct CpuBackend::Impl {
 	ProcessorConfiguration config;
 	std::function<void(const IOBuffer&)> callback;
 	
-	// Output buffers (ping-pong)
+	// Output buffers
 	IOBuffer outputBuffer1;
 	IOBuffer outputBuffer2;
-	int currentOutputBuffer;
 
-	// Semaphore to limit in-flight output buffers (prevents buffer reuse before consumer release)
+	// Only released buffers may be selected for another output.
 	std::mutex outputSemaphoreMutex;
 	std::condition_variable outputSemaphoreCV;
-	int availableOutputBuffers = 2;  // 2 ping-pong buffers
+	std::queue<IOBuffer*> freeOutputBuffersQueue;
 	
 	// Input buffer management
 	std::vector<uint8_t> processingBuffer; 
@@ -113,8 +112,7 @@ struct CpuBackend::Impl {
 	void computeFixedPatternNoiseIfRequested(const ProcessorConfiguration& config, int signalLength, int totalAscans);
 	
 	Impl()
-		: currentOutputBuffer(0)
-		, stopProcessing(false)
+		: stopProcessing(false)
 		, numInputBuffers(2)  // default: 2 buffers (ping-pong)
 		, postProcessBackgroundRecordingRequested(false)
 	{}
@@ -187,18 +185,17 @@ struct CpuBackend::Impl {
 			this->freeQueueCV.notify_one();
 
 			// Wait for an output buffer to be available (prevents buffer reuse before consumer release)
+			IOBuffer* outputBuffer;
 			{
 				std::unique_lock<std::mutex> lock(this->outputSemaphoreMutex);
 				this->outputSemaphoreCV.wait(lock, [this]() {
-					return this->availableOutputBuffers > 0;
+					return !this->freeOutputBuffersQueue.empty();
 				});
-				this->availableOutputBuffers--;
+				outputBuffer = this->freeOutputBuffersQueue.front();
+				this->freeOutputBuffersQueue.pop();
 			}
 
-			this->currentOutputBuffer = (this->currentOutputBuffer + 1) % 2;
-			IOBuffer& output = (this->currentOutputBuffer == 0)
-				? this->outputBuffer1
-				: this->outputBuffer2;
+			IOBuffer& output = *outputBuffer;
 
 			// Propagate buffer ID to output
 			output.setBufferId(bufferId);
@@ -632,6 +629,9 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 
 	this->impl->outputBuffer1.setDataType(IOBuffer::DataType::FLOAT32);
 	this->impl->outputBuffer2.setDataType(IOBuffer::DataType::FLOAT32);
+	this->impl->freeOutputBuffersQueue = {};
+	this->impl->freeOutputBuffersQueue.push(&this->impl->outputBuffer1);
+	this->impl->freeOutputBuffersQueue.push(&this->impl->outputBuffer2);
 
 	// Allocate input buffers
 	size_t inputSize = config.dataParams.samplesPerBuffer() * (config.dataParams.getBytesPerSample());
@@ -693,6 +693,7 @@ void CpuBackend::cleanup() {
 	}
 	
 	// Release output buffers
+	this->impl->freeOutputBuffersQueue = {};
 	this->impl->outputBuffer1.releaseMemory();
 	this->impl->outputBuffer2.releaseMemory();
 	
@@ -831,14 +832,13 @@ int CpuBackend::getNumInputBuffers() const {
 }
 
 int CpuBackend::getOutputBufferCount() const {
-	return 2;  // Fixed ping-pong buffers. todo: make configurable
+	return 2;  // Fixed buffer count. todo: make configurable
 }
 
 void CpuBackend::releaseOutputBuffer(IOBuffer* buffer) {
-	(void)buffer;
 	{
 		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-		this->impl->availableOutputBuffers++;
+		this->impl->freeOutputBuffersQueue.push(buffer);
 	}
 	this->impl->outputSemaphoreCV.notify_one();
 }

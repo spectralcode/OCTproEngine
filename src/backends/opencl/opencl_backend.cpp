@@ -191,9 +191,8 @@ struct OpenClBackend::Impl {
 	VkFFTApplication fftApp;
 	bool fftDebugPrinted = false;
 
-	//	Host output buffers (rotating pool for ordered callback delivery)
+	//	Host output buffers
 	std::vector<IOBuffer> hostOutputBuffers;
-	std::atomic<int> currentOutputBuffer{0};
 
 	//	Callback
 	std::function<void(const IOBuffer&)> callback;
@@ -216,10 +215,10 @@ struct OpenClBackend::Impl {
 	std::thread callbackWorkerThread;
 	std::atomic<bool> callbackWorkerRunning{false};
 
-	// Semaphore to limit in-flight output buffers (prevents buffer reuse before callback delivery)
+	// Only released buffers may be selected for another output.
 	std::mutex outputSemaphoreMutex;
 	std::condition_variable outputSemaphoreCV;
-	int availableOutputBuffers = 0;
+	std::queue<IOBuffer*> freeOutputBuffersQueue;
 
 	Impl() = default;
 
@@ -922,11 +921,13 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 	//	Allocate host output buffers (one per command queue)
 	size_t outputSize = (this->impl->samplesPerBuffer / 2) * sizeof(float);
 	this->impl->hostOutputBuffers.resize(this->impl->numCommandQueues);
+	this->impl->freeOutputBuffersQueue = {};
 	for (int i = 0; i < this->impl->numCommandQueues; ++i) {
 		if (!this->impl->hostOutputBuffers[i].allocateMemory(outputSize)) {
 			throw std::runtime_error("Failed to allocate output buffer " + std::to_string(i));
 		}
 		this->impl->hostOutputBuffers[i].setDataType(IOBuffer::DataType::FLOAT32);
+		this->impl->freeOutputBuffersQueue.push(&this->impl->hostOutputBuffers[i]);
 	}
 
 	//	Pre-allocate callback data pool
@@ -935,9 +936,6 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 	for (auto& data : this->impl->callbackDataPool) {
 		data.impl = this->impl.get();
 	}
-
-	//	Initialize output buffer semaphore (all buffers available at start)
-	this->impl->availableOutputBuffers = this->impl->numCommandQueues;
 
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
@@ -1062,6 +1060,7 @@ void OpenClBackend::cleanup() {
 	if (this->impl->callbackWorkerThread.joinable()) {
 		this->impl->callbackWorkerThread.join();
 	}
+	this->impl->freeOutputBuffersQueue = {};
 
 	//	Release device buffers
 	this->releaseDeviceBuffers();
@@ -1114,19 +1113,16 @@ void OpenClBackend::process(IOBuffer& input) {
 	cl_mem d_outputBuffer = this->impl->d_outputBuffers[queueIndex];
 	cl_mem d_sinusoidalScanTmpBuffer = this->impl->d_sinusoidalScanTmpBuffers[queueIndex];
 
-	//	Wait for an output buffer to be available (prevents buffer reuse before callback delivery)
+	//	Wait for an output buffer released by all consumers.
+	IOBuffer* currentOutputBuf;
 	{
 		std::unique_lock<std::mutex> lock(this->impl->outputSemaphoreMutex);
 		this->impl->outputSemaphoreCV.wait(lock, [this]() {
-			return this->impl->availableOutputBuffers > 0;
+			return !this->impl->freeOutputBuffersQueue.empty();
 		});
-		this->impl->availableOutputBuffers--;
+		currentOutputBuf = this->impl->freeOutputBuffersQueue.front();
+		this->impl->freeOutputBuffersQueue.pop();
 	}
-
-	//	Select output buffer from rotating pool (not tied to queue index)
-	int outputBufIdx = this->impl->currentOutputBuffer.fetch_add(1, std::memory_order_relaxed)
-	                   % static_cast<int>(this->impl->hostOutputBuffers.size());
-	IOBuffer* currentOutputBuf = &this->impl->hostOutputBuffers[outputBufIdx];
 
 	//	Get buffer ID from input to propagate to output later
 	uint64_t bufferId = input.getBufferId();
@@ -1862,10 +1858,9 @@ int OpenClBackend::getOutputBufferCount() const {
 }
 
 void OpenClBackend::releaseOutputBuffer(IOBuffer* buffer) {
-	(void)buffer;
 	{
 		std::lock_guard<std::mutex> lock(this->impl->outputSemaphoreMutex);
-		this->impl->availableOutputBuffers++;
+		this->impl->freeOutputBuffersQueue.push(buffer);
 	}
 	this->impl->outputSemaphoreCV.notify_one();
 }
