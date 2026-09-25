@@ -3984,6 +3984,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 	this->impl->stagingOutputIsCoherent = allocatedCoherent;
 
 	// Initialize free staging output buffer queue
+	this->impl->freeStagingOutputQueue = {};
 	for (int i = 0; i < actualNumOutputBuffers; ++i) {
 		this->impl->freeStagingOutputQueue.push(i);
 	}

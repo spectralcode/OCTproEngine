@@ -149,11 +149,9 @@ int main(int argc, char** argv) {
 			processor.initialize();
 			testOwnership(processor, outputCount, policy);
 			processor.cleanup();
-			if (backend == ope::Backend::CPU || backend == ope::Backend::OPENCL) {
-				processor.initialize();
-				testOwnership(processor, outputCount, policy);
-				processor.cleanup();
-			}
+			processor.initialize();
+			testOwnership(processor, outputCount, policy);
+			processor.cleanup();
 		}
 		std::cout << "PASS: " << name << " output ownership (both consumer policies)\n";
 		return 0;
