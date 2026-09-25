@@ -3,6 +3,7 @@
 #include "../include/types.h"
 #include "../include/iobuffer.h"
 #include "../include/version.h"
+#include "test_backend.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -25,10 +26,10 @@
 // ============================================
 // Desktop: Full benchmark with all backends
 // ============================================
-const bool BENCHMARK_CPU = false;
-const bool BENCHMARK_CUDA = true;
-const bool BENCHMARK_OPENCL = false;
-const bool BENCHMARK_VULKAN = true;
+bool BENCHMARK_CPU = false;
+bool BENCHMARK_CUDA = true;
+bool BENCHMARK_OPENCL = false;
+bool BENCHMARK_VULKAN = true;
 
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {256, 512, 1024};
@@ -39,10 +40,10 @@ const int ITERATIONS = 1000;
 // ============================================
 // Jetson Nano: CUDA-only with reduced sizes
 // ============================================
-const bool BENCHMARK_CPU = false;
-const bool BENCHMARK_CUDA = true;
-const bool BENCHMARK_OPENCL = false;
-const bool BENCHMARK_VULKAN = false;
+bool BENCHMARK_CPU = false;
+bool BENCHMARK_CUDA = true;
+bool BENCHMARK_OPENCL = false;
+bool BENCHMARK_VULKAN = false;
 
 const int SIGNAL_LENGTHS[] = {512, 1024, 2048};
 const int ASCANS_PER_BSCAN[] = {32, 64, 128, 256, 512, 1024, 2048};
@@ -539,7 +540,16 @@ void printConfiguration() {
 // Main Benchmark
 // ============================================
 
-int main() {
+int main(int argc, char** argv) {
+	if (argc > 1) {
+		ope::Backend backend;
+		const int status = selectTestBackend(argc, argv, backend);
+		if (status != 0) return status;
+		BENCHMARK_CPU = backend == ope::Backend::CPU;
+		BENCHMARK_CUDA = backend == ope::Backend::CUDA;
+		BENCHMARK_OPENCL = backend == ope::Backend::OPENCL;
+		BENCHMARK_VULKAN = backend == ope::Backend::VULKAN;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << "OCT Processing Performance Benchmark" << std::endl;
 	std::cout << "========================================" << std::endl;
@@ -595,19 +605,19 @@ int main() {
 	};
 	
 	// Run benchmarks backend by backend
-	if (BENCHMARK_CPU) {
+	if (BENCHMARK_CPU && ope::BackendUtils::isCpuAvailable()) {
 		runAllConfigs(ope::Backend::CPU, "CPU", cpuResults);
 	}
 	
-	if (BENCHMARK_CUDA) {
+	if (BENCHMARK_CUDA && ope::BackendUtils::isCudaAvailable()) {
 		runAllConfigs(ope::Backend::CUDA, "CUDA", cudaResults);
 	}
 	
-	if (BENCHMARK_OPENCL) {
+	if (BENCHMARK_OPENCL && ope::BackendUtils::isOpenCLAvailable()) {
 		runAllConfigs(ope::Backend::OPENCL, "OpenCL", openclResults);
 	}
 
-	if (BENCHMARK_VULKAN) {
+	if (BENCHMARK_VULKAN && ope::BackendUtils::isVulkanAvailable()) {
 		runAllConfigs(ope::Backend::VULKAN, "Vulkan", vulkanResults);
 	}
 
@@ -644,6 +654,10 @@ int main() {
 	}
 	
 	// Print results table
+	if (allResults.empty()) {
+		std::cout << "SKIP: no selected backend available" << std::endl;
+		return 77;
+	}
 	std::cout << std::endl;
 	std::cout << "========================================" << std::endl;
 	std::cout << "Results" << std::endl;

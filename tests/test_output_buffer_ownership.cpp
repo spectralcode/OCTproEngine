@@ -1,4 +1,5 @@
 #include "processor.h"
+#include "test_backend.h"
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -116,16 +117,9 @@ void testOwnership(ope::Processor& processor, int outputCount, ope::DropPolicy p
 } // namespace
 
 int main(int argc, char** argv) {
-	check(argc == 2, "Expected backend name");
-	const std::string name = argv[1];
 	ope::Backend backend;
-	bool available = false;
-	if (name == "CPU") { backend = ope::Backend::CPU; available = ope::BackendUtils::isCpuAvailable(); }
-	else if (name == "CUDA") { backend = ope::Backend::CUDA; available = ope::BackendUtils::isCudaAvailable(); }
-	else if (name == "OPENCL") { backend = ope::Backend::OPENCL; available = ope::BackendUtils::isOpenCLAvailable(); }
-	else if (name == "VULKAN") { backend = ope::Backend::VULKAN; available = ope::BackendUtils::isVulkanAvailable(); }
-	else { check(false, "Unknown backend"); return 1; }
-	if (!available) { std::cout << "SKIP: " << name << " unavailable\n"; return 77; }
+	const int status = selectTestBackend(argc, argv, backend);
+	if (status != 0) return status;
 
 	try {
 		for (auto policy : {ope::DropPolicy::BLOCK, ope::DropPolicy::DROP_OLDEST}) {
@@ -153,7 +147,7 @@ int main(int argc, char** argv) {
 			testOwnership(processor, outputCount, policy);
 			processor.cleanup();
 		}
-		std::cout << "PASS: " << name << " output ownership (both consumer policies)\n";
+		std::cout << "PASS: " << argv[1] << " output ownership (both consumer policies)\n";
 		return 0;
 	} catch (const std::exception& error) {
 		std::cerr << "FAIL: " << error.what() << std::endl;

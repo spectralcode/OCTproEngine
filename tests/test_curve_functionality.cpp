@@ -189,6 +189,10 @@ bool outputsAreDifferent(const std::vector<float>& output1, const std::vector<fl
 // ============================================
 
 int main() {
+	if (!ope::BackendUtils::isCpuAvailable()) {
+		std::cout << "SKIP: CPU backend required" << std::endl;
+		return 77;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << "COMPREHENSIVE CURVE FUNCTIONALITY TEST" << std::endl;
 	std::cout << "========================================" << std::endl;
@@ -611,66 +615,70 @@ int main() {
 	
 	TEST_SECTION("Both Backends (CPU and CUDA)");
 	
-	// Test with CPU backend
-	ope::Processor cpuProc(ope::Backend::CPU);
-	cpuProc.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, ope::DataType::UINT16);
-	cpuProc.enableResampling(true);
-	cpuProc.setInterpolationMethod(ope::InterpolationMethod::CUBIC);
-	cpuProc.setResamplingCoefficients(RESAMPLING_COEFFS);
-	cpuProc.enableWindowing(true);
-	cpuProc.setWindowParameters(WINDOW_TYPE, WINDOW_CENTER, WINDOW_FILL_FACTOR);
-	cpuProc.enableDispersionCompensation(true);
-	cpuProc.setDispersionCoefficients(DISPERSION_COEFFS, DISPERSION_FACTOR);
-	cpuProc.enableLogScaling(true);
-	cpuProc.setGrayscaleRange(0.0f, 80.0f);
-	cpuProc.initialize();
-	
-	// Set custom curves on CPU
-	std::vector<float> cpuCustomResampling(SIGNAL_LENGTH);
-	std::vector<float> cpuCustomWindow(SIGNAL_LENGTH);
-	std::vector<float> cpuCustomDispersion(SIGNAL_LENGTH);
-	for (int i = 0; i < SIGNAL_LENGTH; ++i) {
-		cpuCustomResampling[i] = 7.0f + i * 0.5f;
-		cpuCustomWindow[i] = 0.5f + 0.5f * std::cos(i * 6.28f / SIGNAL_LENGTH);
-		cpuCustomDispersion[i] = 0.0008f * i * i;
+	if (ope::BackendUtils::isCudaAvailable()) {
+		// Test with CPU backend
+		ope::Processor cpuProc(ope::Backend::CPU);
+		cpuProc.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, ope::DataType::UINT16);
+		cpuProc.enableResampling(true);
+		cpuProc.setInterpolationMethod(ope::InterpolationMethod::CUBIC);
+		cpuProc.setResamplingCoefficients(RESAMPLING_COEFFS);
+		cpuProc.enableWindowing(true);
+		cpuProc.setWindowParameters(WINDOW_TYPE, WINDOW_CENTER, WINDOW_FILL_FACTOR);
+		cpuProc.enableDispersionCompensation(true);
+		cpuProc.setDispersionCoefficients(DISPERSION_COEFFS, DISPERSION_FACTOR);
+		cpuProc.enableLogScaling(true);
+		cpuProc.setGrayscaleRange(0.0f, 80.0f);
+		cpuProc.initialize();
+
+		// Set custom curves on CPU
+		std::vector<float> cpuCustomResampling(SIGNAL_LENGTH);
+		std::vector<float> cpuCustomWindow(SIGNAL_LENGTH);
+		std::vector<float> cpuCustomDispersion(SIGNAL_LENGTH);
+		for (int i = 0; i < SIGNAL_LENGTH; ++i) {
+			cpuCustomResampling[i] = 7.0f + i * 0.5f;
+			cpuCustomWindow[i] = 0.5f + 0.5f * std::cos(i * 6.28f / SIGNAL_LENGTH);
+			cpuCustomDispersion[i] = 0.0008f * i * i;
+		}
+		cpuProc.setCustomResamplingCurve(cpuCustomResampling.data(), cpuCustomResampling.size());
+		cpuProc.setCustomWindowCurve(cpuCustomWindow.data(), cpuCustomWindow.size());
+		cpuProc.setCustomDispersionCurve(cpuCustomDispersion.data(), cpuCustomDispersion.size());
+
+		ProcessingResult cpuResult;
+		bool cpuSuccess = processData(cpuProc, testData, cpuResult);
+		ASSERT_TRUE(cpuSuccess, "CPU backend with custom curves succeeded");
+		ASSERT_TRUE(isOutputValid(cpuResult.output), "CPU backend output valid");
+
+		// Test with CUDA backend (same curves)
+		ope::Processor cudaProc(ope::Backend::CUDA);
+		cudaProc.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, ope::DataType::UINT16);
+		cudaProc.enableResampling(true);
+		cudaProc.setInterpolationMethod(ope::InterpolationMethod::CUBIC);
+		cudaProc.setResamplingCoefficients(RESAMPLING_COEFFS);
+		cudaProc.enableWindowing(true);
+		cudaProc.setWindowParameters(WINDOW_TYPE, WINDOW_CENTER, WINDOW_FILL_FACTOR);
+		cudaProc.enableDispersionCompensation(true);
+		cudaProc.setDispersionCoefficients(DISPERSION_COEFFS, DISPERSION_FACTOR);
+		cudaProc.enableLogScaling(true);
+		cudaProc.setGrayscaleRange(0.0f, 80.0f);
+		cudaProc.initialize();
+
+		// Set same custom curves on CUDA
+		cudaProc.setCustomResamplingCurve(cpuCustomResampling.data(), cpuCustomResampling.size());
+		cudaProc.setCustomWindowCurve(cpuCustomWindow.data(), cpuCustomWindow.size());
+		cudaProc.setCustomDispersionCurve(cpuCustomDispersion.data(), cpuCustomDispersion.size());
+
+		ProcessingResult cudaResult;
+		bool cudaSuccess = processData(cudaProc, testData, cudaResult);
+		ASSERT_TRUE(cudaSuccess, "CUDA backend with custom curves succeeded");
+		ASSERT_TRUE(isOutputValid(cudaResult.output), "CUDA backend output valid");
+
+		// Verify CPU and CUDA produce similar results with same curves (should match within tolerance)
+		bool backendsSimilar = !outputsAreDifferent(cpuResult.output, cudaResult.output, 0.1f);
+		ASSERT_TRUE(backendsSimilar, "CPU and CUDA backends produce similar outputs with same curves");
+	} else {
+		std::cout << "SKIP: CPU/CUDA comparison: CUDA unavailable" << std::endl;
 	}
-	cpuProc.setCustomResamplingCurve(cpuCustomResampling.data(), cpuCustomResampling.size());
-	cpuProc.setCustomWindowCurve(cpuCustomWindow.data(), cpuCustomWindow.size());
-	cpuProc.setCustomDispersionCurve(cpuCustomDispersion.data(), cpuCustomDispersion.size());
-	
-	ProcessingResult cpuResult;
-	bool cpuSuccess = processData(cpuProc, testData, cpuResult);
-	ASSERT_TRUE(cpuSuccess, "CPU backend with custom curves succeeded");
-	ASSERT_TRUE(isOutputValid(cpuResult.output), "CPU backend output valid");
-	
-	// Test with CUDA backend (same curves)
-	ope::Processor cudaProc(ope::Backend::CUDA);
-	cudaProc.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, ope::DataType::UINT16);
-	cudaProc.enableResampling(true);
-	cudaProc.setInterpolationMethod(ope::InterpolationMethod::CUBIC);
-	cudaProc.setResamplingCoefficients(RESAMPLING_COEFFS);
-	cudaProc.enableWindowing(true);
-	cudaProc.setWindowParameters(WINDOW_TYPE, WINDOW_CENTER, WINDOW_FILL_FACTOR);
-	cudaProc.enableDispersionCompensation(true);
-	cudaProc.setDispersionCoefficients(DISPERSION_COEFFS, DISPERSION_FACTOR);
-	cudaProc.enableLogScaling(true);
-	cudaProc.setGrayscaleRange(0.0f, 80.0f);
-	cudaProc.initialize();
-	
-	// Set same custom curves on CUDA
-	cudaProc.setCustomResamplingCurve(cpuCustomResampling.data(), cpuCustomResampling.size());
-	cudaProc.setCustomWindowCurve(cpuCustomWindow.data(), cpuCustomWindow.size());
-	cudaProc.setCustomDispersionCurve(cpuCustomDispersion.data(), cpuCustomDispersion.size());
-	
-	ProcessingResult cudaResult;
-	bool cudaSuccess = processData(cudaProc, testData, cudaResult);
-	ASSERT_TRUE(cudaSuccess, "CUDA backend with custom curves succeeded");
-	ASSERT_TRUE(isOutputValid(cudaResult.output), "CUDA backend output valid");
-	
-	// Verify CPU and CUDA produce similar results with same curves (should match within tolerance)
-	bool backendsSimilar = !outputsAreDifferent(cpuResult.output, cudaResult.output, 0.1f);
-	ASSERT_TRUE(backendsSimilar, "CPU and CUDA backends produce similar outputs with same curves");
-	
+
 	// ============================================
 	// FINAL RESULTS
 	// ============================================

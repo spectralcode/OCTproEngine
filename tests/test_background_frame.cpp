@@ -1,5 +1,6 @@
 #include "../include/processor.h"
 #include "test_utils.h"
+#include "test_backend.h"
 #include <iostream>
 #include <vector>
 #include <atomic>
@@ -602,10 +603,10 @@ void testSetConfigProfileHandling(ope::Backend backend) {
 }
 
 // Invalid configurations and profile files must be rejected without partial state
-void testValidationRejection() {
+void testValidationRejection(ope::Backend backend) {
 	std::cout << "  Validation: invalid setConfig() and NaN profile file rejected..." << std::endl;
 
-	ope::Processor processor(ope::Backend::CPU);
+	ope::Processor processor(backend);
 	configurePassthrough(processor, 1);
 	processor.initialize();
 
@@ -699,20 +700,16 @@ void testBackendSwitchTransfer() {
 // passive pre-initialization profile handling must still work everywhere
 
 // Profile set and reset must work on an uninitialized processor on every backend
-void testResetBeforeInitialization() {
+void testResetBeforeInitialization(ope::Backend backend) {
 	std::cout << "  Profile set/reset before initialization..." << std::endl;
 
-	if (ope::BackendUtils::isOpenCLAvailable()) {
-		ope::Processor processor(ope::Backend::OPENCL);
-		processor.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
-		std::vector<float> frame(SAMPLES_PER_BSCAN, 5.0f);
-		processor.setBackgroundFrameProfile(frame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
-		TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Profile must be stored before initialization");
-		processor.resetBackgroundFrame();
-		TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Reset must clear the profile before initialization");
-	} else {
-		std::cout << "    [SKIPPED] no OpenCL runtime available" << std::endl;
-	}
+	ope::Processor processor(backend);
+	processor.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
+	std::vector<float> frame(SAMPLES_PER_BSCAN, 5.0f);
+	processor.setBackgroundFrameProfile(frame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+	TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Profile must be stored before initialization");
+	processor.resetBackgroundFrame();
+	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Reset must clear the profile before initialization");
 }
 
 // After a failed switch the stored backend configuration must describe the backend
@@ -973,48 +970,48 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testProfileOriginalsSurviveResize(backend);
 	testCalibrationSurvivesReinitRoundTrips(backend);
 	testRecordingWithSmoothingInFlight(backend);
+	testValidationRejection(backend);
+	testResetBeforeInitialization(backend);
 }
 
-int main() {
+int main(int argc, char** argv) {
+	const bool crossBackend = argc == 2 && std::string(argv[1]) == "--cross-backend";
+	ope::Backend backend;
+	if (crossBackend) {
+		if (!ope::BackendUtils::isCpuAvailable()) {
+			std::cout << "SKIP: CPU backend required for comparisons" << std::endl;
+			return 77;
+		}
+		if (!ope::BackendUtils::isCudaAvailable() && !ope::BackendUtils::isOpenCLAvailable() &&
+			!ope::BackendUtils::isVulkanAvailable()) {
+			std::cout << "SKIP: a GPU backend is required for comparisons" << std::endl;
+			return 77;
+		}
+	} else {
+		const int status = selectTestBackend(argc, argv, backend);
+		if (status != 0) return status;
+	}
 	std::cout << "=== Background Frame Subtraction Tests (Line-Field OCT) ===" << std::endl;
 	try {
-		runBackendSuite(ope::Backend::CPU, "CPU");
-
 		// Availability is decided by BackendUtils, not by catching exceptions:
 		// once a backend is available, every failure inside the suite fails the test
-		if (ope::BackendUtils::isCudaAvailable()) {
-			runBackendSuite(ope::Backend::CUDA, "CUDA");
+		if (!crossBackend) {
+			runBackendSuite(backend, argv[1]);
 		} else {
-			std::cout << "  [SKIPPED] CUDA suite: no CUDA device available" << std::endl;
-		}
-
-		if (ope::BackendUtils::isOpenCLAvailable()) {
-			runBackendSuite(ope::Backend::OPENCL, "OpenCL");
-		} else {
-			std::cout << "  [SKIPPED] OpenCL suite: no OpenCL runtime available" << std::endl;
-		}
-
-		if (ope::BackendUtils::isVulkanAvailable()) {
-			runBackendSuite(ope::Backend::VULKAN, "Vulkan");
-		} else {
-			std::cout << "  [SKIPPED] Vulkan suite: no Vulkan runtime available" << std::endl;
-		}
-
-		std::cout << "\n=== Cross-backend ===" << std::endl;
-		testValidationRejection();
-		testBackendSwitchTransfer();
-		testResetBeforeInitialization();
-		testFailedSwitchKeepsAccurateMetadata();
-		testFailedSwitchKeepsCalibrationRecoverable();
-		testRecordedProfilesExportAfterSwitch();
-		if (ope::BackendUtils::isCudaAvailable()) {
-			testSequenceMatchesCpu(ope::Backend::CUDA, "CUDA");
-		}
-		if (ope::BackendUtils::isOpenCLAvailable()) {
-			testSequenceMatchesCpu(ope::Backend::OPENCL, "OpenCL");
-		}
-		if (ope::BackendUtils::isVulkanAvailable()) {
-			testSequenceMatchesCpu(ope::Backend::VULKAN, "Vulkan");
+			std::cout << "\n=== Cross-backend ===" << std::endl;
+			testBackendSwitchTransfer();
+			testFailedSwitchKeepsAccurateMetadata();
+			testFailedSwitchKeepsCalibrationRecoverable();
+			testRecordedProfilesExportAfterSwitch();
+			if (ope::BackendUtils::isCudaAvailable()) {
+				testSequenceMatchesCpu(ope::Backend::CUDA, "CUDA");
+			}
+			if (ope::BackendUtils::isOpenCLAvailable()) {
+				testSequenceMatchesCpu(ope::Backend::OPENCL, "OpenCL");
+			}
+			if (ope::BackendUtils::isVulkanAvailable()) {
+				testSequenceMatchesCpu(ope::Backend::VULKAN, "Vulkan");
+			}
 		}
 
 		std::cout << "\nAll background frame tests passed" << std::endl;

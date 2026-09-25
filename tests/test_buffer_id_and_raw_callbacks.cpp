@@ -1,3 +1,4 @@
+#include "test_backend.h"
 #include "../include/processor.h"
 #include "../include/processortool.h"
 #include <iostream>
@@ -9,7 +10,7 @@
 #include <map>
 #include <mutex>
 
-const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+ope::Backend testBackend;
 
 // Simple tool for testing that collects buffer IDs
 class TestRecorderTool : public ope::ProcessorTool {
@@ -60,7 +61,7 @@ void testBufferIdPropagation() {
 	std::cout << "Testing buffer ID propagation..." << std::endl;
 
 	// Create processor
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 
 	processor.setInputParameters(
 		1024,  // samplesPerAscan
@@ -118,7 +119,7 @@ void testBufferIdPropagation() {
 void testInputCallbacks() {
 	std::cout << "\nTesting input callbacks..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(512, 256, 1, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -178,7 +179,7 @@ void testInputCallbacks() {
 void testProcessorToolAttachment() {
 	std::cout << "\nTesting ProcessorTool attachment/detachment..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(256, 128, 1, ope::DataType::UINT8);
 	processor.initialize();
 
@@ -220,7 +221,9 @@ void testProcessorToolAttachment() {
 	std::cout << "  [OK] Tool attachment/detachment works correctly" << std::endl;
 }
 
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "=== Testing Buffer IDs and Input/Output Callbacks ===" << std::endl;
 
 	try {

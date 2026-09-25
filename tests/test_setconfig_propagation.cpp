@@ -133,6 +133,10 @@ void testDataTypeChangeReinitializes() {
 }
 
 int main() {
+	if (!ope::BackendUtils::isCpuAvailable()) {
+		std::cout << "SKIP: CPU backend required" << std::endl;
+		return 77;
+	}
 	std::cout << "=== setConfig() Propagation Test ===" << std::endl;
 	try {
 		testSetConfigPropagatesProcessingFlags();

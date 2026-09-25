@@ -1,6 +1,7 @@
 // Simple test for multi-consumer callback functionality
 // Tests that multiple callbacks can be registered and all receive data
 
+#include "test_backend.h"
 #include "../include/processor.h"
 #include "../include/processorconfiguration.h"
 #include "../include/types.h"
@@ -31,7 +32,7 @@ const bool DC_REMOVAL_ENABLED = false;
 const bool INTENSITY_LOG_SCALE = true;
 
 // Backend for all tests
-const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+ope::Backend testBackend;
 
 
 // Generate simple test data
@@ -74,7 +75,7 @@ bool test_basic_multi_consumer() {
 	std::cout << "TEST 1: Basic Multi-Consumer" << std::endl;
 	std::cout << "  Testing that 3 callbacks all receive data..." << std::endl;
 	
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -127,7 +128,7 @@ bool test_remove_callback() {
 	std::cout << "TEST 2: Remove Callback" << std::endl;
 	std::cout << "  Testing callback removal..." << std::endl;
 	
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -181,7 +182,7 @@ bool test_clear_callbacks() {
 	std::cout << "TEST 3: Clear All Callbacks" << std::endl;
 	std::cout << "  Testing clearOutputCallbacks()..." << std::endl;
 	
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -228,7 +229,7 @@ bool test_data_integrity() {
 	std::cout << "TEST 4: Data Integrity" << std::endl;
 	std::cout << "  Testing that all callbacks receive same data..." << std::endl;
 	
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -307,7 +308,7 @@ bool test_multiple_frames() {
 	std::cout << "TEST 5: Multiple Frames" << std::endl;
 	std::cout << "  Testing multiple frames with multiple callbacks..." << std::endl;
 	
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 	
@@ -355,7 +356,7 @@ bool test_queue_depth() {
 	const int NUM_BUFFERS = 100;
 	const int CALLBACK_DELAY_US = 500;  // Small delay to allow queue buildup
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	auto config = processor.getConfig();
 	config.dataParams.signalLength = PERF_SIGNAL_LENGTH;
 	config.dataParams.ascansPerBscan = PERF_ASCANS_PER_BSCAN;
@@ -427,7 +428,9 @@ bool test_queue_depth() {
 // ============================================
 // Main
 // ============================================
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "========================================" << std::endl;
 	std::cout << "Multi-Consumer Callback Tests" << std::endl;
 	std::cout << "========================================" << std::endl;

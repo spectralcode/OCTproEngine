@@ -296,6 +296,10 @@ void testVulkanInputTypes() {
 // ============================================
 
 int main() {
+	if (!ope::BackendUtils::isCpuAvailable() || !ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "SKIP: CPU and CUDA are required for this comparison" << std::endl;
+		return 77;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << "Backend Comparison Test (CPU/CUDA/OpenCL/Vulkan)" << std::endl;
 	std::cout << "========================================" << std::endl;

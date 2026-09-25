@@ -39,23 +39,15 @@ int main() {
 
 	//	Determine which backend to start with
 	Backend startBackend;
-	bool startBackendFound = false;
-
-#ifdef OPE_CUDA_AVAILABLE
-	startBackend = Backend::CUDA;
-	startBackendFound = true;
-#elif defined(OPE_OPENCL_AVAILABLE)
-	startBackend = Backend::OPENCL;
-	startBackendFound = true;
-#elif defined(OPE_CPU_AVAILABLE)
-	startBackend = Backend::CPU;
-	startBackendFound = true;
-#endif
-
-	if (!startBackendFound) {
-		std::cerr << "ERROR: No backends available!" << std::endl;
-		std::cerr << "OCTproEngine must be compiled with at least one backend." << std::endl;
-		return 1;
+	if (BackendUtils::isCudaAvailable()) {
+		startBackend = Backend::CUDA;
+	} else if (BackendUtils::isOpenCLAvailable()) {
+		startBackend = Backend::OPENCL;
+	} else if (BackendUtils::isCpuAvailable()) {
+		startBackend = Backend::CPU;
+	} else {
+		std::cout << "SKIP: no CPU, CUDA or OpenCL backend available" << std::endl;
+		return 77;
 	}
 
 	//	Generate test data
@@ -139,7 +131,7 @@ int main() {
 
 	//	Try switching to CUDA (if not already using it and if available)
 #ifdef OPE_CUDA_AVAILABLE
-	if (startBackend != Backend::CUDA) {
+	if (startBackend != Backend::CUDA && BackendUtils::isCudaAvailable()) {
 		std::cout << "\nSwitching to CUDA backend..." << std::endl;
 		try {
 			processor.setBackend(Backend::CUDA);
@@ -167,14 +159,15 @@ int main() {
 			}
 			testedBackends++;
 		} catch (const std::exception& e) {
-			std::cerr << "  [SKIPPED] CUDA backend not available at runtime" << std::endl;
+			std::cerr << "  [FAILED] CUDA: " << e.what() << std::endl;
+			return 1;
 		}
 	}
 #endif
 
 	//	Try switching to OpenCL (if not already using it and if available)
 #ifdef OPE_OPENCL_AVAILABLE
-	if (startBackend != Backend::OPENCL) {
+	if (startBackend != Backend::OPENCL && BackendUtils::isOpenCLAvailable()) {
 		std::cout << "\nSwitching to OpenCL backend..." << std::endl;
 		try {
 			processor.setBackend(Backend::OPENCL);
@@ -202,14 +195,15 @@ int main() {
 			}
 			testedBackends++;
 		} catch (const std::exception& e) {
-			std::cerr << "  [SKIPPED] OpenCL backend not available at runtime" << std::endl;
+			std::cerr << "  [FAILED] OpenCL: " << e.what() << std::endl;
+			return 1;
 		}
 	}
 #endif
 
 	//	Try switching to CPU (if not already using it and if available)
 #ifdef OPE_CPU_AVAILABLE
-	if (startBackend != Backend::CPU) {
+	if (startBackend != Backend::CPU && BackendUtils::isCpuAvailable()) {
 		std::cout << "\nSwitching to CPU backend..." << std::endl;
 		try {
 			processor.setBackend(Backend::CPU);
@@ -237,7 +231,8 @@ int main() {
 			}
 			testedBackends++;
 		} catch (const std::exception& e) {
-			std::cerr << "  [SKIPPED] CPU backend not available at runtime" << std::endl;
+			std::cerr << "  [FAILED] CPU: " << e.what() << std::endl;
+			return 1;
 		}
 	}
 #endif
@@ -249,7 +244,7 @@ int main() {
 		std::cout << "TEST SKIPPED" << std::endl;
 		std::cout << "Only one backend available - cannot test state transfer" << std::endl;
 		std::cout << "Compile with multiple backends to test state transfer" << std::endl;
-		return 0;  // Not a failure, just can't test
+		return 77;  // Not a failure, just can't test
 	} else if (successfulTransfers == testedBackends - 1) {
 		std::cout << "TEST PASSED" << std::endl;
 		std::cout << "Background profile successfully transferred between all available backends" << std::endl;

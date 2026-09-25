@@ -1,4 +1,5 @@
 #include "../include/processor.h"
+#include "test_backend.h"
 #include "test_utils.h"
 #include <iostream>
 #include <vector>
@@ -143,30 +144,15 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testDisabledIsBaseline(backend);
 }
 
-int main() {
+int main(int argc, char** argv) {
+	ope::Backend backend;
+	const int status = selectTestBackend(argc, argv, backend);
+	if (status != 0) return status;
 	std::cout << "=== Post-FFT Frame Correction Tests (Line-Field OCT) ===" << std::endl;
 	try {
-		runBackendSuite(ope::Backend::CPU, "CPU");
-
 		// Availability is decided by BackendUtils, not by catching exceptions:
 		// once a backend is available, every failure inside the suite fails the test
-		if (ope::BackendUtils::isCudaAvailable()) {
-			runBackendSuite(ope::Backend::CUDA, "CUDA");
-		} else {
-			std::cout << "  [SKIPPED] CUDA suite: no CUDA device available" << std::endl;
-		}
-
-		if (ope::BackendUtils::isOpenCLAvailable()) {
-			runBackendSuite(ope::Backend::OPENCL, "OpenCL");
-		} else {
-			std::cout << "  [SKIPPED] OpenCL suite: no OpenCL runtime available" << std::endl;
-		}
-
-		if (ope::BackendUtils::isVulkanAvailable()) {
-			runBackendSuite(ope::Backend::VULKAN, "Vulkan");
-		} else {
-			std::cout << "  [SKIPPED] Vulkan suite: no Vulkan runtime available" << std::endl;
-		}
+		runBackendSuite(backend, argv[1]);
 
 		std::cout << "\nAll frame correction tests passed" << std::endl;
 		return 0;

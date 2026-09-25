@@ -8,6 +8,7 @@
  * - The buffer is only reused by the producer when ALL consumers released it
  */
 
+#include "test_backend.h"
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -18,7 +19,7 @@
 #include "test_utils.h"
 
 // Test configuration
-constexpr ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+ope::Backend testBackend;
 constexpr int SIGNAL_LENGTH = 1024;
 constexpr int ASCANS_PER_BSCAN = 256;
 constexpr int BSCANS_PER_BUFFER = 1;
@@ -62,7 +63,7 @@ bool test_basic_input_consumer() {
 	std::cout << "TEST 1: Basic Single Input Consumer" << std::endl;
 	std::cout << "  Testing single consumer can read raw input data..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 
@@ -123,7 +124,7 @@ bool test_multiple_input_consumers() {
 	std::cout << "TEST 2: Multiple Input Consumers" << std::endl;
 	std::cout << "  Testing 2 consumers can all read same raw data..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 
@@ -206,7 +207,7 @@ bool test_input_and_output_consumers() {
 	std::cout << "TEST 3: Input + Output Consumers Together" << std::endl;
 	std::cout << "  Testing raw input and processed output consumers work together..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 
@@ -292,7 +293,7 @@ bool test_input_data_integrity() {
 	std::cout << "TEST 4: Data Integrity" << std::endl;
 	std::cout << "  Testing multiple consumers receive identical raw data..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 
@@ -385,7 +386,7 @@ bool test_try_get_input_buffer() {
 	std::cout << "TEST 5: tryGetInputBuffer (non-blocking)" << std::endl;
 	std::cout << "  Testing non-blocking input buffer retrieval..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	configureProcessor(processor);
 	processor.initialize();
 
@@ -435,7 +436,9 @@ bool test_try_get_input_buffer() {
 // ============================================
 // Main
 // ============================================
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "========================================" << std::endl;
 	std::cout << "Input Consumer Polling API Tests" << std::endl;
 	std::cout << "========================================" << std::endl;

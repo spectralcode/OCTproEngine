@@ -1,3 +1,4 @@
+#include "test_backend.h"
 #include "../include/processor.h"
 #include "test_utils.h"
 #include <iostream>
@@ -8,7 +9,7 @@
 #include <chrono>
 #include <cstring>
 
-const ope::Backend TEST_BACKEND = ope::Backend::VULKAN;
+ope::Backend testBackend;
 
 // Simple test: Count A-scans with non-zero data in processed output
 void testProgressiveDataContent() {
@@ -22,17 +23,17 @@ void testProgressiveDataContent() {
 
     const int bitDepth = getDataTypeBitDepth(dataType);
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT16);
 	processor.initialize();
 
 	// Print configuration
 	std::cout << "\n=== Configuration ===" << std::endl;
 	std::cout << "  Backend: ";
-	if (TEST_BACKEND == ope::Backend::CUDA) std::cout << "CUDA" << std::endl;
-	else if (TEST_BACKEND == ope::Backend::VULKAN) std::cout << "Vulkan" << std::endl;
-	else if (TEST_BACKEND == ope::Backend::OPENCL) std::cout << "OpenCL" << std::endl;
-	else if (TEST_BACKEND == ope::Backend::CPU) std::cout << "CPU" << std::endl;
+	if (testBackend == ope::Backend::CUDA) std::cout << "CUDA" << std::endl;
+	else if (testBackend == ope::Backend::VULKAN) std::cout << "Vulkan" << std::endl;
+	else if (testBackend == ope::Backend::OPENCL) std::cout << "OpenCL" << std::endl;
+	else if (testBackend == ope::Backend::CPU) std::cout << "CPU" << std::endl;
 	std::cout << "  Samples per signal: " << signalLength << std::endl;
 	std::cout << "  A-scans per B-scan: " << ascansPerBscan << std::endl;
 	std::cout << "  B-scans per buffer: " << bscansPerBuffer << std::endl;
@@ -172,7 +173,9 @@ void testProgressiveDataContent() {
 	std::cout << "  [OK] All " << numBuffers << " buffers arrived in order with exact modulo signal counts" << std::endl;
 }
 
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "=== Progressive Data Content Test ===" << std::endl;
 	try {
 		testProgressiveDataContent();

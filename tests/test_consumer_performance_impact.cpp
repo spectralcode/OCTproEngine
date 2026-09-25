@@ -12,6 +12,7 @@
  * 4. Mixed input + output consumers
  */
 
+#include "test_backend.h"
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -21,7 +22,7 @@
 #include <iomanip>
 #include "processor.h"
 
-constexpr ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+ope::Backend testBackend;
 constexpr int SIGNAL_LENGTH = 2048;
 constexpr int ASCANS_PER_BSCAN = 512;
 constexpr int BSCANS_PER_BUFFER = 1;
@@ -70,7 +71,7 @@ PerformanceResult runPerformanceTest(
 		testData[i] = static_cast<uint16_t>(i % 65536);
 	}
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	auto config = processor.getConfig();
 	config.dataParams.signalLength = SIGNAL_LENGTH;
 	config.dataParams.ascansPerBscan = ASCANS_PER_BSCAN;
@@ -342,13 +343,15 @@ void testFastConsumerScaling() {
 	std::cout << std::endl;
 }
 
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "========================================" << std::endl;
 	std::cout << "Consumer Performance Impact Test" << std::endl;
 	std::cout << "========================================" << std::endl;
-	std::cout << "Backend: " << (TEST_BACKEND == ope::Backend::CUDA ? "CUDA" :
-								  TEST_BACKEND == ope::Backend::VULKAN ? "Vulkan" :
-								  TEST_BACKEND == ope::Backend::OPENCL ? "OpenCL" : "CPU") << std::endl;
+	std::cout << "Backend: " << (testBackend == ope::Backend::CUDA ? "CUDA" :
+								  testBackend == ope::Backend::VULKAN ? "Vulkan" :
+								  testBackend == ope::Backend::OPENCL ? "OpenCL" : "CPU") << std::endl;
 	std::cout << "Signal: " << SIGNAL_LENGTH << " samples" << std::endl;
 	std::cout << "A-scans: " << ASCANS_PER_BSCAN << " per B-scan" << std::endl;
 	std::cout << "Iterations: " << NUM_ITERATIONS << std::endl;

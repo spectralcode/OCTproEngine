@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 #include "processor.h"
+#include "test_backend.h"
 
 namespace {
 
@@ -241,7 +242,12 @@ double averageMsPerFrame(const ScenarioResult& scenario) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+	ope::Backend selectedBackend;
+	if (argc > 1) {
+		const int status = selectTestBackend(argc, argv, selectedBackend);
+		if (status != 0) return status;
+	}
 	printf("Dual processor performance test\n");
 	printf("Geometry: %d x %d x %d UINT16, output %d x %d FLOAT32\n",
 	       SIGNAL_LENGTH, ASCANS_PER_BSCAN, BSCANS_PER_BUFFER, SIGNAL_LENGTH / 2, ASCANS_PER_BSCAN);
@@ -257,6 +263,7 @@ int main() {
 	const BackendPlan plans[] = {
 		{ope::Backend::CPU, "CPU", ope::BackendUtils::isCpuAvailable(), ITERATIONS_CPU},
 		{ope::Backend::CUDA, "CUDA", ope::BackendUtils::isCudaAvailable(), ITERATIONS_GPU},
+		{ope::Backend::OPENCL, "OpenCL", ope::BackendUtils::isOpenCLAvailable(), ITERATIONS_GPU},
 		{ope::Backend::VULKAN, "Vulkan", ope::BackendUtils::isVulkanAvailable(), ITERATIONS_GPU},
 	};
 
@@ -269,6 +276,7 @@ int main() {
 	bool anyFailure = false;
 
 	for (const auto& plan : plans) {
+		if (argc > 1 && plan.backend != selectedBackend) continue;
 		if (!plan.available) {
 			printf("\n=== %s: backend not available, skipped ===\n", plan.name);
 			continue;
@@ -308,8 +316,8 @@ int main() {
 	printf("(or a single pipeline already saturates the device)\n");
 
 	if (rows.empty()) {
-		printf("FAIL: no backend available\n");
-		return 1;
+		printf("SKIP: no backend available\n");
+		return 77;
 	}
 	if (anyFailure) {
 		printf("FAIL\n");

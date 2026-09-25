@@ -187,6 +187,10 @@ void testConfigurationImports() {
 } // namespace
 
 int main() {
+	if (!ope::BackendUtils::isCpuAvailable()) {
+		std::cout << "SKIP: CPU backend required" << std::endl;
+		return 77;
+	}
 	int result = 0;
 	try {
 		testImports();

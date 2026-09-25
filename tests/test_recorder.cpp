@@ -1,3 +1,4 @@
+#include "test_backend.h"
 #include "../include/processor.h"
 #include "../include/tools/recorder.h"
 #include "test_utils.h"
@@ -8,7 +9,7 @@
 #include <cstdio>
 #include <cstring>
 
-const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+ope::Backend testBackend;
 const bool DELETE_TEST_FILES = true;
 
 
@@ -31,7 +32,7 @@ void deleteTestFile(const char* filename) {
 void testBasicRecording() {
 	std::cout << "Testing basic recording..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(2048, 1024, 2, ope::DataType::UINT16);
 
 
@@ -71,7 +72,7 @@ void testBasicRecording() {
 void testStartRecordingWhileProcessing() {
 	std::cout << "\nTesting start recording while processing is already running..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(1024, 512, 1, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -143,7 +144,7 @@ void testStartRecordingWhileProcessing() {
 void testEarlyStopIncompleteRecording() {
 	std::cout << "\nTesting early stop with incomplete recording..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(1024, 512, 2, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -184,7 +185,7 @@ void testEarlyStopIncompleteRecording() {
 void testVolumeSynchronizationBothMode() {
 	std::cout << "\nTesting volume synchronization in BOTH mode..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(1024, 512, 1, ope::DataType::UINT16);
 
 	const int buffersPerVolume = 8;
@@ -255,7 +256,7 @@ void testVolumeSynchronizationBothMode() {
 void testAbortRecording() {
 	std::cout << "\nTesting abortRecording()..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(1024, 512, 2, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -316,7 +317,7 @@ void testAbortRecording() {
 void testAllocationModeSwitching() {
 	std::cout << "\nTesting allocation mode switching..." << std::endl;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(1024, 512, 2, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -407,7 +408,7 @@ void testProgressiveDataPattern() {
 	const int bscansPerBuffer = 1;
 	const int numBuffers = 32;
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -617,7 +618,7 @@ void testDiskWritePerformance() {
 	const int bscansPerBuffer = 1;
 	const int numBuffers = 128; 
 
-	ope::Processor processor(TEST_BACKEND);
+	ope::Processor processor(testBackend);
 	processor.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT16);
 	processor.initialize();
 
@@ -770,7 +771,9 @@ void testDiskWritePerformance() {
 	std::cout << "  [OK] Disk write performance test" << std::endl;
 }
 
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "=== Testing Recorder Tool ===" << std::endl;
 
 	try {

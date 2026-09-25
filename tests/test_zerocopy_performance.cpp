@@ -339,6 +339,10 @@ void saveResultsCSV(const std::vector<BenchmarkResult>& results, const char* fil
 // ============================================
 
 int main() {
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "SKIP: CUDA unavailable" << std::endl;
+		return 77;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << "Zero-Copy Performance Benchmark" << std::endl;
 	std::cout << "========================================" << std::endl;

@@ -189,8 +189,8 @@ int main() {
 	} else if (BackendUtils::isCpuAvailable()) {
 		testBackend = Backend::CPU;
 	} else {
-		std::cerr << "No backends available!" << std::endl;
-		return 1;
+		std::cout << "SKIP: no backend available" << std::endl;
+		return 77;
 	}
 
 	try {
@@ -266,7 +266,7 @@ int main() {
 		std::cout << "Saved configuration to " << configFile << std::endl;
 
 		//	Load it back
-		Processor processor2(Backend::CPU);  // Start with different backend
+		Processor processor2(BackendUtils::isCpuAvailable() ? Backend::CPU : testBackend);  // Start with different backend
 		processor2.loadBackendConfigFromFile(configFile);
 
 		auto loadedConfig = processor2.getBackendConfig();

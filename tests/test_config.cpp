@@ -26,6 +26,10 @@ std::vector<float> createTestCurve(size_t size, float startVal = 1.0f, float inc
 }
 
 int main() {
+	if (!ope::BackendUtils::isCpuAvailable()) {
+		std::cout << "SKIP: CPU backend required" << std::endl;
+		return 77;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << "ProcessorConfiguration Comprehensive Test" << std::endl;
 	std::cout << "========================================" << std::endl;

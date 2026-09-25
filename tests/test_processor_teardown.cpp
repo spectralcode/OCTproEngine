@@ -3,14 +3,17 @@
 // backend's output delivery, the input publication and the callback worker
 // threads. Other tests reach the destructor only after their workers went
 // idle (they sleep before returning), so this covers the hot teardown path.
+#include "test_backend.h"
 #include <iostream>
 #include <atomic>
 #include <cstring>
 #include "processor.h"
 
-const ope::Backend TEST_BACKEND = ope::Backend::CUDA;
+ope::Backend testBackend;
 
-int main() {
+int main(int argc, char** argv) {
+	const int status = selectTestBackend(argc, argv, testBackend);
+	if (status != 0) return status;
 	std::cout << "Processor teardown under load" << std::endl;
 
 	const int ITERATIONS = 15;
@@ -23,7 +26,7 @@ int main() {
 
 	for (int iter = 0; iter < ITERATIONS; iter++) {
 		{
-			ope::Processor processor(TEST_BACKEND);
+			ope::Processor processor(testBackend);
 			processor.setInputParameters(1024, 512, 1, ope::DataType::UINT16);
 			processor.initialize();
 

@@ -3,6 +3,10 @@
 #include <iostream>
 
 int main() {
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "SKIP: CUDA unavailable" << std::endl;
+		return 77;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << "Zero-Copy Runtime Switching Test" << std::endl;
 	std::cout << "========================================" << std::endl;
